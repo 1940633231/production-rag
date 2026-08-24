@@ -14,6 +14,10 @@
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
 - **评估体系**：检索指标（Recall/Precision/MRR/NDCG）+ 生成质量评估（Faithfulness/Relevance，LLM-as-Judge）
 
+## 项目架构图
+
+![alt text](design.png)
+
 ## 项目结构
 
 ```
