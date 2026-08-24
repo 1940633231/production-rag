@@ -287,8 +287,8 @@ MySQL 测试需要 MySQL 服务运行中，否则会自动跳过。
 | 组件 | 技术选型 |
 |------|---------|
 | Web 框架 | FastAPI + Uvicorn |
-| 向量检索 | FAISS |
-| BM25 检索 | 自实现（jieba 分词） |
+| 向量检索 | FAISS（开发原型），生产可平滑迁移 Milvus 向量数据库 |
+| BM25 检索 | 自实现（jieba 分词）,BM25（基于 jieba 中文分词自实现）；生产可替换 Elasticsearch |
 | Embedding | sentence-transformers (BGE) |
 | 重排 | Cross-Encoder (BGE-reranker) |
 | LLM 生成 | DashScope (Qwen) |
