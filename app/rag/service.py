@@ -9,9 +9,10 @@ import 策略：
 - 顶部只 import 标准库 + 不依赖外部库的 app 模块（Config/RAGPipeline/RAGResponse）
 - 检索器/reranker 的 import 延迟到 _build_pipeline() 内，让 bm25 模式不需要 numpy/faiss
 """
+import threading
 import time
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, List, Optional
 
 from app.core.config import Config
 from app.core.logger import get_logger
@@ -101,8 +102,11 @@ class RAGService:
             from app.rag.retriever import Retriever
 
             t = time.time()
-            logger.info("Embedding 模型加载开始: %s", self.config.embedding_model)
-            embedding_model = EmbeddingModel(self.config.embedding_model)
+            model_name = self.config.embedding_model
+            if model_name not in _embedding_cache:
+                logger.info("Embedding 模型加载开始: %s", model_name)
+                _embedding_cache[model_name] = EmbeddingModel(model_name)
+            embedding_model = _embedding_cache[model_name]
 
             # Milvus/FAISS 分支
             if use_milvus:
@@ -192,10 +196,13 @@ class RAGService:
         reranker = None
         if self.use_rerank:
             from app.rerank.reranker import Reranker
-            t = time.time()
-            logger.info("Reranker 加载开始: %s", self.config.rerank_model)
-            reranker = Reranker(self.config.rerank_model)
-            logger.info("Reranker 加载完成: %.3fs", time.time() - t)
+            model_name = self.config.rerank_model
+            if model_name not in _reranker_cache:
+                t = time.time()
+                logger.info("Reranker 加载开始: %s", model_name)
+                _reranker_cache[model_name] = Reranker(model_name)
+                logger.info("Reranker 加载完成: %.3fs", time.time() - t)
+            reranker = _reranker_cache[model_name]
 
         # ---- ContextManager（从 config 注入全部参数）----
         from app.ingestion.tokenizer import create_token_counter
@@ -253,12 +260,15 @@ class RAGService:
             rerank_candidate_pool=self.config.rerank_candidate_pool,
         )
 
-    def query(self, query: str) -> RAGResponse:
-        """高层查询接口，返回 RAGResponse。"""
-        logger.info("收到查询: query=%r", query)
+    def query(self, query: str, history: Optional[List] = None) -> RAGResponse:
+        """高层查询接口，返回 RAGResponse。
+
+        history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（可选）
+        """
+        logger.info("收到查询: query=%r, history_turns=%d", query, len(history or []))
         start = time.time()
         try:
-            response = self._pipeline.run(query)
+            response = self._pipeline.run(query, history=history)
         except Exception as e:
             logger.error(
                 "查询失败: %.3fs, error=%s", time.time() - start, e, exc_info=True
@@ -272,16 +282,18 @@ class RAGService:
         )
         return response
 
-    def query_stream(self, query: str) -> Iterator[dict]:
+    def query_stream(self, query: str, history: Optional[List] = None) -> Iterator[dict]:
         """流式查询接口，逐事件 yield。
 
         透传 RAGPipeline.run_stream 的事件流，供 API SSE 端点直接消费。
         事件结构见 RAGPipeline.run_stream 文档。
+
+        history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（可选）
         """
-        logger.info("收到流式查询: query=%r", query)
+        logger.info("收到流式查询: query=%r, history_turns=%d", query, len(history or []))
         start = time.time()
         try:
-            for event in self._pipeline.run_stream(query):
+            for event in self._pipeline.run_stream(query, history=history):
                 yield event
         except Exception as e:
             logger.error(
@@ -291,8 +303,27 @@ class RAGService:
         logger.info("流式查询结束: %.3fs", time.time() - start)
 
 
-# ---- 模块级缓存：按 (strategy, mode, use_rerank, milvus_enabled) 复用模型加载 ----
+# ---- 模块级缓存 ----
+# _service_cache: 按 (strategy, mode, use_rerank, milvus_enabled, index_version) 缓存 RAGService
+# _embedding_cache / _reranker_cache: 按模型名缓存模型实例，索引变更时复用，避免重复加载权重
 _service_cache: dict = {}
+_embedding_cache: dict = {}
+_reranker_cache: dict = {}
+_cache_lock = threading.Lock()
+
+
+def _index_version(strategy: str) -> str:
+    """计算指定 strategy 的索引版本号（metadata.json 的 mtime + size）。
+
+    上传/删除/重建都会重写 metadata.json，版本随之变化，
+    使 get_service 能自动感知索引更新，无需清空整个缓存。
+    """
+    metadata_path = Path("data/index") / strategy / "metadata.json"
+    try:
+        stat = metadata_path.stat()
+        return "{}:{}".format(stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return "missing"
 
 
 def get_service(
@@ -303,18 +334,28 @@ def get_service(
 ) -> RAGService:
     """获取缓存的 RAGService 单例。
 
-    按 (strategy, mode, use_rerank, milvus_enabled) 作 key 缓存，不同配置各自独立，
-    同配置复用（避免 embedding/cross-encoder 重复加载）。
+    缓存 key 含索引版本号（metadata.json 的 mtime+size）：
+      - 配置不变、索引未变：直接复用（模型 + 索引均在内存）
+      - 索引变更（上传/删除/重建）：自动构建新 service，
+        模型从 _embedding_cache/_reranker_cache 复用，不重复加载权重
     """
     _config = config or Config()
-    key = (strategy, mode, use_rerank, _config.storage_milvus_enabled)
-    if key not in _service_cache:
-        _service_cache[key] = RAGService(
-            config=_config, strategy=strategy, mode=mode, use_rerank=use_rerank
-        )
-    return _service_cache[key]
+    version = _index_version(strategy)
+    key = (strategy, mode, use_rerank, _config.storage_milvus_enabled, version)
+    with _cache_lock:
+        if key not in _service_cache:
+            _service_cache[key] = RAGService(
+                config=_config, strategy=strategy, mode=mode, use_rerank=use_rerank
+            )
+        # 索引版本变化后，淘汰该 strategy 的旧版本 service（模型缓存保留复用）
+        for stale in [k for k in _service_cache if k[0] == strategy and k != key]:
+            _service_cache.pop(stale, None)
+        return _service_cache[key]
 
 
 def reset_service_cache():
-    """清空 service 缓存（测试或切换配置时用）。"""
-    _service_cache.clear()
+    """清空全部缓存（service + embedding/reranker 模型），测试或切换配置时用。"""
+    with _cache_lock:
+        _service_cache.clear()
+        _embedding_cache.clear()
+        _reranker_cache.clear()
