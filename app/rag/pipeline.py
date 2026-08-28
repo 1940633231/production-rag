@@ -43,6 +43,7 @@ class RAGPipeline:
         context_manager=None,
         generator=None,
         prompt_builder=None,
+        query_rewriter=None,
         top_k: int = 5,
         rerank_candidate_pool: int = 50,
     ):
@@ -51,8 +52,21 @@ class RAGPipeline:
         self.context_manager = context_manager
         self.generator = generator
         self.prompt_builder = prompt_builder or PromptBuilder()
+        self.query_rewriter = query_rewriter
         self.top_k = top_k
         self.rerank_candidate_pool = rerank_candidate_pool
+
+    def _rewrite_query(self, query: str, history: Optional[List] = None):
+        """有 history 且有 query_rewriter 时改写查询，返回 (effective_query, changed)。"""
+        if not history or self.query_rewriter is None:
+            return query, False
+        t = time.time()
+        rewritten = self.query_rewriter.rewrite(query, history)
+        logger.info(
+            "查询改写: %.3fs, %r → %r",
+            time.time() - t, query[:50], rewritten[:50],
+        )
+        return rewritten, rewritten != query
 
     def _retrieve_and_context(self, query: str):
         """执行 retrieve → rerank → context_manager，返回 (context, chunks, stats)。
@@ -98,8 +112,14 @@ class RAGPipeline:
         logger.info("pipeline 开始: query=%r, history_turns=%d", query, len(history or []))
         pipeline_start = time.time()
 
-        # 1+2: 检索 + ContextManager（复用）
-        context, chunks, stats = self._retrieve_and_context(query)
+        # 0. Query 改写（多轮指代消解）
+        effective_query, rewritten = self._rewrite_query(query, history)
+
+        # 1+2: 检索 + ContextManager（用改写后的 query）
+        context, chunks, stats = self._retrieve_and_context(effective_query)
+        if rewritten:
+            stats = dict(stats)
+            stats["rewritten_query"] = effective_query
 
         # 3. 生成：有 generator 则构建 prompt 并调用 LLM，填充 answer
         answer = None
@@ -111,7 +131,9 @@ class RAGPipeline:
                 generator_name, len(context),
             )
             try:
-                messages = self.prompt_builder.build(query, context, history=history)
+                messages = self.prompt_builder.build(
+                    effective_query, context, history=history
+                )
                 answer = self.generator.generate(messages)
                 # 记录生成耗时指标
                 from app.core.metrics import metrics
@@ -170,8 +192,14 @@ class RAGPipeline:
         pipeline_start = time.time()
 
         try:
-            # 1+2: 检索 + ContextManager
-            context, chunks, stats = self._retrieve_and_context(query)
+            # 0. Query 改写（多轮指代消解）
+            effective_query, rewritten = self._rewrite_query(query, history)
+
+            # 1+2: 检索 + ContextManager（用改写后的 query）
+            context, chunks, stats = self._retrieve_and_context(effective_query)
+            if rewritten:
+                stats = dict(stats)
+                stats["rewritten_query"] = effective_query
             yield {"type": "meta", "chunks": chunks, "stats": stats}
 
             # 3. 流式生成
@@ -180,7 +208,9 @@ class RAGPipeline:
                 yield {"type": "done", "answer_length": 0}
                 return
 
-            messages = self.prompt_builder.build(query, context, history=history)
+            messages = self.prompt_builder.build(
+                effective_query, context, history=history
+            )
             answer_parts = []
             try:
                 for delta in self.generator.stream_generate(messages):

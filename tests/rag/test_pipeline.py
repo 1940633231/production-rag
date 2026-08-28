@@ -326,3 +326,85 @@ class TestPipelineMultiTurn:
         pipeline.run("当前问")  # 不传 history
         msgs = captured["messages"]
         assert [m["role"] for m in msgs] == ["system", "user"]
+
+
+# ============================================================
+# Query 改写
+# ============================================================
+
+class _RecordingRetriever(MockRetriever):
+    """记录每次检索收到的 query。"""
+
+    def __init__(self, results):
+        super().__init__(results)
+        self.queries = []
+
+    def search(self, query, top_k=5):
+        self.queries.append(query)
+        return super().search(query, top_k)
+
+
+class _StubQueryRewriter:
+    """Mock 改写器：返回固定改写结果，记录调用次数。"""
+
+    def __init__(self, rewritten="改写后的问题"):
+        self.rewritten = rewritten
+        self.called = 0
+
+    def rewrite(self, query, history=None):
+        self.called += 1
+        return self.rewritten
+
+
+class TestPipelineQueryRewrite:
+    def _pipeline(self, rewritten="改写后的问题", with_rewriter=True):
+        retriever = _RecordingRetriever(_mock_chunks())
+        rewriter = _StubQueryRewriter(rewritten) if with_rewriter else None
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            query_rewriter=rewriter,
+            top_k=2,
+        )
+        return pipeline, retriever, rewriter
+
+    def test_rewritten_query_used_for_retrieval(self):
+        pipeline, retriever, rewriter = self._pipeline()
+        history = [
+            {"role": "user", "content": "铁矿近期供需如何？"},
+            {"role": "assistant", "content": "供给增加、需求下降。"},
+        ]
+        resp = pipeline.run("那刚才说的如何影响价格", history=history)
+        # 检索用改写后的 query
+        assert rewriter.called == 1
+        assert retriever.queries == ["改写后的问题"]
+        # response.query 保留原始问题，stats 记录改写结果
+        assert resp.query == "那刚才说的如何影响价格"
+        assert resp.stats.get("rewritten_query") == "改写后的问题"
+
+    def test_rewrite_skipped_without_history(self):
+        pipeline, retriever, rewriter = self._pipeline()
+        pipeline.run("单轮问题")
+        assert rewriter.called == 0
+        assert retriever.queries == ["单轮问题"]
+        assert "rewritten_query" not in pipeline.run("单轮问题").stats
+
+    def test_rewrite_skipped_when_not_injected(self):
+        pipeline, retriever, rewriter = self._pipeline(with_rewriter=False)
+        history = [{"role": "user", "content": "旧问题"}]
+        resp = pipeline.run("新问题", history=history)
+        assert retriever.queries == ["新问题"]
+        assert "rewritten_query" not in resp.stats
+
+    def test_stream_uses_rewritten_query(self):
+        pipeline, retriever, rewriter = self._pipeline()
+        history = [{"role": "user", "content": "旧问题"}]
+        events = list(pipeline.run_stream("新问题", history=history))
+        assert retriever.queries == ["改写后的问题"]
+        meta = events[0]
+        assert meta["type"] == "meta"
+        assert meta["stats"].get("rewritten_query") == "改写后的问题"
+        # 流式正常输出
+        types = [e["type"] for e in events]
+        assert "delta" in types
+        assert types[-1] == "done"
