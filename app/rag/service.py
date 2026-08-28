@@ -244,11 +244,20 @@ class RAGService:
             api_key_env=self.config.generation_api_key_env,
             temperature=self.config.generation_temperature,
             max_tokens=self.config.generation_max_tokens,
+            timeout=self.config.generation_timeout,
+            retry_times=self.config.generation_retry_times,
+            retry_backoff=self.config.generation_retry_backoff,
         )
         logger.info(
             "Generator 初始化完成: %.3fs, type=%s",
             time.time() - t, type(generator).__name__,
         )
+
+        # ---- Query 改写器（复用 generator；stub 时自动跳过改写）----
+        query_rewriter = None
+        if generator is not None:
+            from app.generation.query_rewriter import QueryRewriter
+            query_rewriter = QueryRewriter(generator)
 
         logger.info("pipeline 构建完成: 总耗时=%.3fs", time.time() - build_start)
         return RAGPipeline(
@@ -256,6 +265,7 @@ class RAGService:
             reranker=reranker,
             context_manager=context_manager,
             generator=generator,
+            query_rewriter=query_rewriter,
             top_k=self.config.retrieval_top_k,
             rerank_candidate_pool=self.config.rerank_candidate_pool,
         )

@@ -138,6 +138,18 @@ class Config:
     def generation_max_tokens(self):
         return self.generation_config.get("max_tokens", 1024)
 
+    @property
+    def generation_timeout(self):
+        return self.generation_config.get("timeout", 60)
+
+    @property
+    def generation_retry_times(self):
+        return self.generation_config.get("retry_times", 2)
+
+    @property
+    def generation_retry_backoff(self):
+        return self.generation_config.get("retry_backoff", 1.0)
+
     # ---- storage 段（MySQL / ES / Milvus 持久化配置）----
 
     @property

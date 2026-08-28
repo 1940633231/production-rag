@@ -16,7 +16,7 @@
 """
 import os
 import time
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from app.core.logger import get_logger
 from app.generation.generator import BaseGenerator
@@ -34,10 +34,16 @@ class QwenGenerator(BaseGenerator):
         api_key_env: str = "DASHSCOPE_API_KEY",
         temperature: float = 0.3,
         max_tokens: int = 1024,
+        timeout: Optional[int] = 60,
+        retry_times: int = 2,
+        retry_backoff: float = 1.0,
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
+        self.retry_times = retry_times
+        self.retry_backoff = retry_backoff
 
         logger.info(
             "QwenGenerator 初始化: model=%s, temperature=%.2f, max_tokens=%d",
@@ -65,6 +71,81 @@ class QwenGenerator(BaseGenerator):
         self._dashscope = dashscope
         logger.info("QwenGenerator 初始化完成, dashscope 版本=%s", getattr(dashscope, "__version__", "unknown"))
 
+    # ---- 超时 + 指数退避重试 ----
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        """判断异常是否可重试：网络异常/超时（无 status_code）、429 限流、5xx 服务端错误。
+
+        4xx 其他错误（参数/鉴权）为业务错误，重试无意义，直接抛出。
+        """
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+        if status is None:
+            return True
+        return status == 429 or status >= 500
+
+    def _call(self, kwargs: Dict) -> Any:
+        """调用 DashScope Generation API，透传 timeout（旧版 SDK 不支持时自动忽略）。"""
+        if self.timeout:
+            try:
+                return self._dashscope.Generation.call(**kwargs, timeout=self.timeout)
+            except TypeError:
+                return self._dashscope.Generation.call(**kwargs)
+        return self._dashscope.Generation.call(**kwargs)
+
+    def _wait_backoff(self, attempt: int, exc: Exception):
+        """按指数退避等待（1s → 2s → 4s），并记录重试日志。"""
+        wait = self.retry_backoff * (2 ** attempt)
+        logger.warning(
+            "DashScope 调用失败（可重试）: attempt=%d/%d, wait=%.1fs, error=%s: %s",
+            attempt + 1, self.retry_times + 1, wait, type(exc).__name__, exc,
+        )
+        time.sleep(wait)
+
+    def _sync_call_with_retry(self, kwargs: Dict) -> Any:
+        """同步调用：对可重试异常做指数退避重试，重试耗尽后抛出最后一次异常。"""
+        last_exc = None
+        for attempt in range(self.retry_times + 1):
+            try:
+                return self._call(kwargs)
+            except Exception as e:
+                last_exc = e
+                if not self._is_retryable(e):
+                    raise
+                if attempt >= self.retry_times:
+                    break
+                self._wait_backoff(attempt, e)
+        raise last_exc
+
+    def _stream_call_with_retry(self, kwargs: Dict) -> Iterator[Any]:
+        """流式调用：前探首个响应，首包失败时整体重试。
+
+        已输出内容后的迭代异常不再重试（避免重试产生重复片段）。
+        """
+        for attempt in range(self.retry_times + 1):
+            try:
+                responses = self._call(kwargs)
+                iterator = iter(responses)
+                try:
+                    first = next(iterator)
+                except StopIteration:
+                    return
+                except Exception as e:
+                    if self._is_retryable(e) and attempt < self.retry_times:
+                        self._wait_backoff(attempt, e)
+                        continue
+                    raise
+                yield first
+                for resp in iterator:
+                    yield resp
+                return
+            except Exception as e:
+                logger.error("DashScope 流式迭代失败（不重试）: %s", e, exc_info=True)
+                raise
+
     def generate(self, messages: List[Dict]) -> str:
         """调用 DashScope Generation API 生成回复。
 
@@ -85,14 +166,14 @@ class QwenGenerator(BaseGenerator):
         )
 
         try:
-            response = self._dashscope.Generation.call(
-                model=self.model,
-                messages=messages,
-                result_format="message",  # 返回 OpenAI 兼容格式
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                api_key=self.api_key,
-            )
+            response = self._sync_call_with_retry({
+                "model": self.model,
+                "messages": messages,
+                "result_format": "message",  # 返回 OpenAI 兼容格式
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "api_key": self.api_key,
+            })
         except Exception as e:
             logger.error(
                 "DashScope API 网络异常: %.3fs, error=%s",
@@ -158,16 +239,16 @@ class QwenGenerator(BaseGenerator):
         )
 
         try:
-            responses = self._dashscope.Generation.call(
-                model=self.model,
-                messages=messages,
-                result_format="message",
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                api_key=self.api_key,
-                stream=True,  # 启用流式
-                incremental_output=True,  # 增量输出，每个 response 只含新片段
-            )
+            responses = self._stream_call_with_retry({
+                "model": self.model,
+                "messages": messages,
+                "result_format": "message",
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "api_key": self.api_key,
+                "stream": True,  # 启用流式
+                "incremental_output": True,  # 增量输出，每个 response 只含新片段
+            })
         except Exception as e:
             logger.error(
                 "DashScope 流式 API 网络异常: %.3fs, error=%s",
