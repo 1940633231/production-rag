@@ -82,7 +82,10 @@ def _check_milvus() -> ComponentStatus:
         milvus_uri = f"http://{config.milvus_host}:{config.milvus_port}"
         from pymilvus import MilvusClient
         try:
-            client = MilvusClient(uri=milvus_uri)
+            try:
+                client = MilvusClient(uri=milvus_uri, timeout=5)
+            except TypeError:
+                client = MilvusClient(uri=milvus_uri)
             ver: str = client.get_server_version()
             return ComponentStatus(status="ok", detail=f"milvus[{milvus_uri}] server_version:{ver}")
         except Exception as inner_exc:
@@ -160,19 +163,29 @@ def _check_indexes() -> dict:
 @router.get("/health", response_model=HealthResponse)
 async def health():
     """深度服务健康检查：索引 + MySQL + ES + Milvus + DashScope + embedding + reranker。"""
+    import asyncio
+
     from app.core.config import Config
+    from starlette.concurrency import run_in_threadpool
+
     config = Config()
-    # 各组件检查，新增 es、milvus
-    components = {
-        "mysql": _check_mysql(),
-        "elasticsearch": _check_elasticsearch(),
-        "milvus": _check_milvus(),
-        "dashscope": _check_dashscope(),
-        "embedding": _check_embedding_model(),
-        "reranker": _check_reranker(),
+    # 各组件检查全部在线程池执行并并行等待。
+    # MySQL/ES/Milvus 检查是同步网络 IO，若在 async 端点中直接调用，
+    # 组件挂起时会阻塞事件循环，导致其他请求全部排队。
+    check_fns = {
+        "mysql": _check_mysql,
+        "elasticsearch": _check_elasticsearch,
+        "milvus": _check_milvus,
+        "dashscope": _check_dashscope,
+        "embedding": _check_embedding_model,
+        "reranker": _check_reranker,
     }
-    # 索引检查
-    indexes = _check_indexes()
+    results = await asyncio.gather(
+        *(run_in_threadpool(fn) for fn in check_fns.values())
+    )
+    components = dict(zip(check_fns.keys(), results))
+    # 索引检查（本地文件 IO）同样放入线程池，避免任何阻塞留在事件循环
+    indexes = await run_in_threadpool(_check_indexes)
     # 更新 Prometheus 指标
     from app.core.metrics import metrics
     for strategy, info in indexes.items():

@@ -142,6 +142,9 @@ class MySQLManager:
                 charset="utf8mb4",
                 cursorclass=DictCursor,
                 autocommit=False,
+                connect_timeout=5,
+                read_timeout=10,
+                write_timeout=10,
             )
             logger.info("MySQL 连接池已创建")
 
