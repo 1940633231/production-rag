@@ -250,3 +250,79 @@ class TestPipelineRunStream:
         # 检索失败应直接 error 事件
         assert events[0]["type"] == "error"
         assert "检索" in events[0]["error"] or "pipeline" in events[0]["error"]
+
+
+# ============================================================
+# 多轮对话：history 透传
+# ============================================================
+
+class TestPipelineMultiTurn:
+    """history 应作为独立 user/assistant 消息插入 system 与当前 user 之间。"""
+
+    @staticmethod
+    def _capturing_pipeline(history=None):
+        """构建捕获 messages 的 pipeline，返回 (pipeline, captured dict)。"""
+        captured = {}
+
+        class CapturingGenerator(MockGenerator):
+            def generate(self, messages):
+                captured["messages"] = messages
+                return "回答"
+
+        pipeline = RAGPipeline(
+            retriever=MockRetriever(_mock_chunks()),
+            generator=CapturingGenerator(),
+            top_k=2,
+        )
+        return pipeline, captured
+
+    def test_history_inserted_between_system_and_user(self):
+        pipeline, captured = self._capturing_pipeline()
+        history = [
+            {"role": "user", "content": "第一问"},
+            {"role": "assistant", "content": "第一答"},
+            {"role": "user", "content": "第二问"},
+            {"role": "assistant", "content": "第二答"},
+        ]
+        pipeline.run("第三问", history=history)
+        msgs = captured["messages"]
+        # system + 4 条历史 + 当前 user
+        assert [m["role"] for m in msgs] == [
+            "system", "user", "assistant", "user", "assistant", "user",
+        ]
+        assert msgs[1] == {"role": "user", "content": "第一问"}
+        assert msgs[-1]["role"] == "user"
+        assert "第三问" in msgs[-1]["content"]
+        assert "上下文" in msgs[-1]["content"]
+
+    def test_history_truncated_to_last_5_turns(self):
+        pipeline, captured = self._capturing_pipeline()
+        history = []
+        for i in range(8):  # 8 轮 = 16 条消息，超出 MAX_HISTORY_TURNS=5
+            history.append({"role": "user", "content": "问{}".format(i)})
+            history.append({"role": "assistant", "content": "答{}".format(i)})
+        pipeline.run("当前问", history=history)
+        msgs = captured["messages"]
+        # system + 最近 5 轮(10 条) + 当前 user = 12 条
+        assert len(msgs) == 12
+        assert msgs[1]["content"] == "问3"  # 前 3 轮被截断
+
+    def test_history_filters_invalid_entries(self):
+        pipeline, captured = self._capturing_pipeline()
+        history = [
+            {"role": "system", "content": "非法角色"},
+            {"role": "user", "content": "   "},  # 空白内容
+            {"role": "user", "content": "合法问题"},
+            {"role": "assistant", "content": "合法回答"},
+        ]
+        pipeline.run("当前问", history=history)
+        msgs = captured["messages"]
+        # 非法条目被过滤：system + 2 条合法历史 + 当前 user
+        assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
+        assert msgs[1]["content"] == "合法问题"
+
+    def test_history_default_empty(self):
+        pipeline, captured = self._capturing_pipeline()
+        pipeline.run("当前问")  # 不传 history
+        msgs = captured["messages"]
+        assert [m["role"] for m in msgs] == ["system", "user"]

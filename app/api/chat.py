@@ -10,17 +10,17 @@
   - mode (str): 检索模式 vector/bm25/hybrid，默认 hybrid
   - use_rerank (bool): 是否启用 rerank，默认 true
   - stream (bool): 是否流式返回，默认 false
+  - history (list): 多轮对话历史 [{role: user/assistant, content}, ...]，默认空。
+    客户端需自行维护：每轮把上一轮 query 作为 user、answer 作为 assistant 追加。
+    服务端仅保留最近 5 轮，超出自动截断。
 
 使用示例:
-  # 普通 JSON
+  # 普通 JSON（多轮）
   curl -X POST http://localhost:8000/api/chat \\
     -H "Content-Type: application/json" \\
-    -d '{"query": "铁矿近期供需如何？"}'
-
-  # SSE 流式
-  curl -X POST http://localhost:8000/api/chat \\
-    -H "Content-Type: application/json" \\
-    -d '{"query": "铁矿供需", "stream": true}'
+    -d '{"query": "那刚才说的供需如何影响价格？",
+         "history": [{"role": "user", "content": "铁矿近期供需如何？"},
+                     {"role": "assistant", "content": "供给增加、需求下降。"}]}'
 """
 import json
 import time
@@ -46,6 +46,10 @@ class ChatRequest(BaseModel):
     mode: str = Field("hybrid", description="检索模式: vector/bm25/hybrid")
     use_rerank: bool = Field(True, description="是否启用 rerank")
     stream: bool = Field(False, description="是否流式返回（SSE）")
+    history: List[Dict] = Field(
+        default_factory=list,
+        description="多轮对话历史：[{role: user/assistant, content}, ...]，默认空",
+    )
 
 
 class CitationItem(BaseModel):
@@ -117,7 +121,7 @@ async def chat(req: ChatRequest):
 
     t = time.time()
     try:
-        response = await run_in_threadpool(service.query, req.query)
+        response = await run_in_threadpool(service.query, req.query, req.history)
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail="索引文件不存在: {}".format(e))
     except Exception as e:
@@ -170,7 +174,9 @@ async def chat_stream(req: ChatRequest):
         """生成 SSE 事件流，消费 service.query_stream() 的同步事件流。"""
         t = time.time()
         # 用线程池迭代同步生成器，避免阻塞事件循环
-        async for event in iterate_in_threadpool(service.query_stream(req.query)):
+        async for event in iterate_in_threadpool(
+            service.query_stream(req.query, req.history)
+        ):
             evt_type = event.get("type")
             if evt_type == "meta":
                 elapsed = round(time.time() - t, 3)

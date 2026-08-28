@@ -15,7 +15,7 @@
     → RAGResponse（context + chunks + stats + answer）
 """
 import time
-from typing import Iterator
+from typing import Iterator, List, Optional
 
 from app.core.logger import get_logger
 from app.citation.citation import CitationExtractor
@@ -90,9 +90,12 @@ class RAGPipeline:
         )
         return context, results, {"input_count": len(results)}
 
-    def run(self, query: str) -> RAGResponse:
-        """执行 retrieve → rerank → context_manager → generator 链路。"""
-        logger.info("pipeline 开始: query=%r", query)
+    def run(self, query: str, history: Optional[List] = None) -> RAGResponse:
+        """执行 retrieve → rerank → context_manager → generator 链路。
+
+        history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（默认 None）
+        """
+        logger.info("pipeline 开始: query=%r, history_turns=%d", query, len(history or []))
         pipeline_start = time.time()
 
         # 1+2: 检索 + ContextManager（复用）
@@ -108,7 +111,7 @@ class RAGPipeline:
                 generator_name, len(context),
             )
             try:
-                messages = self.prompt_builder.build(query, context)
+                messages = self.prompt_builder.build(query, context, history=history)
                 answer = self.generator.generate(messages)
                 # 记录生成耗时指标
                 from app.core.metrics import metrics
@@ -149,8 +152,10 @@ class RAGPipeline:
             citations=citations,
         )
 
-    def run_stream(self, query: str) -> Iterator[dict]:
+    def run_stream(self, query: str, history: Optional[List] = None) -> Iterator[dict]:
         """流式执行 RAG 链路，逐事件 yield。
+
+        history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（默认 None）
 
         事件类型（dict 含 "type" 字段）:
           - {"type": "meta", "chunks": [...], "stats": {...}}      检索+上下文阶段完成
@@ -175,7 +180,7 @@ class RAGPipeline:
                 yield {"type": "done", "answer_length": 0}
                 return
 
-            messages = self.prompt_builder.build(query, context)
+            messages = self.prompt_builder.build(query, context, history=history)
             answer_parts = []
             try:
                 for delta in self.generator.stream_generate(messages):
