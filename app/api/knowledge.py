@@ -35,6 +35,27 @@ _LOADER_MAP = {
     ".docx": "app.ingestion.loader.word_loader.WordLoader",
 }
 
+# 上传大小限制（50MB），防止超大文件打爆内存
+_MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+
+
+async def _read_upload_limited(file: UploadFile, max_size: int) -> bytes:
+    """分块读取上传文件，超过 max_size 直接拒绝，避免一次性读入内存。"""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail="文件大小超过限制: {} bytes".format(max_size),
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 
 class UploadResponse(BaseModel):
     """上传响应。"""
@@ -130,9 +151,9 @@ async def upload_document(
     # 保存到 data/raw/
     raw_dir = Path("data/raw")
     raw_dir.mkdir(parents=True, exist_ok=True)
-    save_path = raw_dir / file.filename
+    save_path = raw_dir / Path(file.filename or "").name
 
-    content = await file.read()
+    content = await _read_upload_limited(file, _MAX_UPLOAD_SIZE)
     save_path.write_bytes(content)
     logger.info("文件已保存: %s (%d bytes)", save_path, len(content))
 
@@ -192,10 +213,9 @@ def _do_upload(save_path: Path, strategy: str) -> dict:
             strategy=strategy,
         )
 
-        # 清除 service 缓存
-        from app.rag.service import reset_service_cache
-        reset_service_cache()
-        logger.info("已清除 service 缓存（upload 完成）")
+        # 索引已变更，无需清空缓存：get_service 按索引版本号自动刷新 service，
+        # embedding/reranker 模型继续复用
+        logger.info("索引已更新（upload 完成，service 缓存将按版本号自动刷新）")
 
         logger.info(
             "_do_upload 完成: %.3fs, file=%s, strategy=%s, docs=%d, chunks=%d, "
@@ -288,10 +308,8 @@ def _do_rebuild(strategy: str) -> dict:
         writer = IndexWriter()
         result = writer.rebuild(strategy=strategy)
 
-        # 清除 service 缓存
-        from app.rag.service import reset_service_cache
-        reset_service_cache()
-        logger.info("已清除 service 缓存（索引已更新）")
+        # 索引已变更，无需清空缓存：get_service 按索引版本号自动刷新 service
+        logger.info("索引已更新（rebuild 完成，service 缓存将按版本号自动刷新）")
 
         logger.info(
             "_do_rebuild 完成: %.3fs, strategy=%s, docs=%d, chunks=%d, "
@@ -485,10 +503,8 @@ async def delete_document(doc_id: str):
         except Exception as e:
             logger.error("增量重建索引失败（文档已删除）: %s", e, exc_info=True)
 
-        # 清除 service 缓存
-        from app.rag.service import reset_service_cache
-        reset_service_cache()
-        logger.info("已清除 service 缓存（删除文档后）")
+        # 索引已变更，无需清空缓存：get_service 按索引版本号自动刷新 service
+        logger.info("索引已更新（删除文档后，service 缓存将按版本号自动刷新）")
 
         return DeleteResponse(
             document_id=doc_id,
