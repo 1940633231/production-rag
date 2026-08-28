@@ -7,10 +7,14 @@
 - **多格式文档摄入**：支持 TXT / HTML / PDF / Word(.docx)，含清洗、分块（固定/递归）、embedding 向量化
 - **混合检索**：向量检索（FAISS）+ BM25 关键词检索 + RRF 融合，支持 Cross-Encoder 重排
 - **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、压缩截断、token 预算控制
+- **多轮对话**：`history` 透传 + Query 改写（LLM 指代消解，如"那价格呢"→"铁矿近期价格走势"），改写结果用于检索与生成
 - **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移
 - **流式生成**：基于 DashScope 的真流式 SSE 输出，首字延迟≈模型开始输出时间
-- **持久化存储**：MySQL 存储文档/chunks（可选），含连接池和 CASCADE 删除
-- **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查
+- **生成可靠性**：DashScope API 超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）
+- **持久化存储**：MySQL 存储文档/chunks（可选），含连接池（带超时）和 CASCADE 删除
+- **缓存优化**：embedding/reranker 模型按名复用 + 索引版本号感知，上传/删除后自动刷新索引、不重载模型
+- **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
+- **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
 - **评估体系**：检索指标（Recall/Precision/MRR/NDCG）+ 生成质量评估（Faithfulness/Relevance，LLM-as-Judge）
 
@@ -36,7 +40,7 @@ production-rag/
 │   ├── search/               # 检索引擎（vector/bm25/hybrid + RRF）
 │   ├── rerank/               # Cross-Encoder 重排器
 │   ├── context/              # 上下文管理（builder/compressor/manager）
-│   ├── generation/           # LLM 生成（Stub/Qwen + 流式）
+│   ├── generation/           # LLM 生成（Stub/Qwen + 流式 + 超时重试 + Query 改写）
 │   ├── citation/             # 引用提取
 │   ├── rag/                  # RAG 编排（pipeline/service）
 │   ├── storage/              # 持久化（MySQL + 文件元数据）
@@ -189,6 +193,9 @@ generation:
   model_name: qwen-turbo  # Qwen 模型名
   temperature: 0.3
   max_tokens: 1024
+  timeout: 60             # DashScope API 超时（秒）
+  retry_times: 2          # 网络异常/5xx/429 时的重试次数
+  retry_backoff: 1.0      # 重试基础退避秒数（指数退避：1s → 2s → 4s）
 
 storage:
   enabled: true    # 是否启用 MySQL 持久化
@@ -199,10 +206,10 @@ storage:
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat` | RAG 问答（同步） |
-| POST | `/api/chat/stream` | RAG 问答（SSE 流式） |
-| GET | `/api/health` | 深度健康检查 |
-| POST | `/api/knowledge/upload` | 上传文档并构建索引 |
+| POST | `/api/chat` | RAG 问答（同步，支持多轮 `history`） |
+| POST | `/api/chat/stream` | RAG 问答（SSE 流式，支持多轮 `history`） |
+| GET | `/api/health` | 深度健康检查（线程池并行，不阻塞其他请求） |
+| POST | `/api/knowledge/upload` | 上传文档并构建索引（限 50MB，防路径穿越） |
 | DELETE | `/api/knowledge/{doc_id}` | 删除文档 |
 | POST | `/api/knowledge/rebuild` | 重建索引 |
 | GET | `/api/knowledge/status` | 查看索引状态 |
@@ -223,7 +230,20 @@ curl -X POST http://localhost:8000/api/chat \
 curl -X POST http://localhost:8000/api/chat/stream \
   -H "Content-Type: application/json" \
   -d '{"query": "铁矿供需如何？"}'
+
+# 多轮对话（history 由客户端维护：每轮把 query/answer 追加为 user/assistant）
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "那刚才说的供需如何影响价格？",
+    "history": [
+      {"role": "user", "content": "铁矿近期供需如何？"},
+      {"role": "assistant", "content": "供给增加、需求下降。"}
+    ]
+  }'
 ```
+
+> 多轮说明：服务端仅保留最近 5 轮历史，超出自动截断；Query 改写（LLM 指代消解）在存在 history 时自动生效，改写结果用于检索与生成，原始问题保留在响应 `query` 字段、改写结果在 `stats.rewritten_query` 中。
 
 ### 示例：上传文档
 
@@ -288,12 +308,11 @@ MySQL 测试需要 MySQL 服务运行中，否则会自动跳过。
 |------|---------|
 | Web 框架 | FastAPI + Uvicorn |
 | 向量检索 | FAISS（开发原型），生产可平滑迁移 Milvus 向量数据库 |
-| BM25 检索 | 自实现（jieba 分词）,BM25（基于 jieba 中文分词自实现）；生产可替换 Elasticsearch |
+| BM25 检索 | 自实现（基于 jieba 中文分词）；生产可替换 Elasticsearch |
 | Embedding | sentence-transformers (BGE) |
 | 重排 | Cross-Encoder (BGE-reranker) |
-| LLM 生成 | DashScope (Qwen) |
+| LLM 生成 | DashScope (Qwen)，含超时重试 + Query 改写 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
 | 指标采集 | prometheus-client |
 | 测试 | pytest |
-```
 
