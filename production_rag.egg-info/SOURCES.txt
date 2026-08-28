@@ -1,6 +1,8 @@
+README.md
 setup.py
 app/__init__.py
 app/api/__init__.py
+app/api/__main__.py
 app/api/chat.py
 app/api/health.py
 app/api/knowledge.py
@@ -12,8 +14,12 @@ app/context/compressor.py
 app/context/manager.py
 app/core/__init__.py
 app/core/config.py
+app/core/env.py
 app/core/exceptions.py
 app/core/logger.py
+app/core/metrics.py
+app/core/task_queue.py
+app/core/tracing.py
 app/embedding/__init__.py
 app/embedding/model.py
 app/embedding/service.py
@@ -31,6 +37,7 @@ app/ingestion/chunk.py
 app/ingestion/document.py
 app/ingestion/pipeline.py
 app/ingestion/tokenizer.py
+app/ingestion/writer.py
 app/ingestion/chunker/__init__.py
 app/ingestion/chunker/base.py
 app/ingestion/chunker/chunker.py
@@ -52,12 +59,16 @@ app/rerank/__init__.py
 app/rerank/reranker.py
 app/search/__init__.py
 app/search/bm25_search.py
+app/search/es_fulltext_search.py
 app/search/hybrid_search.py
 app/search/rrf.py
 app/search/vector_search.py
 app/storage/__init__.py
+app/storage/base.py
 app/storage/chunk_repository.py
 app/storage/document_repository.py
+app/storage/es_client.py
+app/storage/es_repository.py
 app/storage/metadata_store.py
 app/storage/mysql.py
 app/vector/__init__.py
