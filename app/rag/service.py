@@ -223,6 +223,7 @@ class RAGService:
             builder=builder,
             compressor=compressor,
             order_strategy=self.config.context_order_strategy,
+            budget_temperature=self.config.context_budget_temperature,
         )
         logger.info(
             "ContextManager 初始化完成: max_tokens=%d, reserved=%d, order=%s",

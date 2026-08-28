@@ -36,6 +36,7 @@ context:
   reserved_tokens: 1024         # 给 query + prompt + answer 预留
   tokenizer_backend: char       # char（默认零依赖）/ tiktoken（需 pip install tiktoken）
   order_strategy: score         # score / document / interleaved
+  budget_temperature: 1.0       # 预算加权温度：越小越向高分集中，越大越平均
   dedup_span_overlap: 0.5       # 同文档 span 重叠 >= 此值判为重复
   dedup_jaccard: 0.85           # 跨文档 Jaccard >= 此值判为重复
   merge_span_gap: 5             # span 端点 gap <= 此值判为邻接可合并

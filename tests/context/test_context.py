@@ -273,3 +273,137 @@ class TestContextManager:
         assert result["context"] == ""
         assert result["chunks"] == []
         assert result["stats"]["input_count"] == 0
+
+
+# ============================================================
+# 分数加权预算（#5）
+# ============================================================
+
+class TestWeightedBudget:
+    def test_high_score_chunk_gets_more_cap(self):
+        """高分块应分到更多压缩预算。"""
+        counter = CharLengthCounter()
+        manager = ContextManager(
+            token_counter=counter,
+            max_context_tokens=100,
+            reserved_tokens=0,
+            order_strategy="score",
+        )
+        chunks = [
+            _chunk("a", "d1", "x" * 50, 0, 50, score=0.9, chunk_index=0),
+            _chunk("b", "d2", "y" * 50, 0, 50, score=0.5, chunk_index=0),
+            _chunk("c", "d3", "z" * 50, 0, 50, score=0.1, chunk_index=0),
+        ]
+        result = manager.build("q", chunks)
+        caps = result["stats"]["weighted_caps"]
+        # score 降序排列，cap 应随分数递减
+        assert len(caps) == 3
+        assert caps[0] > caps[2]  # 高分块预算明显多于低分块
+        # 硬约束：压缩后总量不超 available（100 - query 1 = 99）
+        assert result["stats"]["used_tokens"] <= 99
+        assert result["stats"]["budget_utilization"] <= 1.0
+
+    def test_same_score_falls_back_to_even_split(self):
+        """全同分时应退化为均分（回归均分行为）。"""
+        counter = CharLengthCounter()
+        manager = ContextManager(
+            token_counter=counter,
+            max_context_tokens=100,
+            reserved_tokens=0,
+            order_strategy="score",
+        )
+        chunks = [
+            _chunk("a", "d1", "x" * 50, 0, 50, score=0.5, chunk_index=0),
+            _chunk("b", "d2", "y" * 50, 0, 50, score=0.5, chunk_index=0),
+            _chunk("c", "d3", "z" * 50, 0, 50, score=0.5, chunk_index=0),
+        ]
+        result = manager.build("q", chunks)
+        caps = result["stats"]["weighted_caps"]
+        # 全同分 → 权重相等，cap 差距不超过 1（int 截断误差）
+        assert max(caps) - min(caps) <= 1
+        assert result["stats"]["used_tokens"] <= 99
+
+    def test_weighted_caps_total_within_available(self):
+        """加权 cap 总和不应超过 available。"""
+        counter = CharLengthCounter()
+        manager = ContextManager(
+            token_counter=counter,
+            max_context_tokens=50,
+            reserved_tokens=0,
+            order_strategy="score",
+        )
+        chunks = [
+            _chunk("a", "d1", "x" * 20, 0, 20, score=0.9, chunk_index=i)
+            for i in range(6)
+        ]
+        result = manager.build("q", chunks)
+        caps = result["stats"]["weighted_caps"]
+        assert sum(caps) <= 50  # available = 50 - 1(query) = 49
+        # 低分保底后每块至少 1
+        assert all(c >= 1 for c in caps)
+
+    def test_budget_temperature_effect(self):
+        """温度越低，高分块占比越高。"""
+        counter = CharLengthCounter()
+        chunks = [
+            _chunk("a", "d1", "x" * 50, 0, 50, score=0.9, chunk_index=0),
+            _chunk("b", "d2", "y" * 50, 0, 50, score=0.5, chunk_index=0),
+            _chunk("c", "d3", "z" * 50, 0, 50, score=0.1, chunk_index=0),
+        ]
+        low_temp = ContextManager(
+            token_counter=counter, max_context_tokens=100, reserved_tokens=0,
+            budget_temperature=0.2,
+        )
+        high_temp = ContextManager(
+            token_counter=counter, max_context_tokens=100, reserved_tokens=0,
+            budget_temperature=5.0,
+        )
+        caps_low = low_temp._weighted_caps(chunks, 99)
+        caps_high = high_temp._weighted_caps(chunks, 99)
+        # 低温时最高分块 cap 占比更高
+        assert caps_low[0] / sum(caps_low) > caps_high[0] / sum(caps_high)
+
+
+# ============================================================
+# 预算装填跳过策略（#6）
+# ============================================================
+
+class TestFitBudgetSkip:
+    def test_oversized_chunk_skipped_not_truncated(self):
+        """装不下的块应跳过（不截断、不 break），后续小块仍能装下。"""
+        counter = CharLengthCounter()
+        manager = ContextManager(token_counter=counter)
+        # 绕过压缩直接喂未压缩大块（模拟兜底路径）
+        big = _chunk("big", "d1", "x" * 100, 0, 100, score=0.9)
+        small = _chunk("small", "d2", "y" * 10, 0, 10, score=0.5)
+        final, used, skipped = manager._fit_budget([big, small], 50)
+        assert skipped == 1
+        assert len(final) == 1
+        assert final[0]["chunk_id"] == "small"  # 跳过 big 后仍装下 small
+        assert used == 10
+        # 被跳过的块不应被截断残留（原实现会截断 big 的尾部）
+        assert all("budget_truncated" not in c for c in final)
+
+    def test_all_fit_when_within_budget(self):
+        counter = CharLengthCounter()
+        manager = ContextManager(token_counter=counter)
+        chunks = [
+            _chunk("a", "d1", "x" * 10, 0, 10, score=0.9),
+            _chunk("b", "d2", "y" * 10, 0, 10, score=0.5),
+        ]
+        final, used, skipped = manager._fit_budget(chunks, 50)
+        assert skipped == 0
+        assert len(final) == 2
+        assert used == 20
+
+    def test_build_reports_skipped_count(self):
+        """build() stats 应记录跳过数。"""
+        counter = CharLengthCounter()
+        manager = ContextManager(token_counter=counter)
+        # 用极小预算 + 未压缩大块，但 build 会先走压缩……
+        # 这里直接构造压缩后仍超预算的场景：压缩 cap 很小、块内容全是长句无标点
+        result = manager.build("q", [
+            _chunk("a", "d1", "很长的内容" * 50, 0, 250, score=0.9),
+        ])
+        assert "skipped_count" in result["stats"]
+        assert result["stats"]["final_count"] + result["stats"]["skipped_count"] >= 1

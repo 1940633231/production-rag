@@ -55,8 +55,18 @@ class ContextCompressor:
         compressed["compressed_tokens"] = self.token_counter.count(compressed["content"])
         return compressed
 
-    def compress_all(self, chunks: List[Dict], max_tokens_per_chunk: int) -> List[Dict]:
-        """批量压缩。"""
+    def compress_all(self, chunks: List[Dict], max_tokens_per_chunk) -> List[Dict]:
+        """批量压缩。
+
+        参数:
+            max_tokens_per_chunk: 标量（统一 cap）或与 chunks 等长的 cap 列表
+                                  （分数加权预算时每块不同 cap）。
+        """
+        if isinstance(max_tokens_per_chunk, (list, tuple)):
+            return [
+                self.compress(c, cap)
+                for c, cap in zip(chunks, max_tokens_per_chunk)
+            ]
         return [self.compress(c, max_tokens_per_chunk) for c in chunks]
 
     def _split_sentences(self, text: str) -> List[str]:

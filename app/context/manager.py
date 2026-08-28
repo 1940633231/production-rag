@@ -11,15 +11,16 @@
     → merge_neighbors   # 邻接合并（chunk_index 连续或 span 贴合）
     → compress          # 句子窗口压缩（防单 chunk 吃满）
     → order             # 排序（score / interleaved）
-    → fit_budget        # Token 预算贪心装填（尾部截断兜底）
+    → fit_budget        # Token 预算贪心装填（超预算块跳过，不截断）
     → 最终 context
 """
+import math
 import time
 from typing import Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.ingestion.tokenizer import BaseTokenCounter, create_token_counter
-from app.context.builder import ContextBuilder
+from app.context.builder import ContextBuilder, _get_score
 from app.context.compressor import ContextCompressor
 
 logger = get_logger(__name__)
@@ -36,6 +37,7 @@ class ContextManager:
         builder: Optional[ContextBuilder] = None,
         compressor: Optional[ContextCompressor] = None,
         order_strategy: str = "score",
+        budget_temperature: float = 1.0,
     ):
         self.token_counter = token_counter or create_token_counter("char")
         self.max_context_tokens = max_context_tokens
@@ -43,6 +45,7 @@ class ContextManager:
         self.builder = builder or ContextBuilder()
         self.compressor = compressor or ContextCompressor(self.token_counter)
         self.order_strategy = order_strategy
+        self.budget_temperature = budget_temperature
 
     def build(self, query: str, results: List[Dict]) -> Dict:
         """编排完整 context 构建流程。
@@ -101,38 +104,41 @@ class ContextManager:
             self.max_context_tokens, self.reserved_tokens, query_tokens, available,
         )
 
-        # 4. 压缩：per-chunk cap = 均分预算，防止单 chunk 吃满
+        # 4. 排序：score（默认保留 rerank 序）/ document / interleaved
+        #    提前到压缩前执行，让加权压缩能感知每个 chunk 的分数
         t = time.time()
-        n = max(len(merged), 1)
-        per_chunk_cap = available // n if n > 0 else available
-        compressed = self.compressor.compress_all(merged, per_chunk_cap)
-        stats["compressed_count"] = sum(
-            1 for c in compressed if c.get("compressed")
-        )
-        logger.info(
-            "压缩完成: %.3fs, per_chunk_cap=%d, compressed_count=%d",
-            time.time() - t, per_chunk_cap, stats["compressed_count"],
-        )
-
-        # 5. 排序：score（默认保留 rerank 序）/ document / interleaved
-        t = time.time()
-        ordered = self.builder.order(compressed, self.order_strategy)
+        ordered = self.builder.order(merged, self.order_strategy)
         logger.info(
             "排序完成: %.3fs, strategy=%s",
             time.time() - t, self.order_strategy,
         )
 
-        # 6. TokenBudget 贪心装填：按排序顺序累加，超出则截断最后一个
+        # 5. 加权压缩：cap 按分数 softmax 分配（高分块保留更多，低分块压缩更狠）
         t = time.time()
-        final_chunks, used = self._fit_budget(ordered, available)
+        caps = self._weighted_caps(ordered, available)
+        compressed = self.compressor.compress_all(ordered, caps)
+        stats["compressed_count"] = sum(
+            1 for c in compressed if c.get("compressed")
+        )
+        stats["weighted_caps"] = caps
+        logger.info(
+            "压缩完成: %.3fs, temp=%.2f, caps(min=%d, max=%d), compressed_count=%d",
+            time.time() - t, self.budget_temperature,
+            min(caps), max(caps), stats["compressed_count"],
+        )
+
+        # 6. TokenBudget 贪心装填：按排序顺序累加，装不下的块跳过
+        t = time.time()
+        final_chunks, used, skipped = self._fit_budget(compressed, available)
         stats["final_count"] = len(final_chunks)
+        stats["skipped_count"] = skipped
         stats["used_tokens"] = used
         stats["budget_utilization"] = (
             used / available if available > 0 else 0.0
         )
         logger.info(
-            "预算装填完成: %.3fs, final=%d, used=%d, utilization=%.2f%%",
-            time.time() - t, len(final_chunks), used,
+            "预算装填完成: %.3fs, final=%d, skipped=%d, used=%d, utilization=%.2f%%",
+            time.time() - t, len(final_chunks), skipped, used,
             stats["budget_utilization"] * 100,
         )
 
@@ -150,38 +156,68 @@ class ContextManager:
             "stats": stats,
         }
 
+    def _weighted_caps(self, chunks: List[Dict], available: int) -> List[int]:
+        """按分数 softmax 加权分配每个 chunk 的压缩 cap（对应 chunk 顺序）。
+
+        高分块拿到更多预算保留内容，低分块压缩更狠让出预算。
+        温度 budget_temperature 越小越向高分集中，越大越接近均分。
+        """
+        n = max(len(chunks), 1)
+        if available <= 0 or not chunks:
+            return [0] * n
+
+        # 1. 提取分数（rerank_score 优先，回退 score，与排序同一逻辑）
+        scores = [_get_score(c) for c in chunks]
+
+        # 2. min-max 归一化，处理 Cross-Encoder 负 logit；全同分退化为均分
+        s_min, s_max = min(scores), max(scores)
+        if s_max > s_min:
+            norm = [(s - s_min) / (s_max - s_min) for s in scores]
+        else:
+            norm = [1.0] * n
+
+        # 3. softmax 温度加权
+        temp = self.budget_temperature if self.budget_temperature > 0 else 1.0
+        exps = [math.exp(x / temp) for x in norm]
+        weight_sum = sum(exps)
+        caps = [int(available * e / weight_sum) for e in exps]
+
+        # 4. 低分保底：避免被压成空串（压缩为软约束，fit_budget 仍兜底）
+        floor = min(16, max(available // (2 * n), 1))
+        caps = [max(c, floor) for c in caps]
+
+        # 5. 缩放回压：保证总和不超过 available
+        total = sum(caps)
+        if total > available:
+            scale = available / total
+            caps = [int(c * scale) for c in caps]
+        return caps
+
     def _fit_budget(self, chunks: List[Dict], available: int):
         """贪心装填到 available token 预算内。
 
-        按排序顺序逐个累加；最后一个装不下的，按剩余预算截断尾部。
-        compress 已保证单 chunk <= per_chunk_cap，这里兜底防总和超限。
+        按排序顺序逐个累加；装不下的块直接跳过（不截断、不中断），
+        把预算留给后续能完整装下的块——截断某块尾部会占用预算且停止
+        遍历，可能浪费剩余预算。compress 已保证单块 <= cap，此处仅作
+        兜底安全网（例如绕过压缩直接调用时）。
+
+        返回: (final_chunks, used_tokens, skipped_count)
         """
         final: List[Dict] = []
         used = 0
+        skipped = 0
         for chunk in chunks:
             chunk_tokens = self.token_counter.count(chunk["content"])
             if used + chunk_tokens <= available:
                 final.append(chunk)
                 used += chunk_tokens
             else:
-                # 装不下的最后一个，按剩余预算截断
-                remaining = available - used
-                if remaining > 0:
-                    truncated = self.compressor._truncate_to_tokens(
-                        chunk["content"], remaining
-                    )
-                    if truncated:
-                        new_chunk = {**chunk}
-                        new_chunk["content"] = truncated
-                        new_chunk["budget_truncated"] = True
-                        final.append(new_chunk)
-                        used += self.token_counter.count(truncated)
-                        logger.info(
-                            "预算截断: chunk_id=%s, remaining=%d, truncated_len=%d",
-                            chunk.get("chunk_id", "unknown"), remaining, len(truncated),
-                        )
-                break  # 预算用完，停止
-        return final, used
+                skipped += 1
+                logger.info(
+                    "预算跳过: chunk_id=%s, tokens=%d, used=%d/%d",
+                    chunk.get("chunk_id", "unknown"), chunk_tokens, used, available,
+                )
+        return final, used, skipped
 
     def _format_context(self, chunks: List[Dict]) -> str:
         """拼装最终 context 文本，带 chunk 编号（便于 citation 引用）。"""

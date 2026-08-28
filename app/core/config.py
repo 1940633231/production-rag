@@ -100,6 +100,10 @@ class Config:
         return self.context_config.get("order_strategy", "score")
 
     @property
+    def context_budget_temperature(self):
+        return self.context_config.get("budget_temperature", 1.0)
+
+    @property
     def dedup_span_overlap(self):
         return self.context_config.get("dedup_span_overlap", 0.5)
 
