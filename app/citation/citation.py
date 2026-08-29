@@ -21,8 +21,11 @@ logger = get_logger(__name__)
 class CitationExtractor:
     """从 LLM answer 提取 [1][2] 引用并映射到 chunks。"""
 
-    # 匹配 [1] [12] 等单个数字编号
-    REF_PATTERN = re.compile(r"\[(\d+)\]")
+    # 匹配一个括号组内的数字引用（兼容中英文括号与多种分隔符）
+    # 例：[1] [12] [1,2] [1，2] 【1、2】 [1,2,3]
+    _GROUP_PATTERN = re.compile(r"[\[【]\s*([\d\s,，、;；]+)\s*[\]】]")
+    # 括号组内提取单个数字
+    _NUMBER_PATTERN = re.compile(r"\d+")
 
     def extract(self, answer: str, chunks: List[Dict]) -> List[Dict]:
         """从 answer 提取引用编号，映射到 chunks。
@@ -48,8 +51,10 @@ class CitationExtractor:
         if not answer or not chunks:
             return []
 
-        # 提取所有 [数字] 标记
-        matches = self.REF_PATTERN.findall(answer)
+        # 提取所有引用编号（兼容 [1] [1,2] 【1】 [1、2] 等格式）
+        matches = []
+        for group in self._GROUP_PATTERN.findall(answer):
+            matches.extend(self._NUMBER_PATTERN.findall(group))
         if not matches:
             logger.info("answer 中未找到引用编号")
             return []
