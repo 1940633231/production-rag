@@ -1,0 +1,19 @@
+{
+  "created_at": "2026-08-29T20:54:11+08:00",
+  "commit": "98710d6",
+  "config": {
+    "strategy": "recursive",
+    "mode": "hybrid",
+    "rerank": true,
+    "model": "qwen-plus",
+    "top_k": 5,
+    "dataset": "data/evaluation/retrieval_dataset.json"
+  },
+  "metrics": {
+    "recall@1": 0.0,
+    "recall@3": 0.0,
+    "recall@5": 0.0,
+    "faithfulness": 1.0,
+    "relevance": 0.0
+  }
+}

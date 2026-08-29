@@ -204,7 +204,15 @@ class Config:
 
     @property
     def storage_milvus_enabled(self):
-        """Milvus 后端开关。"""
+        """Milvus 后端开关。
+
+        环境变量 MILVUS_ENABLED（1/true/yes/on）可覆盖 config.yaml，
+        便于 CI/测试临时切到 FAISS 本地索引。
+        """
+        import os
+        env_val = os.getenv("MILVUS_ENABLED")
+        if env_val is not None:
+            return env_val.strip().lower() in ("1", "true", "yes", "on")
         return self.storage_backends.get("milvus", {}).get("enabled", False)
 
     # ---- milvus 连接参数 ----
