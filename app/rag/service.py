@@ -248,6 +248,7 @@ class RAGService:
             timeout=self.config.generation_timeout,
             retry_times=self.config.generation_retry_times,
             retry_backoff=self.config.generation_retry_backoff,
+            max_concurrency=self.config.generation_max_concurrency,
         )
         logger.info(
             "Generator 初始化完成: %.3fs, type=%s",

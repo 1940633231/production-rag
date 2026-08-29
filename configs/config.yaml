@@ -52,6 +52,7 @@ generation:
   timeout: 60                   # DashScope API 超时（秒）
   retry_times: 2                # 网络异常/5xx/429 时的重试次数
   retry_backoff: 1.0            # 重试基础退避秒数（指数退避：1s → 2s）
+  max_concurrency: 4            # 最大并发 LLM 调用数（0=不限制），防止占满线程池
 
 
 storage:

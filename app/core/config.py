@@ -159,6 +159,11 @@ class Config:
     def generation_retry_backoff(self):
         return self.generation_config.get("retry_backoff", 1.0)
 
+    @property
+    def generation_max_concurrency(self):
+        """最大并发 LLM 调用数（0=不限制）。"""
+        return self.generation_config.get("max_concurrency", 4)
+
     # ---- storage 段（MySQL / ES / Milvus 持久化配置）----
 
     @property

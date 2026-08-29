@@ -15,6 +15,7 @@
 - 用于 SSE 端点真实流式输出，首字延迟≈模型开始输出时间
 """
 import os
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -37,6 +38,7 @@ class QwenGenerator(BaseGenerator):
         timeout: Optional[int] = 60,
         retry_times: int = 2,
         retry_backoff: float = 1.0,
+        max_concurrency: int = 4,
     ):
         self.model = model
         self.temperature = temperature
@@ -44,6 +46,12 @@ class QwenGenerator(BaseGenerator):
         self.timeout = timeout
         self.retry_times = retry_times
         self.retry_backoff = retry_backoff
+        # 并发信号量：限制同时进行的 DashScope 调用数（0 表示不限制）。
+        # QwenGenerator 由 get_service 缓存复用，信号量为全局共享，
+        # 改写/扩展/生成共用同一并发配额，防止占满 anyio 线程池。
+        self._sem = (
+            threading.BoundedSemaphore(max_concurrency) if max_concurrency > 0 else None
+        )
 
         logger.info(
             "QwenGenerator 初始化: model=%s, temperature=%.2f, max_tokens=%d",
@@ -149,12 +157,19 @@ class QwenGenerator(BaseGenerator):
     def generate(self, messages: List[Dict]) -> str:
         """调用 DashScope Generation API 生成回复。
 
-        参数:
-            messages: [{"role": "system"/"user"/"assistant", "content": "..."}]
-
-        返回:
-            LLM 生成的文本
+        并发信号量包裹：限制同时进行的 DashScope 调用数，
+        防止慢请求占满线程池拖垮整体（max_concurrency=0 时不限）。
         """
+        if self._sem is not None:
+            self._sem.acquire()
+        try:
+            return self._do_generate(messages)
+        finally:
+            if self._sem is not None:
+                self._sem.release()
+
+    def _do_generate(self, messages: List[Dict]) -> str:
+        """实际生成逻辑（由 generate 的并发信号量包裹）。"""
         msg_count = len(messages)
         total_chars = sum(len(m.get("content", "")) for m in messages)
         t = time.time()
@@ -218,7 +233,7 @@ class QwenGenerator(BaseGenerator):
             ) from e
 
     def stream_generate(self, messages: List[Dict]) -> Iterator[str]:
-        """流式调用 DashScope Generation API，逐片段 yield 文本。
+        """流式调用 DashScope Generation API，逐片段 yield 文本（并发信号量包裹）。
 
         用于 SSE 端点真实流式输出，避免等待整段生成完成。
         DashScope 流式返回的每条 response 含增量文本，通过
@@ -230,6 +245,16 @@ class QwenGenerator(BaseGenerator):
         yields:
             str: 增量文本片段（非累积，需由调用方拼接）
         """
+        if self._sem is not None:
+            self._sem.acquire()
+        try:
+            yield from self._do_stream_generate(messages)
+        finally:
+            if self._sem is not None:
+                self._sem.release()
+
+    def _do_stream_generate(self, messages: List[Dict]) -> Iterator[str]:
+        """实际流式生成逻辑（由 stream_generate 的并发信号量包裹）。"""
         msg_count = len(messages)
         total_chars = sum(len(m.get("content", "")) for m in messages)
         t = time.time()
