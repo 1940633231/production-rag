@@ -4,7 +4,7 @@ url = "http://localhost:8001/api/knowledge/upload?async_=true"
 
 # file 为文件对象；strategy 普通表单字段
 files = {
-    "file": open("data/raw/test1.txt", "rb")
+    "file": open("data/raw/test.txt", "rb")
 }
 data = {
     "strategy": "recursive"
