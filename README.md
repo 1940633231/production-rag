@@ -6,16 +6,18 @@
 
 - **多格式文档摄入**：支持 TXT / HTML / PDF / Word(.docx)，含清洗、分块（固定/递归）、embedding 向量化
 - **混合检索**：向量检索（FAISS）+ BM25 关键词检索 + RRF 融合，支持 Cross-Encoder 重排
-- **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、压缩截断、token 预算控制
+- **多路召回（Multi-Query）**：LLM 把查询扩展成多个角度子查询，各自检索后按 chunk 合并去重，弥补单查询召回不足
+- **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、**分数加权预算**（高分块保留更多内容）、超预算块跳过装填
 - **多轮对话**：`history` 透传 + Query 改写（LLM 指代消解，如"那价格呢"→"铁矿近期价格走势"），改写结果用于检索与生成
-- **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移
+- **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移；解析兼容 `[1,2]`、`【1】` 等多种格式
 - **流式生成**：基于 DashScope 的真流式 SSE 输出，首字延迟≈模型开始输出时间
-- **生成可靠性**：DashScope API 超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）
+- **生成可靠性**：DashScope API 超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
 - **持久化存储**：MySQL 存储文档/chunks（可选），含连接池（带超时）和 CASCADE 删除
 - **缓存优化**：embedding/reranker 模型按名复用 + 索引版本号感知，上传/删除后自动刷新索引、不重载模型
 - **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
+- **Docker 部署**：CPU/GPU 双版本镜像 + docker-compose 一键编排（RAG + MySQL，可选 ES/Milvus）
 - **评估体系**：检索指标（Recall/Precision/MRR/NDCG）+ 生成质量评估（Faithfulness/Relevance，LLM-as-Judge）
 
 ## 项目架构图
@@ -40,26 +42,27 @@ production-rag/
 │   ├── search/               # 检索引擎（vector/bm25/hybrid + RRF）
 │   ├── rerank/               # Cross-Encoder 重排器
 │   ├── context/              # 上下文管理（builder/compressor/manager）
-│   ├── generation/           # LLM 生成（Stub/Qwen + 流式 + 超时重试 + Query 改写）
-│   ├── citation/             # 引用提取
+│   ├── generation/           # LLM 生成（Stub/Qwen + 流式 + 超时重试 + Query 改写 + Multi-Query）
+│   ├── citation/             # 引用提取（兼容多种括号/分隔符格式）
 │   ├── rag/                  # RAG 编排（pipeline/service）
 │   ├── storage/              # 持久化（MySQL + 文件元数据）
 │   ├── evaluation/           # 评估（检索指标 + 生成质量）
 │   └── core/                 # 基础设施（config/env/logger/metrics/tracing/task_queue）
 ├── configs/
 │   └── config.yaml           # 主配置文件
+├── docker/                   # Docker 部署（CPU/GPU 双 Dockerfile + docker-compose）
 ├── scripts/                  # 命令行脚本
 │   ├── ingest.py             #   文档摄入脚本
 │   ├── evaluate.py           #   批量评估（检索 + 生成质量）
 │   ├── evaluate_retrieval.py #   检索评估
 │   ├── query.py              #   命令行查询
 │   └── context_demo.py      #   上下文管理演示
-├── tests/                    # 单元测试
+├── tests/                    # 单元测试（api/context/rag/generation/citation/...）
 ├── data/                     # 运行时数据（索引/原始文件）
 ├── reports/                  # 评估报告输出
 ├── main.py                   # CLI 交互式入口
 ├── requirements.txt          # 依赖清单
-└── .env                      # 环境变量（需自建，参考下文）
+└── .env                      # 环境变量（需自建，参考 .env.example）
 ```
 
 ## 环境要求
@@ -67,6 +70,7 @@ production-rag/
 - Python 3.10+
 - MySQL 8.0+（可选，`storage.enabled=false` 时不需要）
 - 阿里云 DashScope API Key（使用 Qwen LLM 时需要）
+- Docker + Docker Compose（可选，使用容器部署时需要；GPU 版另需 NVIDIA GPU + nvidia-container-toolkit）
 
 ## 快速开始
 
@@ -163,6 +167,22 @@ python main.py --strategy recursive --mode hybrid --query "铁矿供需"
 python main.py --no-rerank --query "铁矿供需"
 ```
 
+#### 方式三：Docker 部署（可选）
+
+```bash
+# 1. 准备环境变量（见上文 .env 说明；Docker 场景 MYSQL_HOST 由 compose 自动指向 mysql 服务）
+cp .env.example .env
+
+# 2a. CPU 版（默认）
+docker compose -f docker/docker-compose.yml up --build
+
+# 2b. GPU 版（需 NVIDIA GPU + nvidia-container-toolkit）
+docker compose -f docker/docker-compose.yml --profile gpu up --build
+```
+
+- 模型权重缓存（`hf_cache` 卷）与数据（`./data` 挂载）持久化，容器重建不丢失
+- 启用 ES/Milvus：取消 `docker/docker-compose.yml` 中对应服务注释，并在 `configs/config.yaml` 打开对应 `enabled: true`
+
 ## 配置说明
 
 主配置文件 `configs/config.yaml`：
@@ -178,6 +198,7 @@ chunk:
 
 retrieval:
   top_k: 5          # 检索返回数
+  multi_query: 3    # 多路召回总路数（含原始 query，如 3 = 原始 + 2 个 LLM 扩展），1 表示关闭
 
 rerank:
   model_name: BAAI/bge-reranker-base
@@ -187,6 +208,7 @@ context:
   max_context_tokens: 4096  # 上下文 token 预算
   reserved_tokens: 1024     # 给 query+prompt+answer 预留
   order_strategy: score     # 排序策略：score/document/interleaved
+  budget_temperature: 1.0   # 预算加权温度：越小越向高分集中，越大越平均
 
 generation:
   backend: qwen           # stub（占位）/ qwen（DashScope）
@@ -196,6 +218,7 @@ generation:
   timeout: 60             # DashScope API 超时（秒）
   retry_times: 2          # 网络异常/5xx/429 时的重试次数
   retry_backoff: 1.0      # 重试基础退避秒数（指数退避：1s → 2s → 4s）
+  max_concurrency: 4      # 最大并发 LLM 调用数（0=不限制），防止占满线程池
 
 storage:
   enabled: true    # 是否启用 MySQL 持久化
@@ -293,9 +316,13 @@ python scripts/evaluate.py --mode generation --output reports/gen_eval.csv
 python -m pytest tests/ -v
 
 # 运行指定模块测试
-python -m pytest tests/ingestion/test_chunker.py -v    # 分块器
-python -m pytest tests/context/test_context.py -v       # 上下文管理
-python -m pytest tests/rag/test_pipeline.py -v         # RAG 编排
+python -m pytest tests/api/test_upload_security.py -v    # 上传安全（路径穿越/大小限制）
+python -m pytest tests/api/test_e2e.py -v                # 端到端闭环（upload→chat→delete）
+python -m pytest tests/ingestion/test_chunker.py -v     # 分块器
+python -m pytest tests/context/test_context.py -v       # 上下文管理（含加权预算）
+python -m pytest tests/rag/test_pipeline.py -v          # RAG 编排（多轮/改写/多路召回）
+python -m pytest tests/generation/ -v                   # 生成（Multi-Query/并发限流）
+python -m pytest tests/citation/ -v                     # 引用提取
 python -m pytest tests/evaluation/test_eval.py -v       # 评估指标
 python -m pytest tests/storage/test_mysql_crud.py -v    # MySQL CRUD
 ```
@@ -311,8 +338,9 @@ MySQL 测试需要 MySQL 服务运行中，否则会自动跳过。
 | BM25 检索 | 自实现（基于 jieba 中文分词）；生产可替换 Elasticsearch |
 | Embedding | sentence-transformers (BGE) |
 | 重排 | Cross-Encoder (BGE-reranker) |
-| LLM 生成 | DashScope (Qwen)，含超时重试 + Query 改写 |
+| LLM 生成 | DashScope (Qwen)，含超时重试 + Query 改写 + 并发限流 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
+| 部署 | Docker（CPU/GPU 双镜像）+ docker-compose |
 | 指标采集 | prometheus-client |
 | 测试 | pytest |
 
