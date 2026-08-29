@@ -157,14 +157,18 @@ class TestRecursiveChunker:
             assert 0 <= c.start_offset < c.end_offset <= len(text)
 
     def test_single_long_sentence_truncation(self):
-        """单个超长句无分隔符时，piece 超过 chunk_size 但无更细切分，仍应返回。"""
+        """单个超长句无分隔符时，应硬切为多个不超过 chunk_size 的 chunk。"""
         text = "a" * 50  # 无任何分隔符
         doc = _make_doc(text)
         chunker = RecursiveChunker(chunk_size=10, overlap=0)
         chunks = chunker.split(doc)
-        # 无分隔符，整个文本作为一个 piece，超过 chunk_size 也只能作为一个 chunk
-        assert len(chunks) == 1
-        assert len(chunks[0].content) == 50
+        # 无分隔符 → 硬切为 ceil(50/10)=5 个 chunk，每块不超过 chunk_size
+        assert len(chunks) == 5
+        assert all(len(c.content) <= 10 for c in chunks)
+        # 拼接还原原文，offset 从 0 连续到文末
+        assert "".join(c.content for c in chunks) == text
+        assert chunks[0].start_offset == 0
+        assert chunks[-1].end_offset == len(text)
 
     def test_empty_document(self):
         doc = _make_doc("   ")
