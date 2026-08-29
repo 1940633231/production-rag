@@ -100,7 +100,7 @@ def clean_store(milvus_conn):
     except Exception:
         pass
     # 重置内部状态（便于重新创建）
-    milvus_conn._collection = None
+    milvus_conn._collection_name = None
     milvus_conn.collection_name = TEST_COLLECTION
     return milvus_conn
 
@@ -114,7 +114,7 @@ def test_add_writes_vectors_and_increments_count(clean_store):
     """add(vectors) 后 count() 应匹配。"""
     vectors = np.random.rand(8, TEST_DIM).astype("float32")
     clean_store.add(vectors)
-    clean_store._collection.flush()
+    clean_store._client.flush(TEST_COLLECTION)
     assert clean_store.count() == 8
 
 
@@ -132,7 +132,7 @@ def test_search_returns_sorted_results_in_faiss_compatible_format(clean_store):
     vectors = vectors / np.where(norms == 0, 1, norms)
 
     clean_store.add(vectors)
-    clean_store._collection.flush()
+    clean_store._client.flush(TEST_COLLECTION)
 
     # 用第 3 条向量做查询，期望最佳命中 id==3
     qv = vectors[3:4]
@@ -152,7 +152,7 @@ def test_search_pads_with_minus_one_when_fewer_results(clean_store):
     """数据量小于 top_k 时，ids/scores 尾部补 -1（FAISS 兼容）。"""
     vectors = np.random.rand(2, TEST_DIM).astype("float32")
     clean_store.add(vectors)
-    clean_store._collection.flush()
+    clean_store._client.flush(TEST_COLLECTION)
 
     scores, ids = clean_store.search(vectors[0:1], top_k=10)
     assert ids.shape == (1, 10)
@@ -189,7 +189,7 @@ def test_save_and_load_round_trip(clean_store):
 
 
 def test_drop_collection_removes_data(clean_store):
-    """drop() 后再 search 应返回空/抛错，且 utility.has_collection 为 False。"""
+    """drop() 后再 search 应返回空/抛错，且 collection 已不存在。"""
     vectors = np.random.rand(4, TEST_DIM).astype("float32")
     clean_store.add(vectors)
     clean_store.save(TEST_COLLECTION)
@@ -198,7 +198,7 @@ def test_drop_collection_removes_data(clean_store):
     clean_store.drop()
     # 再次查询：因 collection 不存在，search 前 _ensure_collection 会新建空 collection
     # count 应返回 0
-    clean_store._collection = None  # 强制重新走 ensure 路径
+    clean_store._collection_name = None  # 强制重新走 ensure 路径
     clean_store._ensure_collection(TEST_COLLECTION)
     assert clean_store.count() == 0
 
@@ -240,7 +240,7 @@ def test_auto_id_matches_enumerate_order(clean_store):
     vectors = vectors / np.where(norms == 0, 1, norms)
 
     clean_store.add(vectors)
-    clean_store._collection.flush()
+    clean_store._client.flush(TEST_COLLECTION)
     assert clean_store.count() == n
 
     for i in range(n):

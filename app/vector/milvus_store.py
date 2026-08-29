@@ -1,4 +1,4 @@
-"""Milvus 向量存储：基于 pymilvus 的分布式向量数据库后端。
+"""Milvus 向量存储：基于 pymilvus MilvusClient 的分布式向量数据库后端。
 
 依赖:
     pip install pymilvus
@@ -15,6 +15,7 @@
     - metric_type=IP（内积），与 FAISSStore 的 IndexFlatIP 对齐
     - embedding 向量需归一化（EmbeddingModel.encode 已 normalize_embeddings=True）
     - 向量主键用自增 int id，与 metadata.json 的 key（"0"/"1"/...）一一对应
+    - 使用 MilvusClient（非弃用的 ORM Collection API，兼容 pymilvus 3.1+）
     - pymilvus 未安装时抛出明确 ImportError，不强制依赖
 
 使用示例:
@@ -33,21 +34,16 @@ logger = get_logger(__name__)
 
 # 尝试导入 pymilvus，不可用时降级
 try:
-    from pymilvus import (
-        connections,
-        Collection,
-        CollectionSchema,
-        FieldSchema,
-        DataType,
-        utility,
-    )
+    from pymilvus import MilvusClient, DataType
+    from pymilvus.milvus_client.index import IndexParams
+
     _PYMILVUS_AVAILABLE = True
 except ImportError:
     _PYMILVUS_AVAILABLE = False
 
 
 class MilvusStore(BaseVectorStore):
-    """Milvus 向量存储后端。
+    """Milvus 向量存储后端（基于 MilvusClient API）。
 
     支持两种 Milvus 索引类型:
       - ivf:  IVF_FLAT，倒排索引（默认）
@@ -95,8 +91,10 @@ class MilvusStore(BaseVectorStore):
         self.hnsw_m = hnsw_m
         self.hnsw_ef_construction = hnsw_ef_construction
         self.hnsw_ef_search = hnsw_ef_search
-        self._collection: Optional[Any] = None
+        self._client: Optional[Any] = None
         self._connected = False
+        # 当前生效的 collection（add/load 后非 None，search 依赖它）
+        self._collection_name: Optional[str] = None
 
     # ---- 连接管理 ----
 
@@ -105,16 +103,30 @@ class MilvusStore(BaseVectorStore):
         if self._connected:
             return
         t = time.time()
-        alias = "rag_{}".format(id(self))
-        logger.info("连接 Milvus: %s:%s (alias=%s)", self.host, self.port, alias)
-        connections.connect(
-            alias=alias,
-            host=self.host,
-            port=str(self.port),
-        )
-        self._alias = alias
+        uri = "http://{}:{}".format(self.host, self.port)
+        logger.info("连接 Milvus: %s", uri)
+        self._client = MilvusClient(uri=uri)
         self._connected = True
         logger.info("Milvus 连接成功: %.3fs", time.time() - t)
+
+    def _build_index_params(self) -> IndexParams:
+        """按索引类型构建 IndexParams（IVF_FLAT / HNSW）。"""
+        index_params = IndexParams()
+        if self.index_type == "hnsw":
+            index_params.add_index(
+                field_name="embedding",
+                index_type="HNSW",
+                metric_type="IP",
+                params={"M": self.hnsw_m, "efConstruction": self.hnsw_ef_construction},
+            )
+        else:  # 默认 ivf
+            index_params.add_index(
+                field_name="embedding",
+                index_type="IVF_FLAT",
+                metric_type="IP",
+                params={"nlist": self.ivf_nlist},
+            )
+        return index_params
 
     def _ensure_collection(self, collection_name: str):
         """确保 collection 存在，不存在则创建。
@@ -123,62 +135,41 @@ class MilvusStore(BaseVectorStore):
         保证与 chunks enumerate 顺序、FAISS store 的 position 严格对齐。
         """
         self._connect()
+        self._collection_name = collection_name
 
-        if utility.has_collection(collection_name, using=self._alias):
-            self._collection = Collection(
-                collection_name, using=self._alias
-            )
+        if self._client.has_collection(collection_name):
             logger.info(
                 "加载已有 collection: %s, rows=%d",
-                collection_name, self._collection.num_entities,
+                collection_name, self._row_count(collection_name),
             )
             return
 
-        # 创建新 collection
+        # 创建新 collection（schema + 指定索引类型，create_collection 会建索引并加载）
         logger.info(
-            "创建 collection: %s, dim=%d, metric=IP",
-            collection_name, self.dimension,
+            "创建 collection: %s, dim=%d, metric=IP, index=%s",
+            collection_name, self.dimension, self.index_type,
         )
-        fields = [
-            FieldSchema(
-                name="id",
-                dtype=DataType.INT64,
-                is_primary=True,
-                auto_id=False,  # 关键：由 add() 显式写入 vector_id=0..N-1，保证对齐
-            ),
-            FieldSchema(
-                name="embedding",
-                dtype=DataType.FLOAT_VECTOR,
-                dim=self.dimension,
-            ),
-        ]
-        schema = CollectionSchema(fields, description="RAG production vectors")
-        self._collection = Collection(
-            collection_name, schema=schema, using=self._alias
-        )
-        # 根据索引类型创建索引
-        if self.index_type == "hnsw":
-            index_params = {
-                "metric_type": "IP",
-                "index_type": "HNSW",
-                "params": {
-                    "M": self.hnsw_m,
-                    "efConstruction": self.hnsw_ef_construction,
-                },
-            }
-        else:  # 默认 ivf
-            index_params = {
-                "metric_type": "IP",
-                "index_type": "IVF_FLAT",
-                "params": {"nlist": self.ivf_nlist},
-            }
-        self._collection.create_index(
-            field_name="embedding", index_params=index_params
+        schema = self._client.create_schema(auto_id=False)
+        schema.add_field("id", DataType.INT64, is_primary=True)
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self.dimension)
+        self._client.create_collection(
+            collection_name,
+            schema=schema,
+            index_params=self._build_index_params(),
         )
         logger.info(
             "collection 创建并建索引完成: %s, index_type=%s",
             collection_name, self.index_type,
         )
+
+    def _row_count(self, collection_name: str) -> int:
+        """返回 collection 的持久化行数。"""
+        try:
+            stats = self._client.get_collection_stats(collection_name)
+            return int(stats.get("row_count", 0))
+        except Exception as e:
+            logger.debug("获取 collection 行数失败: %s", e)
+            return 0
 
     # ---- 接口实现 ----
 
@@ -208,13 +199,15 @@ class MilvusStore(BaseVectorStore):
 
         # 显式生成 vector_id=0..N-1 并作为主键写入（auto_id=False）
         # 保证 Milvus 返回的 id 与 chunks enumerate 顺序、FAISS position 严格对齐
-        n = vectors.shape[0]
-        vector_ids = list(range(n))
-        self._collection.insert([vector_ids, vectors.tolist()])
-        self._collection.flush()
+        data = [
+            {"id": i, "embedding": vectors[i].tolist()}
+            for i in range(vectors.shape[0])
+        ]
+        self._client.insert(self.collection_name, data)
+        self._client.flush(self.collection_name)
         logger.info(
             "Milvus 写入完成: %.3fs, total_rows=%d",
-            time.time() - t, self._collection.num_entities,
+            time.time() - t, self._row_count(self.collection_name),
         )
 
     def search(self, query_vector, top_k):
@@ -231,7 +224,7 @@ class MilvusStore(BaseVectorStore):
         """
         import numpy as np
 
-        if self._collection is None:
+        if self._collection_name is None:
             raise RuntimeError(
                 "collection 未加载，请先调用 load(path) 或 add(vectors)"
             )
@@ -242,7 +235,7 @@ class MilvusStore(BaseVectorStore):
             query_vector = query_vector.reshape(1, -1)
 
         t = time.time()
-        self._collection.load()
+        self._client.load_collection(self._collection_name)
 
         # 按索引类型设置搜索参数
         if self.index_type == "hnsw":
@@ -250,12 +243,12 @@ class MilvusStore(BaseVectorStore):
         else:  # ivf
             search_params = {"metric_type": "IP", "params": {"nprobe": self.ivf_nprobe}}
 
-        results = self._collection.search(
+        results = self._client.search(
+            self._collection_name,
             data=query_vector.tolist(),
             anns_field="embedding",
-            param=search_params,
+            search_params=search_params,
             limit=top_k,
-            output_fields=None,
         )
         logger.info(
             "Milvus 检索: %.3fs, top_k=%d, 返回=%d, index_type=%s",
@@ -268,8 +261,8 @@ class MilvusStore(BaseVectorStore):
         ids_list: List[int] = []
         if results and len(results) > 0:
             for hit in results[0]:
-                scores_list.append(float(hit.score))
-                ids_list.append(int(hit.id))
+                scores_list.append(float(hit.get("distance", -1.0)))
+                ids_list.append(int(hit.get("id", -1)))
 
         # 不足 top_k 时补 -1（与 FAISS 行为一致）
         while len(ids_list) < top_k:
@@ -287,7 +280,7 @@ class MilvusStore(BaseVectorStore):
         path 参数作为 collection name（覆盖初始化时的 collection_name），
         保持与 FAISSStore.save(path) 接口一致。
         """
-        if self._collection is None:
+        if self._collection_name is None:
             raise RuntimeError("无数据可保存，请先 add(vectors)")
 
         # path 作为 collection name
@@ -301,7 +294,7 @@ class MilvusStore(BaseVectorStore):
             self.collection_name = collection_name
             self._ensure_collection(collection_name)
         # Milvus 数据已在远端持久化，flush 确保写入磁盘
-        self._collection.flush()
+        self._client.flush(self.collection_name)
         logger.info("Milvus 索引已保存: collection=%s", collection_name)
 
     def load(self, path):
@@ -313,10 +306,10 @@ class MilvusStore(BaseVectorStore):
         collection_name = str(path)
         self.collection_name = collection_name
         self._ensure_collection(collection_name)
-        self._collection.load()
+        self._client.load_collection(collection_name)
         logger.info(
             "Milvus 索引已加载: collection=%s, rows=%d",
-            collection_name, self._collection.num_entities,
+            collection_name, self._row_count(collection_name),
         )
 
     # ---- 辅助方法 ----
@@ -329,24 +322,25 @@ class MilvusStore(BaseVectorStore):
         """
         self._connect()
         name = collection_name or self.collection_name
-        if utility.has_collection(name, using=self._alias):
-            utility.drop_collection(name, using=self._alias)
+        if self._client.has_collection(name):
+            self._client.drop_collection(name)
             logger.warning("已删除 collection: %s", name)
         else:
             logger.info("collection 不存在，无需删除: %s", name)
 
     def count(self) -> int:
         """返回当前 collection 中的向量数。"""
-        if self._collection is None:
+        if self._client is None or self._collection_name is None:
             return 0
-        return self._collection.num_entities
+        return self._row_count(self._collection_name)
 
     def close(self):
         """断开 Milvus 连接。"""
         if self._connected:
             try:
-                connections.disconnect(self._alias)
+                self._client.close()
             except Exception:
                 pass
             self._connected = False
+            self._client = None
             logger.info("Milvus 连接已断开")
