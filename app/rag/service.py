@@ -260,6 +260,14 @@ class RAGService:
             from app.generation.query_rewriter import QueryRewriter
             query_rewriter = QueryRewriter(generator)
 
+        # ---- Multi-Query 扩展器（多路召回；stub/关闭时回退单路）----
+        multi_query_expander = None
+        if generator is not None and self.config.retrieval_multi_query > 1:
+            from app.generation.multi_query import MultiQueryExpander
+            multi_query_expander = MultiQueryExpander(
+                generator, num_queries=self.config.retrieval_multi_query
+            )
+
         logger.info("pipeline 构建完成: 总耗时=%.3fs", time.time() - build_start)
         return RAGPipeline(
             retriever=retriever,
@@ -267,6 +275,7 @@ class RAGService:
             context_manager=context_manager,
             generator=generator,
             query_rewriter=query_rewriter,
+            multi_query_expander=multi_query_expander,
             top_k=self.config.retrieval_top_k,
             rerank_candidate_pool=self.config.rerank_candidate_pool,
         )

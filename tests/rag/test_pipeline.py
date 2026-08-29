@@ -408,3 +408,85 @@ class TestPipelineQueryRewrite:
         types = [e["type"] for e in events]
         assert "delta" in types
         assert types[-1] == "done"
+
+
+# ============================================================
+# Multi-Query 多路召回
+# ============================================================
+
+class _MockMultiQueryExpander:
+    """Mock 扩展器：返回固定子查询列表，记录调用次数。"""
+
+    def __init__(self, queries):
+        self.queries = queries
+        self.called = 0
+
+    def expand(self, query):
+        self.called += 1
+        return self.queries
+
+
+class TestPipelineMultiQuery:
+    def test_multi_query_expands_retrieval(self):
+        """启用扩展器时应多路检索，stats 记录路数。"""
+        retriever = _RecordingRetriever(_mock_chunks())
+        expander = _MockMultiQueryExpander(["主问题", "子问题A", "子问题B"])
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            multi_query_expander=expander,
+            top_k=2,
+        )
+        resp = pipeline.run("主问题")
+        assert expander.called == 1
+        # 每路子查询各检索一次
+        assert retriever.queries == ["主问题", "子问题A", "子问题B"]
+        assert resp.stats["query_count"] == 3
+        assert resp.stats["merged_candidates"] >= 1
+
+    def test_multi_query_merged_dedup(self):
+        """多路检索结果应按 chunk_id 去重合并。"""
+        retriever = _RecordingRetriever(_mock_chunks())  # mock 每路返回相同 chunks
+        expander = _MockMultiQueryExpander(["q1", "q2", "q3"])
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            multi_query_expander=expander,
+            top_k=2,
+        )
+        resp = pipeline.run("q1")
+        # 3 路 × top_k=2，但 mock 返回的 chunk 相同 → 去重后 2 个候选
+        assert resp.stats["query_count"] == 3
+        assert resp.stats["merged_candidates"] == 2
+        # 未启用 rerank：按 score 降序取 top_k
+        assert len(resp.chunks) == 2
+        assert resp.chunks[0]["score"] >= resp.chunks[1]["score"]
+
+    def test_no_expander_single_route(self):
+        """未注入扩展器时保持单路检索。"""
+        retriever = _RecordingRetriever(_mock_chunks())
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            multi_query_expander=None,
+            top_k=2,
+        )
+        resp = pipeline.run("q1")
+        assert retriever.queries == ["q1"]
+        assert resp.stats["query_count"] == 1
+
+    def test_stream_uses_multi_query(self):
+        """流式端点同样走多路召回。"""
+        retriever = _RecordingRetriever(_mock_chunks())
+        expander = _MockMultiQueryExpander(["q1", "q2"])
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            multi_query_expander=expander,
+            top_k=2,
+        )
+        events = list(pipeline.run_stream("q1"))
+        assert retriever.queries == ["q1", "q2"]
+        meta = events[0]
+        assert meta["stats"]["query_count"] == 2
+        assert "delta" in [e["type"] for e in events]

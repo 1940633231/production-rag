@@ -69,6 +69,11 @@ class Config:
         return self.data["retrieval"]["top_k"]
 
     @property
+    def retrieval_multi_query(self):
+        """多路召回总路数（含原始 query），1 或缺失表示关闭。"""
+        return self.data.get("retrieval", {}).get("multi_query", 1)
+
+    @property
     def rerank_model(self):
         return self.data["rerank"]["model_name"]
 

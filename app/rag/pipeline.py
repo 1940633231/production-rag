@@ -15,7 +15,7 @@
     → RAGResponse（context + chunks + stats + answer）
 """
 import time
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from app.core.logger import get_logger
 from app.citation.citation import CitationExtractor
@@ -44,6 +44,7 @@ class RAGPipeline:
         generator=None,
         prompt_builder=None,
         query_rewriter=None,
+        multi_query_expander=None,
         top_k: int = 5,
         rerank_candidate_pool: int = 50,
     ):
@@ -53,6 +54,7 @@ class RAGPipeline:
         self.generator = generator
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.query_rewriter = query_rewriter
+        self.multi_query_expander = multi_query_expander
         self.top_k = top_k
         self.rerank_candidate_pool = rerank_candidate_pool
 
@@ -69,9 +71,9 @@ class RAGPipeline:
         return rewritten, rewritten != query
 
     def _retrieve_and_context(self, query: str):
-        """执行 retrieve → rerank → context_manager，返回 (context, chunks, stats)。
+        """执行 multi-query → retrieve → rerank → context_manager。
 
-        供 run() 和 run_stream() 复用，避免重复代码。
+        返回 (context, chunks, stats)。供 run() 和 run_stream() 复用。
         同时记录检索/重排阶段 Prometheus 指标。
         """
         from app.core.metrics import metrics
@@ -79,30 +81,79 @@ class RAGPipeline:
         # 推断 strategy（用于指标标签）
         strategy = getattr(self.retriever, "strategy", "unknown")
 
-        # 1. 检索
-        t = time.time()
-        if self.reranker is not None:
-            candidates = self.retriever.search(query, top_k=self.rerank_candidate_pool)
-            metrics.record_retrieval(strategy, time.time() - t)
+        # 0. Multi-Query 扩展（多路召回）
+        queries = [query]
+        if self.multi_query_expander is not None:
+            t = time.time()
+            queries = self.multi_query_expander.expand(query)
+            logger.info(
+                "多路召回: %.3fs, %d 路查询: %r",
+                time.time() - t, len(queries), [q[:30] for q in queries],
+            )
 
-            # 1b. 重排
+        # 1. 多路检索 + 合并去重
+        t = time.time()
+        candidates = self._search_all(query, queries)
+        metrics.record_retrieval(strategy, time.time() - t)
+
+        # 1b. 重排（整体重排，query 用主查询）
+        if self.reranker is not None:
             t = time.time()
             results = self.reranker.rerank(query, candidates, top_k=self.top_k)
             metrics.record_rerank(time.time() - t)
         else:
-            results = self.retriever.search(query, top_k=self.top_k)
-            metrics.record_retrieval(strategy, time.time() - t)
+            # 未启用 rerank：多路合并后按 score 降序取 top_k
+            results = sorted(
+                candidates, key=lambda r: r.get("score", 0.0), reverse=True
+            )[:self.top_k]
 
         # 2. ContextManager
         if self.context_manager is not None:
             ctx_result = self.context_manager.build(query, results)
+            ctx_result["stats"]["query_count"] = len(queries)
+            ctx_result["stats"]["merged_candidates"] = len(candidates)
             return ctx_result["context"], ctx_result["chunks"], ctx_result["stats"]
 
         # Fallback
         context = "\n\n".join(
             "[{}] {}".format(i + 1, r["content"]) for i, r in enumerate(results)
         )
-        return context, results, {"input_count": len(results)}
+        return context, results, {
+            "input_count": len(results),
+            "query_count": len(queries),
+            "merged_candidates": len(candidates),
+        }
+
+    def _search_all(self, query: str, queries: List[str]) -> List[Dict]:
+        """对每路子查询检索并合并去重（按 chunk_id）。
+
+        每路候选数：rerank 启用时均分 rerank_candidate_pool（合并后总量≈pool），
+        未启用时每路取 top_k。合并结果供重排或按分数排序。
+        """
+        if len(queries) <= 1:
+            topk = (
+                self.rerank_candidate_pool
+                if self.reranker is not None
+                else self.top_k
+            )
+            return self.retriever.search(query, top_k=topk)
+
+        per_query = (
+            self.rerank_candidate_pool // len(queries)
+            if self.reranker is not None
+            else self.top_k
+        )
+        per_query = max(per_query, 1)
+        merged: List[Dict] = []
+        seen = set()
+        for q in queries:
+            for r in self.retriever.search(q, top_k=per_query):
+                cid = r.get("chunk_id")
+                if cid is None or cid not in seen:
+                    seen.add(cid)
+                    merged.append(r)
+        logger.info("多路检索合并: %d 路 → %d 候选", len(queries), len(merged))
+        return merged
 
     def run(self, query: str, history: Optional[List] = None) -> RAGResponse:
         """执行 retrieve → rerank → context_manager → generator 链路。

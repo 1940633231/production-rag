@@ -24,6 +24,7 @@ chunk:
 
 retrieval:
   top_k: 5
+  multi_query: 3            # 多路召回总路数（含原始 query，如 3 = 原始 + 2 个 LLM 扩展），1 表示关闭
 
 
 rerank:
