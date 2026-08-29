@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+# Production RAG - GPU 版镜像（需要 NVIDIA GPU + nvidia-container-toolkit）
+#
+# 构建: docker build -f docker/Dockerfile.gpu -t production-rag:gpu .
+# 运行: docker run --gpus all --env-file .env -p 8000:8000 \
+#         -v "$PWD/data:/app/data" production-rag:gpu
+#
+# 说明:
+#   - 基于 CUDA 12.1 runtime，embedding/reranker 推理跑在 GPU
+#   - 检索仍用 faiss-cpu（FAISS 本身不依赖 GPU），GPU 只加速 transformer 推理
+FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
+
+# 运行参数
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/cache/hf \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# ubuntu22.04 自带 python3.10
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 python3-pip python3.10-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -s /usr/bin/pip3 /usr/local/bin/pip
+
+WORKDIR /app
+
+# 1. 先装 CUDA 12.1 版 torch（requirements 里 torch>=2.0 默认拉 CUDA 大包，
+#    这里显式固定 cu121 版本，保证与 cuda 12.1 runtime 镜像匹配）
+RUN pip install --upgrade pip \
+ && pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.3.0
+
+# 2. 装其余依赖
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 3. 拷贝代码与配置
+COPY app/ app/
+COPY configs/ configs/
+COPY main.py .
+
+# 4. 运行时数据目录
+RUN mkdir -p data/raw data/index reports logs
+
+EXPOSE 8000
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)" || exit 1
+
+CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]

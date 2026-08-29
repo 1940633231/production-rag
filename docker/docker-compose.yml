@@ -1,0 +1,95 @@
+# Production RAG 编排：RAG 服务 + MySQL（默认启用，对应 config.yaml 的 mysql.enabled=true）
+#
+# 使用:
+#   cp .env.example .env                    # 准备环境变量（项目根）
+#   docker compose -f docker/docker-compose.yml up --build    # CPU 版
+#   docker compose -f docker/docker-compose.yml --profile gpu up --build   # GPU 版
+#
+# 启用 ES/Milvus：取消下方对应服务注释，并同时在 configs/config.yaml 打开
+# storage.backends.es.enabled / storage.backends.milvus.enabled。
+
+# 两个 RAG 变体共享的公共配置（YAML 锚点）
+x-rag-common: &rag-common
+  env_file: ../.env
+  environment:
+    MYSQL_HOST: mysql            # 指向 compose 内的 mysql 服务
+    HF_HOME: /app/cache/hf
+  volumes:
+    - ../data:/app/data          # 文档 + 索引持久化
+    - hf_cache:/app/cache/hf     # 模型权重缓存（避免每次重建重新下载）
+  depends_on:
+    mysql:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+services:
+  rag:                          # CPU 版（默认）
+    <<: *rag-common
+    build:
+      context: ..               # build context 必须是项目根（.dockerignore 在根）
+      dockerfile: docker/Dockerfile.cpu
+    image: production-rag:cpu
+    ports:
+      - "8000:8000"
+
+  rag-gpu:                      # GPU 版（docker compose --profile gpu up）
+    <<: *rag-common
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    image: production-rag:gpu
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-production_rag}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---- 可选：Elasticsearch（需 config.yaml 打开 es.enabled）----
+  # elasticsearch:
+  #   image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+  #   environment:
+  #     discovery.type: single-node
+  #     ES_JAVA_OPTS: -Xms512m -Xmx512m
+  #     xpack.security.enabled: "false"
+  #   ports:
+  #     - "9200:9200"
+  #   volumes:
+  #     - es_data:/usr/share/elasticsearch/data
+
+  # ---- 可选：Milvus（需 config.yaml 打开 milvus.enabled）----
+  # milvus:
+  #   image: milvusdb/milvus:v2.4.9
+  #   command: ["milvus", "run", "standalone"]
+  #   ports:
+  #     - "19530:19530"
+  #   volumes:
+  #     - milvus_data:/var/lib/milvus
+
+volumes:
+  mysql_data:
+  hf_cache:
+  # es_data:
+  # milvus_data:

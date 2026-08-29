@@ -1,0 +1,19 @@
+# 依赖与环境
+.venv/
+.env
+*.pyc
+__pycache__/
+
+# 数据与运行时产物（挂载卷，不进镜像）
+data/
+reports/
+logs/
+.pytest_cache/
+
+# 代码仓库与文档
+.git/
+tests/
+Dockerfile
+docker-compose.yml
+*.md
+design.png

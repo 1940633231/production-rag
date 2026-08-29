@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# Production RAG - CPU 版镜像
+#
+# 构建: docker build -f docker/Dockerfile.cpu -t production-rag:cpu .
+# 运行: docker run --env-file .env -p 8000:8000 -v "$PWD/data:/app/data" production-rag:cpu
+#
+# 注意: build context 必须是项目根目录（compose 中已配置 context: ..）
+FROM python:3.10-slim
+
+# 运行参数
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/cache/hf \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+WORKDIR /app
+
+# 1. 先装 CPU 版 torch（requirements 里 torch>=2.0 默认拉 CUDA 大包，体积 3GB+）
+#    装完后 requirements 的 torch 约束自动满足，后续不会重复安装
+RUN pip install --upgrade pip \
+ && pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+# 2. 装其余依赖（利用层缓存：requirements.txt 不变则此层不重建）
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 3. 拷贝代码与配置（.dockerignore 已排除 .venv/data/tests 等）
+COPY app/ app/
+COPY configs/ configs/
+COPY main.py .
+
+# 4. 运行时数据目录（文档/索引/reports 通过 volume 挂载持久化）
+RUN mkdir -p data/raw data/index reports logs
+
+EXPOSE 8000
+
+# 健康检查：用 python 内置 urllib（避免额外安装 curl）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).status==200 else 1)" || exit 1
+
+CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
