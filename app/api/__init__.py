@@ -60,6 +60,18 @@ def create_app() -> FastAPI:
         content, content_type = metrics.export()
         return Response(content=content, media_type=content_type)
 
+    # 静态资源托管（管理台页面）
+    from fastapi.staticfiles import StaticFiles
+    from pathlib import Path
+    static_dir = Path(__file__).resolve().parent.parent / "static"
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    # 管理台入口
+    @app.get("/admin", include_in_schema=False)
+    async def admin():
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/static/index.html")
+
     # 根路由
     @app.get("/")
     async def root():
