@@ -122,10 +122,11 @@ def build_index(texts, model):
 
 
 def retrieve(query_texts, index, embeddings, model, top_k, corpus_df, corpus_ids,
-             reranker=None):
+             reranker=None, candidate_k=100):
     """逐条 query 检索，返回每个 query 的 corpus id 列表。
 
     corpus_df: 采样后的 corpus DataFrame（id/text 列），供 rerank 取文本。
+    candidate_k: rerank 前的粗筛候选池大小（越小重排越快）。
     """
     results = []
     batch = model.encode(list(query_texts))
@@ -136,7 +137,7 @@ def retrieve(query_texts, index, embeddings, model, top_k, corpus_df, corpus_ids
             results.append([corpus_ids[j] for j in ids[0]])
         else:
             # 粗筛候选池 → rerank 精排（rerank 需要候选含 content 文本）
-            candidate_k = min(100, len(corpus_ids))
+            candidate_k = min(candidate_k, len(corpus_ids))
             _s, ids = index.search(qv, candidate_k)
             candidate_rows = corpus_df.iloc[ids[0]]
             candidates = [
@@ -191,6 +192,12 @@ def run():
                         help="限制评测 query 条数（默认 500，全量 22812 条）")
     parser.add_argument("--top-k", type=int, default=10, help="检索返回条数（默认 10）")
     parser.add_argument("--rerank", action="store_true", help="启用 Cross-Encoder 重排")
+    parser.add_argument("--candidate-k", type=int, default=30,
+                        help="rerank 前粗筛候选池大小（默认 30，越小重排越快）")
+    parser.add_argument("--rerank-batch", type=int, default=8,
+                        help="rerank CrossEncoder 推理 batch（默认 8）")
+    parser.add_argument("--rerank-device", default=None,
+                        help="rerank 设备：None 自动 / cpu / cuda（默认 None）")
     parser.add_argument("--save-baseline", metavar="PATH", help="保存评估结果为新基线")
     parser.add_argument("--compare", metavar="PATH", help="与基线对比并执行门禁")
     parser.add_argument("--trend", default="reports/cmteb_trend.csv", help="趋势 CSV")
@@ -227,13 +234,17 @@ def run():
     if args.rerank:
         from app.rerank.reranker import Reranker
         t = time.time()
-        reranker = Reranker(config.rerank_model)
+        reranker = Reranker(
+            config.rerank_model,
+            device=args.rerank_device,
+            batch_size=args.rerank_batch,
+        )
         logger.info("reranker 加载完成: %.3fs", time.time() - t)
 
     t = time.time()
     retrieved_list = retrieve(
         query_texts, index, _embeddings, model, args.top_k, corpus, corpus_ids,
-        reranker,
+        reranker, args.candidate_k,
     )
     print("检索完成: {} 条 query, 耗时 {:.1f}s".format(
         len(query_texts), time.time() - t,

@@ -14,7 +14,11 @@ class EmbeddingModel:
         logger.info("加载 embedding 模型: %s", model_name)
         self.model = SentenceTransformer(model_name)
         # 缓存向量维度，供 FAISSStore 动态使用（避免换模型时硬编码崩溃）
-        self.dimension = self.model.get_sentence_embedding_dimension()
+        # 新 API: get_embedding_dimension；旧版回退 get_sentence_embedding_dimension
+        getter = getattr(self.model, "get_embedding_dimension", None)
+        if getter is None:
+            getter = self.model.get_sentence_embedding_dimension
+        self.dimension = getter()
         logger.info(
             "embedding 模型加载完成: %.3fs, dim=%d",
             time.time() - t, self.dimension,
