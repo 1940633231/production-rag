@@ -12,13 +12,17 @@
 - **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移；解析兼容 `[1,2]`、`【1】` 等多种格式
 - **流式生成**：基于 DashScope 的真流式 SSE 输出，首字延迟≈模型开始输出时间
 - **生成可靠性**：DashScope API 超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
-- **持久化存储**：MySQL 存储文档/chunks（可选），含连接池（带超时）和 CASCADE 删除
+- **多后端持久化**：MySQL 存储文档/chunks（含连接池与 CASCADE 删除）+ Elasticsearch 全文检索 + Milvus 向量库（替代本地 FAISS），均可按开关启用
 - **缓存优化**：embedding/reranker 模型按名复用 + 索引版本号感知，上传/删除后自动刷新索引、不重载模型
 - **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
+- **管理台 Web UI**：浏览器可视化问答、上传/删除文档、索引状态（`/` 自动跳转）
 - **Docker 部署**：CPU/GPU 双版本镜像 + docker-compose 一键编排（RAG + MySQL，可选 ES/Milvus）
 - **评估体系**：检索指标（Recall/Precision/MRR/NDCG）+ 生成质量评估（Faithfulness/Relevance，LLM-as-Judge）
+- **评估回归闭环**：基线存档（`--save-baseline`）/ 对比门禁（`--compare`，指标跌破阈值退出码 1）/ 趋势沉淀（trend.csv）
+- **C-MTEB 中文检索基准**：接入 T2Retrieval 评测 + corpus embedding 缓存（corpus 未变直接复用，GitHub Runner 免重复编码）
+- **CI 门禁**：GitHub Actions 自动跑测试 + 检索门禁（与入库基线对比，回退即拦截），支持手动全量评测
 
 ## 项目架构图
 
@@ -45,32 +49,42 @@ production-rag/
 │   ├── generation/           # LLM 生成（Stub/Qwen + 流式 + 超时重试 + Query 改写 + Multi-Query）
 │   ├── citation/             # 引用提取（兼容多种括号/分隔符格式）
 │   ├── rag/                  # RAG 编排（pipeline/service）
-│   ├── storage/              # 持久化（MySQL + 文件元数据）
-│   ├── evaluation/           # 评估（检索指标 + 生成质量）
+│   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document 仓储）
+│   ├── evaluation/           # 评估（检索指标 / 生成质量 / 回归闭环基线门禁趋势）
+│   ├── vector/               # 向量存储（FAISS / Milvus 双后端）
+│   ├── static/               # 管理台 Web UI
 │   └── core/                 # 基础设施（config/env/logger/metrics/tracing/task_queue）
 ├── configs/
 │   └── config.yaml           # 主配置文件
+├── .github/workflows/        # CI 门禁（test + eval 检索门禁 + full-eval 全量评测）
 ├── docker/                   # Docker 部署（CPU/GPU 双 Dockerfile + docker-compose）
 ├── scripts/                  # 命令行脚本
 │   ├── ingest.py             #   文档摄入脚本
-│   ├── evaluate.py           #   批量评估（检索 + 生成质量）
-│   ├── evaluate_retrieval.py #   检索评估
+│   ├── rebuild_index.py      #   全量重建索引（FAISS + MySQL + ES）
+│   ├── evaluate.py           #   批量评估（检索 + 生成质量 + 回归闭环）
+│   ├── build_eval_dataset.py #   基于 data/raw 自动构建评估数据集
+│   ├── download_cmteb.py     #   下载 C-MTEB T2Retrieval 数据（hf-mirror 国内镜像）
+│   ├── eval_cmteb.py         #   C-MTEB 检索评测（含 embedding 缓存）
+│   ├── cmteb_rerank_diag.py  #   rerank 消融诊断（候选池截断对比）
 │   ├── query.py              #   命令行查询
-│   └── context_demo.py      #   上下文管理演示
-├── tests/                    # 单元测试（api/context/rag/generation/citation/...）
-├── data/                     # 运行时数据（索引/原始文件）
-├── reports/                  # 评估报告输出
+│   └── context_demo.py       #   上下文管理演示
+├── tests/                    # 单元测试（api/context/rag/generation/citation/eval/storage/...）
+├── data/                     # 运行时数据（索引/原始文件/评测数据集）
+├── reports/                  # 评估报告输出（baseline/trend/CSV 明细）
 ├── main.py                   # CLI 交互式入口
-├── requirements.txt          # 依赖清单
+├── requirements.txt          # 依赖清单（pandas/pyarrow 等 C-MTEB 评测依赖）
 └── .env                      # 环境变量（需自建，参考 .env.example）
 ```
 
 ## 环境要求
 
 - Python 3.10+
-- MySQL 8.0+（可选，`storage.enabled=false` 时不需要）
+- MySQL 8.0+（可选，`storage.backends.mysql.enabled=false` 时不需要）
+- Elasticsearch 8.x（可选，`storage.backends.es.enabled=false` 时不需要）
+- Milvus 2.x（可选，`storage.backends.milvus.enabled=false` 时回退本地 FAISS 索引）
 - 阿里云 DashScope API Key（使用 Qwen LLM 时需要）
 - Docker + Docker Compose（可选，使用容器部署时需要；GPU 版另需 NVIDIA GPU + nvidia-container-toolkit）
+- 网络（C-MTEB 评测需下载数据集与模型，默认走 hf-mirror 国内镜像）
 
 ## 快速开始
 
@@ -99,7 +113,7 @@ pip install -r requirements.txt
 DASHSCOPE_API_KEY=sk-your-api-key-here
 DASHSCOPE_MODEL=qwen-plus
 
-# MySQL（不使用 MySQL 可在 config.yaml 中设 storage.enabled=false）
+# MySQL（不使用 MySQL 可在 config.yaml 中设 storage.backends.mysql.enabled=false）
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=root
@@ -147,6 +161,7 @@ uvicorn app.api:app --host 127.0.0.1 --port 8080
 ```
 
 启动后访问：
+- 管理台 Web UI：http://localhost:8000/（自动跳转 `/static/index.html`）
 - API 文档（Swagger）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/api/health
 - Prometheus 指标：http://localhost:8000/metrics
@@ -192,6 +207,13 @@ embedding:
   model_name: BAAI/bge-small-zh-v1.5  # embedding 模型
   batch_size: 32
 
+vector:
+  index_type: ivf        # flat（暴力）/ ivf / hnsw
+  ivf_nlist: 128         # IVF 聚类中心数
+  ivf_nprobe: 16         # 检索探测聚类数（越大越准越慢）
+  hnsw_m: 16             # HNSW 邻居数
+  hnsw_ef_search: 64     # HNSW 检索候选池
+
 chunk:
   chunk_size: 100   # 每块字符数
   overlap: 20       # 重叠字符数
@@ -221,8 +243,14 @@ generation:
   max_concurrency: 4      # 最大并发 LLM 调用数（0=不限制），防止占满线程池
 
 storage:
-  enabled: true    # 是否启用 MySQL 持久化
   pool_size: 5     # 连接池大小
+  backends:
+    mysql:
+      enabled: true       # MySQL 结构化存储（documents + chunks 表）
+    es:
+      enabled: true       # Elasticsearch 全文检索（BM25 后端的生产版）
+    milvus:
+      enabled: true       # Milvus 向量库（false 时回退本地 FAISS）
 ```
 
 ## API 接口
@@ -287,27 +315,86 @@ curl http://localhost:8000/api/knowledge/tasks/{task_id}
 
 ## 评估
 
+评估体系分三层：**检索评估**（Recall/MRR/NDCG）、**生成质量评估**（Faithfulness/Relevance）、**回归闭环**（基线/对比/门禁/趋势），并支持 **C-MTEB 中文检索基准**。
+
 ### 检索评估
 
 ```bash
 # 评估检索指标（Recall/Precision/MRR/NDCG）
 python scripts/evaluate.py --mode retrieval --strategy recursive
 
-# 指定检索模式
-python scripts/evaluate_retrieval.py --strategy recursive --mode hybrid --rerank
+# 指定检索模式（hybrid 融合 / 纯向量 / 纯 BM25），跳过 rerank 用 --no-rerank
+python scripts/evaluate.py --mode retrieval --strategy recursive --search-mode hybrid
 ```
 
 ### 生成质量评估
 
 ```bash
-# 评估 Faithfulness + Relevance，输出 CSV 报告
+# 评估 Faithfulness + Relevance（LLM-as-Judge，需要 DASHSCOPE_API_KEY），输出 CSV 报告
 python scripts/evaluate.py --mode generation --strategy recursive --search-mode hybrid
 
 # 指定输出路径
 python scripts/evaluate.py --mode generation --output reports/gen_eval.csv
 ```
 
-评估报告输出到 `reports/` 目录。
+### 评估回归闭环（基线 / 对比 / 门禁 / 趋势）
+
+```bash
+# 1. 存档本次评估为基线（检索 + 生成指标一并入库）
+python scripts/evaluate.py --save-baseline reports/baseline.json
+
+# 2. 与基线对比 + 门禁 + 趋势：任一指标跌破阈值 → 退出码 1（不可合入）
+python scripts/evaluate.py --compare reports/baseline.json
+
+# 3. 仅检索回归（强制 stub 生成器，无需 LLM/API key，适合 CI 无 key 场景）
+python scripts/evaluate.py --no-generation --compare reports/baseline.json
+
+# 4. 统一覆盖阈值（默认按指标独立阈值：recall 各档 0.10 / faithfulness、relevance 0.05）
+python scripts/evaluate.py --compare reports/baseline.json --tolerance 0.15
+```
+
+- 基线文件 `reports/baseline.json`：含创建时间、commit、配置快照、指标
+- 每次 `--compare` 追加一行到 `reports/trend.csv`（timestamp / commit / 各指标），沉淀指标历史
+- 基线含生成指标但本次缺失（如 LLM 评估失败）时门禁默认 FAIL，防止"生成质量回退被静默放过"
+
+### C-MTEB 中文检索基准
+
+接入 [C-MTEB](https://github.com/FlagOpen/FlagEmbedding/blob/master/C_MTEB/README.md) T2Retrieval（dev 集）评测，数据默认从 hf-mirror 国内镜像下载：
+
+```bash
+# 1. 下载数据（corpus 156MB / queries / qrels）
+python scripts/download_cmteb.py
+
+# 2. 评测：默认 500 query / 20000 corpus，固定 seed=42 保证可复现
+python scripts/eval_cmteb.py
+
+# 3. 与 CI 同规模（1500 corpus / 50 query）对比门禁
+python scripts/eval_cmteb.py --max-corpus 1500 --max-queries 50 --seed 42 \
+  --compare reports/cmteb_ci_baseline.json
+
+# 4. 全量评测（11.8 万 corpus / 2.28 万 query，CPU 首次约 1-2h，之后命中 embedding 缓存秒级恢复）
+python scripts/eval_cmteb.py --max-corpus 200000 --max-queries 30000 --seed 42
+```
+
+- **Embedding 缓存**：采样 corpus 内容 hash 作缓存键（`data/evaluation/cmteb_cache/`），corpus 未变时直接复用向量，跳过重复编码；`--no-embedding-cache` 可强制重算
+- **Rerank 消融诊断**（`scripts/cmteb_rerank_diag.py`）：对比不同候选池截断下的 Recall。实测结论：纯向量 top-10 已覆盖相关文档，扩大候选池对召回零贡献；Cross-Encoder 精排在短文本高重合场景反而降 Recall（负优化）——不要无脑叠加 rerank
+- 评测报告输出到 `reports/`（CSV / JSON 明细 / 基线 / 趋势）
+
+### CI 门禁（GitHub Actions）
+
+工作流 `.github/workflows/ci.yml` 包含三个 job：
+
+| Job | 触发 | 说明 |
+|-----|------|------|
+| `test` | push / PR | pytest 全量测试 + 覆盖率 |
+| `eval` | schedule / 手动 dispatch（gate） | 下载 C-MTEB 数据 → `eval_cmteb.py --compare` 与入库基线对比，指标回退即 FAIL（退出码 1 标红） |
+| `full-eval` | 手动 dispatch（full） | 全量 11.8 万 corpus / 2.28 万 query 评测，报告存 artifact |
+
+手动触发：**Actions → CI → Run workflow**，可选参数：
+- `eval_scale`：`gate`（1500/50，默认）或 `full`（全量）
+- `eval_rerank`：full 评测是否启用 rerank（gate 固定不启用，保证与基线可比）
+
+eval/full-eval 均通过 **actions/cache** 复用 corpus embedding（缓存 key = 数据 parquet 内容 hash + 规模 + seed）：GitHub-hosted runner 每次全新机器，corpus 未变时命中缓存只做检索与指标计算，gate 评测从 ~2 分钟压缩到几十秒。
 
 ## 测试
 
@@ -334,13 +421,16 @@ MySQL 测试需要 MySQL 服务运行中，否则会自动跳过。
 | 组件 | 技术选型 |
 |------|---------|
 | Web 框架 | FastAPI + Uvicorn |
-| 向量检索 | FAISS（开发原型），生产可平滑迁移 Milvus 向量数据库 |
-| BM25 检索 | 自实现（基于 jieba 中文分词）；生产可替换 Elasticsearch |
+| 向量检索 | Milvus 向量库（生产后端），本地可回退 FAISS |
+| 全文/BM25 | Elasticsearch（生产后端），本地自实现（基于 jieba 分词） |
+| 混合检索 | 向量 + 全文双路召回 + RRF 融合 |
 | Embedding | sentence-transformers (BGE) |
-| 重排 | Cross-Encoder (BGE-reranker) |
+| 重排 | Cross-Encoder (BGE-reranker)，可配置开关 |
 | LLM 生成 | DashScope (Qwen)，含超时重试 + Query 改写 + 并发限流 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
 | 部署 | Docker（CPU/GPU 双镜像）+ docker-compose |
+| 评测 | C-MTEB T2Retrieval 基准 + LLM-as-Judge 生成质量评估 + 回归闭环门禁 |
+| CI | GitHub Actions（test + eval 检索门禁 + full-eval 全量评测） |
 | 指标采集 | prometheus-client |
 | 测试 | pytest |
 
