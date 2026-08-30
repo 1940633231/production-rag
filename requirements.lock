@@ -59,6 +59,7 @@ prometheus_client==0.26.0
 prompt_toolkit==3.0.53
 propcache==0.5.2
 protobuf==7.36.0
+pyarrow==25.0.1
 pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
