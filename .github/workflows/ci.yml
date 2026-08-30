@@ -34,8 +34,8 @@ jobs:
           name: coverage
           path: .coverage
 
-  # 定时/手动检索评估：用样例文档重建 FAISS 索引并跑检索评估（无 LLM 依赖）
-  # 注意：不与本地基线门禁（CI 数据 ≠ 本地真实数据），仅产出报告供人工检查
+  # 定时/手动检索评估门禁：C-MTEB T2Retrieval 子集（可复现，无需外部服务）
+  # 与入库基线 cmteb_ci_baseline.json 同 seed/同规模对比，指标回退即拦截 PR
   eval:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -54,16 +54,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock
 
-      - name: Rebuild FAISS index from sample docs
-        env:
-          MILVUS_ENABLED: "0"
-        run: python scripts/rebuild_index.py --strategy recursive
+      - name: Download C-MTEB data
+        run: python scripts/download_cmteb.py
 
-      - name: Run retrieval evaluation (report only)
-        env:
-          MILVUS_ENABLED: "0"
+      - name: Run C-MTEB gate (compare with baseline)
         run: |
-          python scripts/evaluate.py --no-generation --mode retrieval --strategy recursive
+          python scripts/eval_cmteb.py \
+            --max-corpus 1500 --max-queries 50 --seed 42 \
+            --compare reports/cmteb_ci_baseline.json
 
       - name: Upload eval report
         if: always()

@@ -190,6 +190,8 @@ def run():
                         help="干扰项为相关文档的倍数（默认 5，越大越接近真实检索场景但编码越慢）")
     parser.add_argument("--max-queries", type=int, default=500,
                         help="限制评测 query 条数（默认 500，全量 22812 条）")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="采样随机种子（默认 42，固定 seed 保证 CI 可复现）")
     parser.add_argument("--top-k", type=int, default=10, help="检索返回条数（默认 10）")
     parser.add_argument("--rerank", action="store_true", help="启用 Cross-Encoder 重排")
     parser.add_argument("--candidate-k", type=int, default=30,
@@ -213,7 +215,7 @@ def run():
 
     # ---- 1. 数据 ----
     corpus, queries, relevant_map = load_data(
-        args.max_corpus, args.max_queries, args.fill_factor,
+        args.max_corpus, args.max_queries, args.fill_factor, seed=args.seed,
     )
 
     # ---- 2. Embedding 模型 + 索引 ----

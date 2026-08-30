@@ -28,6 +28,9 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
     "recall@1": 0.10,
     "recall@3": 0.10,
     "recall@5": 0.10,
+    "recall@10": 0.10,
+    "mrr@10": 0.10,
+    "ndcg@10": 0.05,
     "faithfulness": 0.05,
     "relevance": 0.05,
 }

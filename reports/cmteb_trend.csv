@@ -1,0 +1,2 @@
+timestamp,commit,recall@1,recall@3,recall@5,recall@10,mrr@10,ndcg@10
+2026-08-30T18:12:20+08:00,746e0b3,0.3318,0.6953,0.8362,0.9592,1.0,0.9705

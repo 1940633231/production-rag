@@ -363,6 +363,20 @@ def run_regression(config, args):
         print(format_table(rows))
         append_trend(args.trend, metrics)
         ok = all_passed(rows)
+
+        # 缺口1：基线含生成指标但本次缺失/失败 → 门禁 FAIL（生成质量回退不可被静默放过）
+        baseline_metrics = old_baseline.get("metrics", {})
+        missing_gen = {"faithfulness", "relevance"} & set(baseline_metrics) - set(metrics)
+        if missing_gen:
+            if getattr(args, "allow_missing_gen", False):
+                print("\n[WARN] 基线含生成指标但本次缺失（{}），已按 --allow-missing-gen 放行".format(
+                    sorted(missing_gen)))
+            else:
+                print("\n门禁结果: FAIL（基线含生成指标 {} 但本次缺失/失败，"
+                      "生成质量未验证，不允许合入；如确认仅做检索回归请加 --allow-missing-gen）".format(
+                          sorted(missing_gen)))
+                sys.exit(1)
+
         print("\n门禁结果: {}".format(
             "PASS" if ok else "FAIL（存在指标跌破阈值，不允许合入）"
         ))
@@ -412,6 +426,10 @@ def main():
     parser.add_argument(
         "--no-generation", action="store_true",
         help="跳过生成质量评估（检索评估强制使用 stub 生成器，无需 LLM/API key）",
+    )
+    parser.add_argument(
+        "--allow-missing-gen", action="store_true",
+        help="对比时若基线含生成指标但本次缺失，放行门禁（默认严格 FAIL）",
     )
     parser.add_argument(
         "--tolerance", type=float, default=None,
