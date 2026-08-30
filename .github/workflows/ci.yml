@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      eval_scale:
+        description: "评测规模: gate（1500/50 与基线对比）/ full（全量 corpus+query，首次 1-2h+，之后命中 embedding 缓存大幅加速）"
+        type: choice
+        default: gate
+        options: [gate, full]
+      eval_rerank:
+        description: "full 评测启用 rerank（gate 固定不启用，保证与基线可比）"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -37,10 +47,15 @@ jobs:
 
   # 定时/手动检索评估门禁：C-MTEB T2Retrieval 子集（可复现，无需外部服务）
   # 与入库基线 cmteb_ci_baseline.json 同 seed/同规模对比，指标回退即拦截 PR
+  # corpus embedding 用 actions/cache 复用（key = 数据内容 hash + 规模 + seed），
+  # GitHub-hosted runner 是全新机器，corpus 未变时跳过重复编码
   eval:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.eval_scale == 'gate')
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      MAX_CORPUS: "1500"
+      MAX_QUERIES: "50"
     steps:
       - uses: actions/checkout@v4
 
@@ -58,10 +73,27 @@ jobs:
       - name: Download C-MTEB data
         run: python scripts/download_cmteb.py
 
+      - name: Compute embedding cache key
+        id: cache-key
+        run: |
+          hash=$(cat \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval/data/corpus-*.parquet \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval/data/queries-*.parquet \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval-qrels/data/dev-*.parquet \
+            | sha256sum | cut -c1-16)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore corpus embeddings
+        uses: actions/cache@v4
+        id: emb-cache
+        with:
+          path: data/evaluation/cmteb_cache
+          key: cmteb-emb-${{ steps.cache-key.outputs.hash }}-${{ env.MAX_CORPUS }}-${{ env.MAX_QUERIES }}-seed42
+
       - name: Run C-MTEB gate (compare with baseline)
         run: |
           python scripts/eval_cmteb.py \
-            --max-corpus 1500 --max-queries 50 --seed 42 \
+            --max-corpus ${{ env.MAX_CORPUS }} --max-queries ${{ env.MAX_QUERIES }} --seed 42 \
             --compare reports/cmteb_ci_baseline.json
 
       - name: Upload eval report
@@ -69,4 +101,61 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: eval-report
+          path: reports/
+
+  # 手动全量评测：全量 corpus（11.8 万）+ 全量 query（2.28 万）。
+  # 首次需完整编码 corpus（CPU 约 1-2h），embedding 写入 actions/cache，
+  # 之后 rerun 命中缓存只做检索+指标，大幅加速；与 gate 基线规模不同，不做对比。
+  full-eval:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.eval_scale == 'full'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MAX_CORPUS: "200000"   # > 全量 corpus 数，即不截断
+      MAX_QUERIES: "30000"   # > 全量 query 数，即不截断
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+
+      - name: Download C-MTEB data
+        run: python scripts/download_cmteb.py
+
+      - name: Compute embedding cache key
+        id: cache-key
+        run: |
+          hash=$(cat \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval/data/corpus-*.parquet \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval/data/queries-*.parquet \
+            data/evaluation/cmteb/C-MTEB/T2Retrieval-qrels/data/dev-*.parquet \
+            | sha256sum | cut -c1-16)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore corpus embeddings
+        uses: actions/cache@v4
+        id: emb-cache
+        with:
+          path: data/evaluation/cmteb_cache
+          key: cmteb-emb-${{ steps.cache-key.outputs.hash }}-${{ env.MAX_CORPUS }}-${{ env.MAX_QUERIES }}-seed42
+
+      - name: Run full C-MTEB evaluation
+        run: |
+          python scripts/eval_cmteb.py \
+            --max-corpus ${{ env.MAX_CORPUS }} --max-queries ${{ env.MAX_QUERIES }} --seed 42 \
+            ${{ github.event.inputs.eval_rerank == 'true' && '--rerank' || '' }}
+
+      - name: Upload full eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-eval-report
           path: reports/

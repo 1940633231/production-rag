@@ -19,6 +19,8 @@
   .venv\\Scripts\\python.exe scripts\\eval_cmteb.py --compare reports/cmteb_baseline.json
 """
 import argparse
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -39,7 +41,74 @@ CORPUS_PATH = DATA_ROOT / "C-MTEB/T2Retrieval/data/corpus-00000-of-00001-8afe7b7
 QUERIES_PATH = DATA_ROOT / "C-MTEB/T2Retrieval/data/queries-00000-of-00001-930bf3b805a80dd9.parquet"
 QRELS_PATH = DATA_ROOT / "C-MTEB/T2Retrieval-qrels/data/dev-00000-of-00001-92ed0416056ff7e1.parquet"
 
+CACHE_DEFAULT = PROJECT_ROOT / "data/evaluation/cmteb_cache"
+
 KS = [1, 3, 5, 10]
+
+
+def hash_corpus(corpus_df) -> str:
+    """对采样后的 corpus 内容做 hash（缓存键：同一份数据 + 同一 seed/规模 → 同 hash → 可复用 embedding）。
+
+    GitHub-hosted runner 每次都是全新机器，corpus embedding 是确定性产物
+    （固定数据 + 固定模型），内容不变时应直接复用，避免每次全量重算。
+    """
+    payload = "\n".join(
+        "{}|{}".format(i, t)
+        for i, t in zip(corpus_df["id"].astype(str), corpus_df["text"])
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+class EmbeddingCache:
+    """corpus embedding 缓存：meta.json + corpus_ids.json + embeddings.npy。
+
+    命中条件（全部一致才复用）：
+      - embedding 模型名 + normalize 开关
+      - 采样 corpus 内容 hash（corpus_hash）
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.meta_path = self.path / "meta.json"
+        self.ids_path = self.path / "corpus_ids.json"
+        self.npy_path = self.path / "embeddings.npy"
+
+    def _meta(self, model_name, normalize, corpus_hash):
+        return {
+            "model": model_name,
+            "normalize": bool(normalize),
+            "corpus_hash": corpus_hash,
+        }
+
+    def load(self, model_name, normalize, corpus_hash, dim):
+        """命中返回 np.ndarray，未命中返回 None。"""
+        if not all(p.exists() for p in (self.meta_path, self.ids_path, self.npy_path)):
+            return None
+        try:
+            meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if meta != self._meta(model_name, normalize, corpus_hash):
+            logger.info("embedding 缓存未命中（meta 不一致），重新编码")
+            return None
+        emb = np.load(self.npy_path)
+        if emb.shape[1] != dim:
+            logger.info("embedding 缓存未命中（维度 %d != %d），重新编码", emb.shape[1], dim)
+            return None
+        logger.info("embedding 缓存命中: %s (%s)", self.npy_path, emb.shape)
+        return emb
+
+    def save(self, model_name, normalize, corpus_hash, embeddings, corpus_ids):
+        self.path.mkdir(parents=True, exist_ok=True)
+        np.save(self.npy_path, embeddings)
+        self.ids_path.write_text(
+            json.dumps(corpus_ids, ensure_ascii=False), encoding="utf-8"
+        )
+        self.meta_path.write_text(
+            json.dumps(self._meta(model_name, normalize, corpus_hash), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("embedding 缓存已保存: %s (%s)", self.npy_path, embeddings.shape)
 
 
 def load_data(max_corpus, max_queries, fill_factor=5, seed=42):
@@ -108,17 +177,16 @@ def load_data(max_corpus, max_queries, fill_factor=5, seed=42):
     return corpus_sample, queries, relevant_map
 
 
-def build_index(texts, model):
-    """编码 corpus 建 FAISS IndexFlatIP 索引，返回 (index, id_list)。"""
+def build_index(embeddings):
+    """由 corpus embeddings 构建 FAISS IndexFlatIP 索引（向量已归一化）。"""
     import faiss
 
     t = time.time()
-    embeddings = model.encode(list(texts))
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(np.ascontiguousarray(embeddings, dtype="float32"))
     logger.info("corpus 索引构建完成: %.3fs, %d 条, dim=%d",
-                time.time() - t, len(texts), embeddings.shape[1])
-    return index, embeddings
+                time.time() - t, len(embeddings), embeddings.shape[1])
+    return index
 
 
 def retrieve(query_texts, index, embeddings, model, top_k, corpus_df, corpus_ids,
@@ -204,12 +272,17 @@ def run():
     parser.add_argument("--compare", metavar="PATH", help="与基线对比并执行门禁")
     parser.add_argument("--trend", default="reports/cmteb_trend.csv", help="趋势 CSV")
     parser.add_argument("--tolerance", type=float, default=None, help="统一指标阈值")
+    parser.add_argument("--embedding-cache", metavar="PATH", default=str(CACHE_DEFAULT),
+                        help="corpus embedding 缓存目录（命中则跳过编码，默认 data/evaluation/cmteb_cache）")
+    parser.add_argument("--no-embedding-cache", action="store_true",
+                        help="禁用 embedding 缓存（总是重新编码）")
     args = parser.parse_args()
 
     load_env()
     config = Config()
-    print("配置: corpus_limit={}, fill_factor={}, queries_limit={}, top_k={}, rerank={}".format(
+    print("配置: corpus_limit={}, fill_factor={}, queries_limit={}, top_k={}, rerank={}, embedding_cache={}".format(
         args.max_corpus, args.fill_factor, args.max_queries, args.top_k, args.rerank,
+        "off" if args.no_embedding_cache else args.embedding_cache,
     ))
     print()
 
@@ -217,15 +290,33 @@ def run():
     corpus, queries, relevant_map = load_data(
         args.max_corpus, args.max_queries, args.fill_factor, seed=args.seed,
     )
+    corpus_ids = corpus["id"].astype(str).tolist()
+    corpus_hash = hash_corpus(corpus)
+    logger.info("采样 corpus hash: %s（缓存键）", corpus_hash)
 
-    # ---- 2. Embedding 模型 + 索引 ----
+    # ---- 2. Embedding（缓存命中则跳过编码）+ 索引 ----
     from app.embedding.model import EmbeddingModel
     t = time.time()
     model = EmbeddingModel(config.embedding_model)
     logger.info("embedding 模型加载完成: %.3fs", time.time() - t)
 
-    index, _embeddings = build_index(corpus["text"].tolist(), model)
-    corpus_ids = corpus["id"].astype(str).tolist()
+    normalize = config.data.get("embedding", {}).get("normalize", True)
+    cache = None
+    if not args.no_embedding_cache:
+        cache = EmbeddingCache(args.embedding_cache)
+        embeddings = cache.load(config.embedding_model, normalize, corpus_hash, model.dimension)
+    else:
+        embeddings = None
+
+    if embeddings is None:
+        t = time.time()
+        embeddings = model.encode(list(corpus["text"]))
+        logger.info("corpus 编码完成: %.3fs, %d 条, dim=%d",
+                    time.time() - t, len(corpus), embeddings.shape[1])
+        if cache is not None:
+            cache.save(config.embedding_model, normalize, corpus_hash, embeddings, corpus_ids)
+
+    index = build_index(embeddings)
 
     # ---- 3. 检索 ----
     query_texts = queries["text"].tolist()
@@ -245,7 +336,7 @@ def run():
 
     t = time.time()
     retrieved_list = retrieve(
-        query_texts, index, _embeddings, model, args.top_k, corpus, corpus_ids,
+        query_texts, index, embeddings, model, args.top_k, corpus, corpus_ids,
         reranker, args.candidate_k,
     )
     print("检索完成: {} 条 query, 耗时 {:.1f}s".format(
