@@ -1,6 +1,6 @@
 {
-  "created_at": "2026-08-29T21:31:50+08:00",
-  "commit": "ca77a85",
+  "created_at": "2026-08-30T18:31:28+08:00",
+  "commit": "e5491f7",
   "config": {
     "strategy": "recursive",
     "mode": "hybrid",
@@ -12,6 +12,8 @@
   "metrics": {
     "recall@1": 1.0,
     "recall@3": 1.0,
-    "recall@5": 1.0
+    "recall@5": 1.0,
+    "faithfulness": 1.0,
+    "relevance": 0.875
   }
 }
