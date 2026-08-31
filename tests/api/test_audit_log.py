@@ -201,7 +201,8 @@ class TestDocumentAudit:
         assert events[0]["resource"] == fname
         (raw_dir / fname).unlink()
 
-    def test_delete_recorded(self, anon_client, admin_headers, audit_log, raw_dir, monkeypatch):
+    def test_delete_recorded(self, anon_client, admin_headers, audit_log, raw_dir,
+                             monkeypatch, sync_background_rebuild):
         import app.api.knowledge as knowledge
         import app.ingestion.writer as writer_mod
         import app.core.config as config_mod

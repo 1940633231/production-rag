@@ -112,3 +112,31 @@ def _audit_in_memory():
 def audit_log(_audit_in_memory):
     """返回当前测试的内存审计日志（InMemoryAuditLogger）。"""
     return _audit_in_memory
+
+
+@pytest.fixture
+def sync_background_rebuild(monkeypatch):
+    """让 task_manager.submit 同步执行任务（删除测试用：索引重建立即跑完，断言可确定）。
+
+    避免真实后台线程的时序不确定性；配合 IndexWriter mock 时为 no-op。
+    """
+    from app.core import task_queue as tq
+
+    def _sync_submit(task_type, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+        return "task_{}_sync".format(task_type)
+
+    monkeypatch.setattr(tq.task_manager, "submit", _sync_submit)
+    return _sync_submit
+
+
+@pytest.fixture
+def noop_background_rebuild(monkeypatch):
+    """让 task_manager.submit 只返回 id 不执行任务（真实 DB 删除测试用，避免触发耗时重建）。"""
+    from app.core import task_queue as tq
+
+    def _noop_submit(task_type, fn, *args, **kwargs):
+        return "task_{}_noop".format(task_type)
+
+    monkeypatch.setattr(tq.task_manager, "submit", _noop_submit)
+    return _noop_submit

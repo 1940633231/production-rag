@@ -5,63 +5,103 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Production RAG 管理台</title>
 <style>
-  :root { --brand:#2563eb; --bg:#f5f7fa; --card:#fff; --border:#e2e8f0; --ok:#16a34a; --warn:#d97706; --err:#dc2626; }
+  :root { --brand:#2563eb; --bg:#f5f7fa; --card:#fff; --border:#e2e8f0; --ok:#16a34a; --warn:#d97706; --err:#dc2626; --ink:#1e293b; --muted:#64748b; }
   * { box-sizing:border-box; margin:0; padding:0; }
-  body { font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:#1e293b; }
-  header { background:var(--brand); color:#fff; padding:14px 24px; display:flex; align-items:center; justify-content:space-between; }
+  body { font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--brand); color:#fff; padding:12px 24px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; }
   header h1 { font-size:18px; font-weight:600; }
-  header .health { font-size:13px; opacity:.95; }
-  nav { background:#fff; border-bottom:1px solid var(--border); display:flex; padding:0 24px; }
-  nav button { background:none; border:none; padding:12px 18px; font-size:14px; cursor:pointer; color:#64748b; border-bottom:2px solid transparent; }
+  header .right { display:flex; align-items:center; gap:12px; font-size:13px; }
+  nav { background:#fff; border-bottom:1px solid var(--border); display:flex; padding:0 16px; flex-wrap:wrap; }
+  nav button { background:none; border:none; padding:12px 15px; font-size:14px; cursor:pointer; color:var(--muted); border-bottom:2px solid transparent; }
   nav button.active { color:var(--brand); border-bottom-color:var(--brand); font-weight:600; }
-  main { padding:24px; max-width:1100px; margin:0 auto; }
+  main { padding:24px; max-width:1180px; margin:0 auto; }
   .panel { display:none; }
   .panel.active { display:block; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px; }
-  .card h3 { font-size:15px; margin-bottom:12px; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  .card h3 { font-size:15px; margin-bottom:12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; align-items:center; }
   input,select,textarea { padding:8px 10px; border:1px solid var(--border); border-radius:6px; font-size:14px; }
-  input[type=text],select { flex:1; min-width:160px; }
+  input[type=text],input[type=password],select { flex:1; min-width:140px; }
   textarea { width:100%; resize:vertical; font-family:inherit; }
-  button { padding:8px 16px; border:none; border-radius:6px; cursor:pointer; font-size:14px; }
+  button { padding:8px 16px; border:none; border-radius:6px; cursor:pointer; font-size:14px; background:#e2e8f0; }
   .btn-primary { background:var(--brand); color:#fff; }
   .btn-danger { background:var(--err); color:#fff; }
   .btn-sm { padding:4px 10px; font-size:12px; }
+  .btn-plain { background:#334155; color:#fff; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }
-  th { background:#f8fafc; font-weight:600; }
-  .badge { padding:2px 8px; border-radius:10px; font-size:12px; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { background:#f8fafc; font-weight:600; white-space:nowrap; }
+  .badge { padding:2px 8px; border-radius:10px; font-size:12px; white-space:nowrap; }
   .badge.ok { background:#dcfce7; color:var(--ok); }
   .badge.warn { background:#fef3c7; color:var(--warn); }
   .badge.err { background:#fee2e2; color:var(--err); }
   .badge.info { background:#e0f2fe; color:#0284c7; }
-  #chat-area { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:12px; min-height:200px; max-height:400px; overflow-y:auto; font-size:14px; line-height:1.7; }
+  #chat-area { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:12px; min-height:180px; max-height:400px; overflow-y:auto; font-size:14px; line-height:1.7; }
   .msg { margin-bottom:10px; }
   .msg .role { font-weight:600; margin-right:6px; }
   .msg.user .role { color:var(--brand); }
   .msg.assistant .role { color:var(--ok); }
-  .msg .cites { color:#64748b; font-size:12px; }
-  .meta { color:#64748b; font-size:12px; margin-top:6px; }
-  pre { background:#0f172a; color:#e2e8f0; padding:10px; border-radius:6px; font-size:12px; overflow-x:auto; }
+  .msg .cites { color:var(--muted); font-size:12px; }
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; }
+  pre { background:#0f172a; color:#e2e8f0; padding:10px; border-radius:6px; font-size:12px; overflow-x:auto; white-space:pre-wrap; word-break:break-all; }
   .muted { color:#94a3b8; font-size:12px; }
+  .link { color:var(--brand); cursor:pointer; text-decoration:underline; font-size:12px; }
+
+  /* 登录遮罩 */
+  #login-overlay { position:fixed; inset:0; background:rgba(15,23,42,.55); display:flex; align-items:center; justify-content:center; z-index:50; }
+  #login-box { background:#fff; border-radius:12px; padding:32px; width:360px; box-shadow:0 20px 60px rgba(0,0,0,.3); }
+  #login-box h2 { margin-bottom:4px; font-size:18px; }
+  #login-box .sub { color:var(--muted); font-size:12px; margin-bottom:16px; }
+  #login-box .row { margin-bottom:14px; }
+  #login-box input { width:100%; }
+  #login-msg { min-height:18px; font-size:13px; color:var(--err); margin-bottom:8px; }
+
+  /* 弹窗 */
+  .modal-mask { position:fixed; inset:0; background:rgba(15,23,42,.5); display:none; align-items:flex-start; justify-content:center; z-index:60; padding-top:60px; }
+  .modal-mask.open { display:flex; }
+  .modal { background:#fff; border-radius:10px; width:640px; max-width:94vw; max-height:82vh; overflow:auto; padding:20px; }
+  .modal h3 { margin-bottom:14px; }
+  .perm-chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .perm-chips label { font-size:12px; background:#f1f5f9; padding:3px 8px; border-radius:10px; cursor:pointer; user-select:none; }
+  .perm-chips input { margin-right:3px; }
+  .hidden { display:none !important; }
 </style>
 </head>
 <body>
 
 <header>
   <h1>📚 Production RAG 管理台</h1>
-  <div class="health" id="health-bar">健康检查中…</div>
+  <div class="right">
+    <span id="user-info" class="hidden"></span>
+    <button id="btn-logout" class="btn-sm hidden" style="background:#1d4ed8;color:#fff;">退出</button>
+    <div id="health-bar">健康检查中…</div>
+  </div>
 </header>
 
-<nav id="nav">
+<!-- 登录 -->
+<div id="login-overlay">
+  <div id="login-box">
+    <h2>登录管理台</h2>
+    <div class="sub">默认账号 admin / admin123（请及时修改）</div>
+    <div class="row"><input type="text" id="login-username" placeholder="用户名"></div>
+    <div class="row"><input type="password" id="login-password" placeholder="密码"></div>
+    <div id="login-msg"></div>
+    <button class="btn-primary" style="width:100%;" onclick="doLogin()">登 录</button>
+  </div>
+</div>
+
+<nav id="nav" class="hidden">
   <button class="active" data-panel="chat">💬 问答</button>
   <button data-panel="upload">📤 上传</button>
   <button data-panel="docs">📄 文档</button>
   <button data-panel="index">🗂 索引</button>
   <button data-panel="tasks">⏳ 任务</button>
+  <button data-panel="users">👥 用户</button>
+  <button data-panel="roles">🎭 角色</button>
+  <button data-panel="audit">🛡 审计日志</button>
 </nav>
 
-<main>
+<main id="main" class="hidden">
 
   <!-- ============ 问答 ============ -->
   <div class="panel active" id="panel-chat">
@@ -69,15 +109,8 @@
       <h3>RAG 问答</h3>
       <div class="row">
         <input type="text" id="chat-query" placeholder="输入问题，如：铁矿近期供需如何？">
-        <select id="chat-strategy">
-          <option value="recursive">recursive</option>
-          <option value="fixed">fixed</option>
-        </select>
-        <select id="chat-mode">
-          <option value="hybrid">hybrid</option>
-          <option value="vector">vector</option>
-          <option value="bm25">bm25</option>
-        </select>
+        <select id="chat-strategy"><option value="recursive">recursive</option><option value="fixed">fixed</option></select>
+        <select id="chat-mode"><option value="hybrid">hybrid</option><option value="vector">vector</option><option value="bm25">bm25</option></select>
         <label class="muted"><input type="checkbox" id="chat-rerank" checked> rerank</label>
         <label class="muted"><input type="checkbox" id="chat-stream"> 流式</label>
         <button class="btn-primary" onclick="sendChat()">发送</button>
@@ -95,10 +128,7 @@
       <h3>上传文档</h3>
       <div class="row">
         <input type="file" id="upload-file" accept=".txt,.html,.pdf,.docx">
-        <select id="upload-strategy">
-          <option value="recursive">recursive</option>
-          <option value="fixed">fixed</option>
-        </select>
+        <select id="upload-strategy"><option value="recursive">recursive</option><option value="fixed">fixed</option></select>
         <label class="muted"><input type="checkbox" id="upload-async"> 后台异步</label>
         <button class="btn-primary" onclick="uploadDoc()">上传</button>
       </div>
@@ -111,7 +141,7 @@
     <div class="card">
       <h3>文档列表 <button class="btn-sm btn-primary" onclick="loadDocs()">刷新</button></h3>
       <table id="docs-table">
-        <thead><tr><th>文件名</th><th>文档 ID</th><th>大小</th><th>chunk 数</th><th>操作</th></tr></thead>
+        <thead><tr><th>文件名</th><th>文档 ID</th><th>归属人</th><th>大小</th><th>chunk</th><th>操作</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -121,8 +151,8 @@
   <div class="panel" id="panel-index">
     <div class="card">
       <h3>索引状态 <button class="btn-sm btn-primary" onclick="loadStatus()">刷新</button>
-        <button class="btn-sm" style="margin-left:12px;background:#334155;color:#fff;" onclick="rebuildIndex('recursive')">重建 recursive</button>
-        <button class="btn-sm" style="background:#334155;color:#fff;" onclick="rebuildIndex('fixed')">重建 fixed</button>
+        <button class="btn-sm btn-plain" onclick="rebuildIndex('recursive')">重建 recursive</button>
+        <button class="btn-sm btn-plain" onclick="rebuildIndex('fixed')">重建 fixed</button>
       </h3>
       <table id="index-table">
         <thead><tr><th>策略</th><th>FAISS</th><th>metadata</th><th>chunk 数</th></tr></thead>
@@ -142,84 +172,219 @@
     </div>
   </div>
 
+  <!-- ============ 用户管理 ============ -->
+  <div class="panel" id="panel-users">
+    <div class="card">
+      <h3>创建用户</h3>
+      <div class="row">
+        <input type="text" id="user-name" placeholder="用户名">
+        <input type="text" id="user-pass" placeholder="密码（≥6 位）">
+        <input type="text" id="user-display" placeholder="显示名（可选）">
+        <input type="text" id="user-tenant" placeholder="租户（默认 default）">
+        <select id="user-role"></select>
+        <button class="btn-primary" onclick="createUser()">创建</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>用户列表 <button class="btn-sm btn-primary" onclick="loadUsers()">刷新</button></h3>
+      <table id="users-table">
+        <thead><tr><th>用户名</th><th>显示名</th><th>租户</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ 角色管理 ============ -->
+  <div class="panel" id="panel-roles">
+    <div class="card">
+      <h3>创建角色</h3>
+      <div class="row">
+        <input type="text" id="role-code" placeholder="角色编码（如 ops）">
+        <input type="text" id="role-name" placeholder="角色名称（如 运维）">
+      </div>
+      <div class="row"><div class="perm-chips" id="role-perms"></div></div>
+      <button class="btn-primary" onclick="createRole()">创建角色</button>
+    </div>
+    <div class="card">
+      <h3>角色列表 <button class="btn-sm btn-primary" onclick="loadRoles()">刷新</button></h3>
+      <table id="roles-table">
+        <thead><tr><th>编码</th><th>名称</th><th>内置</th><th>权限</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ 审计日志 ============ -->
+  <div class="panel" id="panel-audit">
+    <div class="card">
+      <h3>审计日志 <button class="btn-sm btn-primary" onclick="loadAudit()">查询</button></h3>
+      <div class="row">
+        <input type="text" id="audit-action" placeholder="action 过滤，如 authz.denied / login.success">
+        <input type="text" id="audit-actor" placeholder="actor（用户名或 user_id）">
+        <select id="audit-result"><option value="">全部结果</option><option value="success">success</option><option value="failure">failure</option><option value="denied">denied</option></select>
+        <input type="number" id="audit-limit" value="50" min="1" max="500" style="flex:0 0 90px;">
+      </div>
+      <table id="audit-table">
+        <thead><tr><th>时间</th><th>租户</th><th>操作者</th><th>action</th><th>资源</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
 </main>
+
+<!-- 文档 ACL 弹窗 -->
+<div class="modal-mask" id="acl-modal">
+  <div class="modal">
+    <h3>文档授权 <span class="muted" id="acl-doc-label"></span>
+      <button class="btn-sm" style="float:right" onclick="closeAcl()">关闭</button>
+    </h3>
+    <div class="row">
+      <select id="acl-type"><option value="user">用户</option><option value="role">角色</option></select>
+      <input type="text" id="acl-principal" placeholder="user_id 或 role_code">
+      <select id="acl-perm"><option value="read">read</option><option value="write">write</option><option value="delete">delete</option></select>
+      <button class="btn-primary" onclick="grantAcl()">授权</button>
+    </div>
+    <table id="acl-table">
+      <thead><tr><th>类型</th><th>主体</th><th>权限</th><th>时间</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
 
 <script>
 const API = "";
 const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m]));
+let token = localStorage.getItem("rag_token") || "";
+let currentUser = null;
 
-// ---- 导航切换 ----
-document.querySelectorAll("#nav button").forEach(btn => {
-  btn.onclick = () => {
-    document.querySelectorAll("#nav button").forEach(b => b.classList.remove("active"));
-    document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
-    btn.classList.add("active");
-    $("panel-" + btn.dataset.panel).classList.add("active");
-    if (btn.dataset.panel === "docs") loadDocs();
-    if (btn.dataset.panel === "index") loadStatus();
-    if (btn.dataset.panel === "tasks") loadTasks();
-  };
-});
+/* ---------- 鉴权请求封装 ---------- */
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers);
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
+  if (opts.body && typeof opts.body !== "string" && !(opts.body instanceof FormData)) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(opts.body);
+  }
+  const r = await fetch(API + path, opts);
+  let data = null;
+  try { data = await r.json(); } catch (_) { data = null; }
+  if (r.status === 401 && token) { logout(); throw new Error("登录已过期，请重新登录"); }
+  return { status: r.status, data };
+}
 
-// ---- 健康检查 ----
+/* ---------- 登录 / 退出 ---------- */
+async function doLogin() {
+  const username = $("login-username").value.trim();
+  const password = $("login-password").value;
+  if (!username || !password) return;
+  $("login-msg").textContent = "";
+  try {
+    const r = await fetch(API + "/api/auth/login", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const d = await r.json();
+    if (r.status !== 200) { $("login-msg").textContent = d.detail || "登录失败"; return; }
+    token = d.token;
+    localStorage.setItem("rag_token", token);
+    currentUser = d.user;
+    showApp();
+  } catch (e) { $("login-msg").textContent = "请求失败: " + e; }
+}
+
+function logout() {
+  token = ""; currentUser = null;
+  localStorage.removeItem("rag_token");
+  $("login-overlay").style.display = "flex";
+  $("nav").classList.add("hidden");
+  $("main").classList.add("hidden");
+  $("user-info").classList.add("hidden");
+  $("btn-logout").classList.add("hidden");
+}
+
+function showApp() {
+  $("login-overlay").style.display = "none";
+  $("nav").classList.remove("hidden");
+  $("main").classList.remove("hidden");
+  $("user-info").classList.remove("hidden");
+  $("btn-logout").classList.remove("hidden");
+  const u = currentUser || {};
+  $("user-info").textContent = `${u.username || "?"}（租户 ${u.tenant_id || "default"} / ${(u.roles || []).join(",") || "无角色"}）`;
+  loadHealth();
+  loadPermChips();
+  loadUserRoleOptions();
+  switchPanel("chat");
+}
+
+async function init() {
+  $("btn-logout").onclick = logout;
+  $("login-password").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
+  if (token) {
+    try {
+      const r = await api("/api/auth/me");
+      if (r.status === 200) { currentUser = r.data; showApp(); return; }
+    } catch (_) { /* 走登录 */ }
+  }
+  logout();
+}
+
+/* ---------- 导航 ---------- */
+function switchPanel(name) {
+  document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("active", b.dataset.panel === name));
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  $("panel-" + name).classList.add("active");
+  if (name === "docs") loadDocs();
+  if (name === "index") loadStatus();
+  if (name === "tasks") loadTasks();
+  if (name === "users") loadUsers();
+  if (name === "roles") loadRoles();
+  if (name === "audit") loadAudit();
+}
+document.querySelectorAll("#nav button").forEach(btn => btn.onclick = () => switchPanel(btn.dataset.panel));
+
+/* ---------- 健康检查 ---------- */
 async function loadHealth() {
   try {
     const r = await fetch(API + "/api/health");
     const d = await r.json();
-    const parts = [];
-    for (const [k, v] of Object.entries(d.components)) {
-      const c = v.status === "ok" ? "ok" : (v.status === "disabled" ? "info" : "err");
-      parts.push(`<span class="badge ${c}">${k}:${v.status}</span>`);
-    }
+    const parts = Object.entries(d.components || {}).map(([k, v]) =>
+      `<span class="badge ${v.status === "ok" ? "ok" : (v.status === "disabled" ? "info" : "err")}">${k}:${v.status}</span>`);
     $("health-bar").innerHTML = `<b>${d.status}</b> ${parts.join(" ")}`;
-  } catch (e) {
-    $("health-bar").innerHTML = `<span class="badge err">服务不可达</span>`;
-  }
+  } catch (_) { $("health-bar").innerHTML = `<span class="badge err">服务不可达</span>`; }
 }
 
-// ---- 问答 ----
+/* ---------- 问答 ---------- */
 async function sendChat() {
   const query = $("chat-query").value.trim();
   if (!query) return alert("请输入问题");
   const stream = $("chat-stream").checked;
-  const body = {
-    query,
-    strategy: $("chat-strategy").value,
-    mode: $("chat-mode").value,
-    use_rerank: $("chat-rerank").checked,
-  };
+  const body = { query, strategy: $("chat-strategy").value, mode: $("chat-mode").value, use_rerank: $("chat-rerank").checked };
   const histText = $("chat-history").value.trim();
-  if (histText) {
-    try { body.history = JSON.parse(histText); }
-    catch (e) { return alert("history 不是合法 JSON"); }
-  }
+  if (histText) { try { body.history = JSON.parse(histText); } catch (_) { return alert("history 不是合法 JSON"); } }
 
   const area = $("chat-area");
-  const esc = s => String(s ?? "").replace(/[&<>"']/g,
-    m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
-  // 引用渲染：编号 + 来源 + 区间 + 部分原文（content_preview）
   const buildCiteHtml = cites => {
     if (!cites || !cites.length) return "";
     return `<div class="cites">引用: ${cites.map(c =>
       `[${c.number}] ${esc(c.file_name)} chunk:${esc(c.chunk_id)} [${c.start_offset}-${c.end_offset}]` +
-      (c.content_preview ? `：${esc(c.content_preview)}` : "")
-    ).join("<br>")}</div>`;
+      (c.content_preview ? `：${esc(c.content_preview)}` : "")).join("<br>")}</div>`;
   };
   const addMsg = (role, text, cites) => {
     const div = document.createElement("div");
     div.className = "msg " + role;
-    div.innerHTML = `<span class="role">${role === "user" ? "我" : "助手"}</span><span class="content">${text}</span>${buildCiteHtml(cites)}`;
-    area.appendChild(div);
-    area.scrollTop = area.scrollHeight;
+    div.innerHTML = `<span class="role">${role === "user" ? "我" : "助手"}</span><span class="content"></span>`;
+    div.querySelector(".content").textContent = text;
+    if (cites) div.insertAdjacentHTML("beforeend", buildCiteHtml(cites));
+    area.appendChild(div); area.scrollTop = area.scrollHeight;
     return div;
   };
 
   if (stream) {
-    // SSE 流式（用独立的 .content 容器累加文本，避免依赖节点顺序）
     addMsg("user", query);
     const div = addMsg("assistant", "");
     const contentSpan = div.querySelector(".content");
-    // 解析单个 SSE 事件块（行分隔兼容 \n 与 \r\n）
     const parseChunk = chunk => {
       let event = "message", data = "";
       chunk.split(/\r?\n/).forEach(line => {
@@ -227,85 +392,51 @@ async function sendChat() {
         if (line.startsWith("data:")) data += line.slice(5).trim();
       });
       if (event === "delta" && data) {
-        try {
-          const d = JSON.parse(data);
-          if (d && d.content) contentSpan.textContent += d.content;
-        } catch (e) { /* 跳过无法解析的片段 */ }
+        try { const d = JSON.parse(data); if (d && d.content) contentSpan.textContent += d.content; } catch (_) {}
       } else if (event === "citations" && data) {
         try {
           const arr = JSON.parse(data);
           if (Array.isArray(arr) && arr.length) {
-            const old = div.querySelector(".cites");
-            if (old) old.remove();
-            div.insertAdjacentHTML("beforeend", buildCiteHtml(arr));
-            area.scrollTop = area.scrollHeight;
+            const old = div.querySelector(".cites"); if (old) old.remove();
+            div.insertAdjacentHTML("beforeend", buildCiteHtml(arr)); area.scrollTop = area.scrollHeight;
           }
-        } catch (e) { /* 跳过无法解析的片段 */ }
+        } catch (_) {}
       }
     };
     try {
       const resp = await fetch(API + "/api/chat/stream", {
-        method: "POST", headers: { "Content-Type": "application/json" },
+        method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
         body: JSON.stringify(body),
       });
       if (!resp.ok) {
         let msg = "HTTP " + resp.status;
-        try {
-          const e = await resp.json();
-          msg += ": " + (e.detail || JSON.stringify(e));
-        } catch (_) { /* 非 JSON 错误体 */ }
-        contentSpan.textContent = "流式请求失败: " + msg;
-        return;
+        try { const e = await resp.json(); msg += ": " + (e.detail || JSON.stringify(e)); } catch (_) {}
+        contentSpan.textContent = "流式请求失败: " + msg; return;
       }
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      // 事件分隔兼容 \r\n\r\n（sse-starlette 默认）与 \n\n 两种格式
-      const flush = () => {
-        const parts = buf.split(/\r\n\r\n|\n\n/);
-        buf = parts.pop(); // 最后一个可能是不完整的事件，留到下一帧
-        parts.forEach(parseChunk);
-      };
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        flush();
-      }
-      // 收尾：flush 解码器残留 + 最后一个未带尾分隔的事件
-      buf += decoder.decode();
-      buf.split(/\r\n\r\n|\n\n/).forEach(parseChunk);
+      const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf = "";
+      const flush = () => { const parts = buf.split(/\r\n\r\n|\n\n/); buf = parts.pop(); parts.forEach(parseChunk); };
+      while (true) { const { value, done } = await reader.read(); if (done) break; buf += decoder.decode(value, { stream: true }); flush(); }
+      buf += decoder.decode(); buf.split(/\r\n\r\n|\n\n/).forEach(parseChunk);
       area.scrollTop = area.scrollHeight;
-    } catch (e) {
-      contentSpan.textContent = "流式请求失败: " + e;
-    }
+    } catch (e) { contentSpan.textContent = "流式请求失败: " + e; }
     return;
   }
 
-  // 同步
   try {
-    const r = await fetch(API + "/api/chat", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const err = await r.json();
-      return addMsg("assistant", "请求失败: " + (err.detail || r.status));
-    }
-    const d = await r.json();
+    const r = await api("/api/chat", { method: "POST", body });
+    if (r.status !== 200) return addMsg("assistant", "请求失败: " + ((r.data && r.data.detail) || r.status));
+    const d = r.data;
     addMsg("user", query);
     addMsg("assistant", d.answer || "(空)", d.citations);
-    const stats = d.stats || {};
+    const st = d.stats || {};
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `elapsed=${d.elapsed}s | 改写:${stats.rewritten_query || "-"} | 多路:${stats.query_count || 1} | 合并:${stats.merged_candidates || "-"} | 上下文:${(stats.used_tokens ?? "-")}tok`;
+    meta.textContent = `elapsed=${d.elapsed}s | 改写:${st.rewritten_query || "-"} | 多路:${st.query_count || 1} | 合并:${st.merged_candidates || "-"} | 上下文:${(st.used_tokens ?? "-")}tok`;
     area.appendChild(meta);
-  } catch (e) {
-    addMsg("assistant", "请求异常: " + e);
-  }
+  } catch (e) { addMsg("assistant", "请求异常: " + e); }
 }
 
-// ---- 上传 ----
+/* ---------- 上传 ---------- */
 async function uploadDoc() {
   const file = $("upload-file").files[0];
   if (!file) return alert("请选择文件");
@@ -313,35 +444,27 @@ async function uploadDoc() {
   form.append("file", file);
   form.append("strategy", $("upload-strategy").value);
   const asyncFlag = $("upload-async").checked;
-  const url = API + "/api/knowledge/upload" + (asyncFlag ? "?async_=true" : "");
-  const div = $("upload-result");
-  div.innerHTML = `<span class="muted">上传中…</span>`;
+  $("upload-result").innerHTML = `<span class="muted">上传中…</span>`;
   try {
-    const r = await fetch(url, { method: "POST", body: form });
-    const d = await r.json();
-    div.innerHTML = `<pre>${JSON.stringify(d, null, 2)}</pre>`;
-    if (asyncFlag && d.task_id) setTimeout(loadTasks, 500);
-  } catch (e) {
-    div.innerHTML = `<span class="badge err">上传失败: ${e}</span>`;
-  }
+    const r = await api("/api/knowledge/upload" + (asyncFlag ? "?async_=true" : ""), { method: "POST", body: form });
+    $("upload-result").innerHTML = `<pre>${JSON.stringify(r.data, null, 2)}</pre>`;
+    if (asyncFlag && r.data && r.data.task_id) setTimeout(loadTasks, 500);
+  } catch (e) { $("upload-result").innerHTML = `<span class="badge err">上传失败: ${e}</span>`; }
 }
 
-// ---- 文档列表 ----
+/* ---------- 文档列表 ---------- */
 async function loadDocs() {
   try {
-    const r = await fetch(API + "/api/knowledge/documents");
-    const d = await r.json();
-    const tb = $("docs-table").querySelector("tbody");
-    tb.innerHTML = "";
-    if (!d.documents || !d.documents.length) {
-      tb.innerHTML = `<tr><td colspan="5" class="muted">暂无文档</td></tr>`;
-      return;
-    }
-    d.documents.forEach(doc => {
+    const r = await api("/api/knowledge/documents");
+    if (r.status !== 200) return alert("加载文档失败: " + ((r.data && r.data.detail) || r.status));
+    const tb = $("docs-table").querySelector("tbody"); tb.innerHTML = "";
+    if (!r.data.documents || !r.data.documents.length) { tb.innerHTML = `<tr><td colspan="6" class="muted">暂无文档</td></tr>`; return; }
+    r.data.documents.forEach(doc => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${doc.file_name}</td><td>${doc.document_id}</td><td>${doc.content_length}</td>
-        <td>${doc.chunk_count || "-"}</td>
-        <td><button class="btn-sm btn-danger" onclick="delDoc('${doc.document_id}')">删除</button></td>`;
+      tr.innerHTML = `<td>${esc(doc.file_name)}</td><td>${esc(doc.document_id)}</td>
+        <td>${esc(doc.owner_user_id || "共享")}</td><td>${doc.content_length || 0}</td><td>${doc.chunk_count || "-"}</td>
+        <td><button class="btn-sm btn-primary" onclick="openAcl('${esc(doc.document_id)}')">授权</button>
+            <button class="btn-sm btn-danger" onclick="delDoc('${esc(doc.document_id)}')">删除</button></td>`;
       tb.appendChild(tr);
     });
   } catch (e) { alert("加载文档失败: " + e); }
@@ -350,21 +473,65 @@ async function loadDocs() {
 async function delDoc(id) {
   if (!confirm("确定删除文档 " + id + " ？")) return;
   try {
-    const r = await fetch(API + "/api/knowledge/" + encodeURIComponent(id), { method: "DELETE" });
-    const d = await r.json();
-    alert(JSON.stringify(d, null, 2));
+    const r = await api("/api/knowledge/" + encodeURIComponent(id), { method: "DELETE" });
+    alert(JSON.stringify(r.data, null, 2));
     loadDocs(); loadStatus(); loadTasks();
   } catch (e) { alert("删除失败: " + e); }
 }
 
-// ---- 索引状态 ----
+/* ---------- 文档 ACL ---------- */
+let aclDocId = null;
+function openAcl(docId) {
+  aclDocId = docId;
+  $("acl-doc-label").textContent = docId;
+  $("acl-principal").value = ""; $("acl-type").value = "user"; $("acl-perm").value = "read";
+  $("acl-modal").classList.add("open");
+  loadAcl();
+}
+function closeAcl() { $("acl-modal").classList.remove("open"); aclDocId = null; }
+async function loadAcl() {
+  if (!aclDocId) return;
+  try {
+    const r = await api("/api/knowledge/" + encodeURIComponent(aclDocId) + "/acl");
+    if (r.status !== 200) { $("acl-table").querySelector("tbody").innerHTML = `<tr><td colspan="5" class="muted">${esc((r.data && r.data.detail) || "无法加载")}</td></tr>`; return; }
+    const tb = $("acl-table").querySelector("tbody"); tb.innerHTML = "";
+    const grants = r.data.grants || [];
+    if (!grants.length) { tb.innerHTML = `<tr><td colspan="5" class="muted">暂无授权（归属人拥有全部权限）</td></tr>`; return; }
+    grants.forEach(g => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${g.principal_type}</td><td>${esc(g.principal_id)}</td>
+        <td><span class="badge info">${g.permission}</span></td><td>${g.created_at || ""}</td>
+        <td><button class="btn-sm btn-danger" onclick="revokeAcl('${esc(g.principal_type)}','${esc(g.principal_id)}','${g.permission}')">撤销</button></td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { alert("加载授权失败: " + e); }
+}
+async function grantAcl() {
+  const pid = $("acl-principal").value.trim();
+  if (!pid) return alert("请输入 user_id 或 role_code");
+  const payload = { principal_type: $("acl-type").value, principal_id: pid, permission: $("acl-perm").value };
+  try {
+    const r = await api("/api/knowledge/" + encodeURIComponent(aclDocId) + "/acl", { method: "POST", body: payload });
+    if (r.status !== 200) return alert((r.data && r.data.detail) || "授权失败");
+    $("acl-principal").value = ""; loadAcl();
+  } catch (e) { alert("授权失败: " + e); }
+}
+async function revokeAcl(type, pid, perm) {
+  if (!confirm("撤销该授权？")) return;
+  try {
+    const q = new URLSearchParams({ principal_type: type, principal_id: pid, permission: perm });
+    await api("/api/knowledge/" + encodeURIComponent(aclDocId) + "/acl?" + q.toString(), { method: "DELETE" });
+    loadAcl();
+  } catch (e) { alert("撤销失败: " + e); }
+}
+
+/* ---------- 索引 ---------- */
 async function loadStatus() {
   try {
-    const r = await fetch(API + "/api/knowledge/status");
-    const d = await r.json();
-    const tb = $("index-table").querySelector("tbody");
-    tb.innerHTML = "";
-    for (const [k, v] of Object.entries(d.indexes)) {
+    const r = await api("/api/knowledge/status");
+    if (r.status !== 200) return alert("加载索引状态失败");
+    const tb = $("index-table").querySelector("tbody"); tb.innerHTML = "";
+    for (const [k, v] of Object.entries(r.data.indexes || {})) {
       const tr = document.createElement("tr");
       tr.innerHTML = `<td>${k}</td>
         <td><span class="badge ${v.faiss_exists ? "ok" : "err"}">${v.faiss_exists ? "存在" : "缺失"}</span></td>
@@ -374,45 +541,157 @@ async function loadStatus() {
     }
   } catch (e) { alert("加载索引状态失败: " + e); }
 }
-
 async function rebuildIndex(strategy) {
   if (!confirm("确定重建 " + strategy + " 索引？")) return;
   try {
-    const r = await fetch(API + "/api/knowledge/rebuild", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ strategy }),
-    });
-    const d = await r.json();
-    if (d.task_id) { alert("已提交重建任务: " + d.task_id); setTimeout(loadTasks, 500); }
-    else alert(JSON.stringify(d, null, 2));
+    const r = await api("/api/knowledge/rebuild", { method: "POST", body: { strategy } });
+    if (r.data && r.data.task_id) { alert("已提交重建任务: " + r.data.task_id); setTimeout(loadTasks, 500); }
+    else alert(JSON.stringify(r.data, null, 2));
   } catch (e) { alert("重建失败: " + e); }
 }
 
-// ---- 任务列表 ----
+/* ---------- 任务 ---------- */
 async function loadTasks() {
   try {
-    const r = await fetch(API + "/api/knowledge/tasks");
-    const d = await r.json();
-    const tb = $("tasks-table").querySelector("tbody");
-    tb.innerHTML = "";
-    if (!d.tasks || !d.tasks.length) {
-      tb.innerHTML = `<tr><td colspan="5" class="muted">暂无任务</td></tr>`;
-      return;
-    }
-    d.tasks.forEach(t => {
+    const r = await api("/api/knowledge/tasks");
+    const tb = $("tasks-table").querySelector("tbody"); tb.innerHTML = "";
+    if (!r.data || !r.data.tasks || !r.data.tasks.length) { tb.innerHTML = `<tr><td colspan="5" class="muted">暂无任务</td></tr>`; return; }
+    r.data.tasks.forEach(t => {
       const badge = t.status === "done" ? "ok" : (t.status === "failed" ? "err" : "warn");
       const tr = document.createElement("tr");
       tr.innerHTML = `<td>${t.task_id}</td><td>${t.type}</td>
         <td><span class="badge ${badge}">${t.status}</span></td>
-        <td>${t.elapsed ? t.elapsed.toFixed(1) : "-"}</td>
-        <td>${t.error || ""}</td>`;
+        <td>${t.elapsed ? t.elapsed.toFixed(1) : "-"}</td><td>${esc(t.error || "")}</td>`;
       tb.appendChild(tr);
     });
-  } catch (e) { /* ignore */ }
+  } catch (_) { /* ignore */ }
 }
 
-// ---- 初始化 ----
-loadHealth();
+/* ---------- 用户管理 ---------- */
+const ALL_PERMS = [
+  ["chat:query", "问答"], ["knowledge:read", "查看知识库"], ["knowledge:upload", "上传文档"],
+  ["knowledge:delete", "删除文档"], ["knowledge:rebuild", "重建索引"], ["knowledge:grant", "文档授权"],
+  ["admin:users", "用户管理"], ["admin:roles", "角色管理"], ["admin:audit", "审计日志"],
+];
+async function loadUserRoleOptions() {
+  try {
+    const r = await api("/api/admin/roles");
+    const roles = (r.data && r.data.roles) || [];
+    $("user-role").innerHTML = `<option value="">（无角色）</option>` + roles.map(x => `<option value="${esc(x.role_code)}">${esc(x.role_code)}</option>`).join("");
+  } catch (_) {}
+}
+function rolePermChip(role) {
+  return (role.permissions || []).map(p => `<span class="badge info">${esc(p)}</span>`).join(" ") || '<span class="muted">无</span>';
+}
+async function loadUsers() {
+  try {
+    const r = await api("/api/admin/users");
+    if (r.status !== 200) return alert("加载用户失败: " + ((r.data && r.data.detail) || r.status));
+    const tb = $("users-table").querySelector("tbody"); tb.innerHTML = "";
+    (r.data.users || []).forEach(u => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(u.username)}</td><td>${esc(u.display_name || "")}</td><td>${esc(u.tenant_id)}</td>
+        <td>${(u.roles || []).map(esc).join(", ") || "-"}</td>
+        <td><span class="badge ${u.is_active ? "ok" : "err"}">${u.is_active ? "启用" : "停用"}</span></td>
+        <td>${u.created_at || ""}</td>
+        <td><button class="btn-sm btn-danger" onclick="deleteUser('${esc(u.user_id)}','${esc(u.username)}')">删除</button></td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { alert("加载用户失败: " + e); }
+}
+async function createUser() {
+  const username = $("user-name").value.trim();
+  const password = $("user-pass").value.trim();
+  if (!username || !password) return alert("用户名和密码必填");
+  const payload = {
+    username, password,
+    display_name: $("user-display").value.trim(),
+    tenant_id: $("user-tenant").value.trim() || "default",
+    roles: $("user-role").value ? [$("user-role").value] : [],
+  };
+  try {
+    const r = await api("/api/admin/users", { method: "POST", body: payload });
+    if (r.status !== 200) return alert((r.data && r.data.detail) || "创建失败");
+    $("user-name").value = ""; $("user-pass").value = ""; $("user-display").value = "";
+    alert("已创建用户: " + username); loadUsers();
+  } catch (e) { alert("创建失败: " + e); }
+}
+async function deleteUser(id, name) {
+  if (!confirm("确定删除用户 " + name + " ？")) return;
+  try {
+    const r = await api("/api/admin/users/" + encodeURIComponent(id), { method: "DELETE" });
+    alert(JSON.stringify(r.data, null, 2)); loadUsers();
+  } catch (e) { alert("删除失败: " + e); }
+}
+
+/* ---------- 角色管理 ---------- */
+async function loadPermChips() {
+  $("role-perms").innerHTML = ALL_PERMS.map(([code, name]) =>
+    `<label><input type="checkbox" value="${code}"> ${name} (${code})</label>`).join("");
+}
+async function createRole() {
+  const code = $("role-code").value.trim();
+  const name = $("role-name").value.trim();
+  if (!code || !name) return alert("角色编码和名称必填");
+  const permissions = Array.from(document.querySelectorAll("#role-perms input:checked")).map(x => x.value);
+  try {
+    const r = await api("/api/admin/roles", { method: "POST", body: { role_code: code, name, permissions } });
+    if (r.status !== 200) return alert((r.data && r.data.detail) || "创建失败");
+    $("role-code").value = ""; $("role-name").value = "";
+    document.querySelectorAll("#role-perms input").forEach(i => i.checked = false);
+    alert("已创建角色: " + code); loadRoles(); loadUserRoleOptions();
+  } catch (e) { alert("创建失败: " + e); }
+}
+async function loadRoles() {
+  try {
+    const r = await api("/api/admin/roles");
+    if (r.status !== 200) return alert("加载角色失败: " + ((r.data && r.data.detail) || r.status));
+    const tb = $("roles-table").querySelector("tbody"); tb.innerHTML = "";
+    (r.data.roles || []).forEach(role => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${esc(role.role_code)}</td><td>${esc(role.name)}</td>
+        <td><span class="badge ${role.builtin ? "info" : "ok"}">${role.builtin ? "内置" : "自定义"}</span></td>
+        <td>${rolePermChip(role)}</td>
+        <td>${role.builtin ? '<span class="muted">内置不可删</span>' : `<button class="btn-sm btn-danger" onclick="deleteRole('${esc(role.role_code)}')">删除</button>`}</td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { alert("加载角色失败: " + e); }
+}
+async function deleteRole(code) {
+  if (!confirm("确定删除角色 " + code + " ？")) return;
+  try {
+    const r = await api("/api/admin/roles/" + encodeURIComponent(code), { method: "DELETE" });
+    alert(JSON.stringify(r.data, null, 2)); loadRoles(); loadUserRoleOptions();
+  } catch (e) { alert("删除失败: " + e); }
+}
+
+/* ---------- 审计日志 ---------- */
+async function loadAudit() {
+  try {
+    const params = new URLSearchParams();
+    const action = $("audit-action").value.trim(); if (action) params.set("action", action);
+    const actor = $("audit-actor").value.trim(); if (actor) params.set("actor", actor);
+    const result = $("audit-result").value; if (result) params.set("result", result);
+    params.set("limit", $("audit-limit").value || 50);
+    const r = await api("/api/admin/audit-logs?" + params.toString());
+    if (r.status !== 200) return alert("加载审计日志失败: " + ((r.data && r.data.detail) || r.status));
+    const tb = $("audit-table").querySelector("tbody"); tb.innerHTML = "";
+    const logs = r.data.logs || [];
+    if (!logs.length) { tb.innerHTML = `<tr><td colspan="7" class="muted">暂无日志</td></tr>`; return; }
+    logs.forEach(l => {
+      const badge = l.result === "success" ? "ok" : (l.result === "denied" ? "err" : "warn");
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td>${l.created_at || ""}</td><td>${esc(l.tenant_id)}</td>
+        <td>${esc(l.actor_username || "-")}</td><td><span class="badge info">${esc(l.action)}</span></td>
+        <td>${esc(l.resource || "")}</td><td><span class="badge ${badge}">${l.result}</span></td>
+        <td style="max-width:300px;word-break:break-all;">${esc(l.detail || "")}</td>`;
+      tb.appendChild(tr);
+    });
+  } catch (e) { alert("加载审计日志失败: " + e); }
+}
+
+/* ---------- 初始化 ---------- */
+init();
 setInterval(loadHealth, 15000);
 </script>
 </body>

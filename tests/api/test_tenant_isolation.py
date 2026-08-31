@@ -182,7 +182,7 @@ class TestTenantDataIsolation:
             (Config().raw_dir_for("acme") / fname).unlink()
 
     def test_delete_tenant_scoped(self, anon_client, tenant_token, mock_upload,
-                                  no_mysql, fake_index_writer):
+                                  no_mysql, fake_index_writer, sync_background_rebuild):
         """A 上传后：B 删除 → 404；A 删除 → 200 且触发租户重建。"""
         token_a = tenant_token("acme")
         token_b = tenant_token("beta")

@@ -135,12 +135,17 @@ class RebuildResponse(BaseModel):
 
 
 class DeleteResponse(BaseModel):
-    """删除文档响应。"""
+    """删除文档响应。
+
+    rebuilt_indexes: 已提交后台重建的索引策略列表（异步执行，完成后索引才真正更新）。
+    task_id: 后台重建任务 ID（可到 /api/knowledge/tasks 查询状态）。
+    """
     document_id: str
     deleted_from_mysql: bool
     deleted_chunks: int
     deleted_file: bool
     rebuilt_indexes: List[str]
+    task_id: str = None
 
 
 class DocumentItem(BaseModel):
@@ -148,6 +153,7 @@ class DocumentItem(BaseModel):
     file_name: str
     content_length: int = 0
     source: str = ""
+    owner_user_id: str = ""
     chunk_count: int = 0
     created_at: str = ""
 
@@ -547,9 +553,9 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
         deleted_from_mysql = False
         deleted_chunks = 0
         deleted_file = False
-        rebuilt_indexes: List[str] = []
         # 记录原始文件名（用于外层判断 doc_id 映射：MySQL 中的 doc_id 可能与 stem 相同）
         resolved_doc_id = doc_id
+        deleted_doc_ids_for_rebuild: List[str] = []
 
         # 1. 删除 MySQL 记录（按 document_id + tenant 删除 chunks + 文档）
         if config.storage_mysql_enabled:
@@ -576,6 +582,7 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
                     deleted_chunks = chunk_repo.delete_by_document(resolved_doc_id)
                     doc_repo.delete(resolved_doc_id, tenant_id=tenant_id)
                     deleted_from_mysql = True
+                    deleted_doc_ids_for_rebuild.append(resolved_doc_id)
                     logger.info(
                         "已从 MySQL 删除文档: doc_id=%s (原始=%s), tenant=%s, chunks=%d",
                         resolved_doc_id, doc_id, tenant_id, deleted_chunks,
@@ -591,7 +598,6 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
 
         # 2. 删除原始文件（可能是 doc_id.file_name 形式，按 stem/name 多方式匹配）
         raw_dir = config.raw_dir_for(tenant_id)
-        deleted_doc_ids_for_rebuild: List[str] = []
         if raw_dir.exists():
             target = None
             if (raw_dir / doc_id).exists():
@@ -609,17 +615,11 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
                         break
             if target and target.exists():
                 # 删除前记录 stem（ES/MySQL 使用 document_id = 原始 stem）
-                deleted_doc_ids_for_rebuild.append(target.stem)
-                # 同时把 resolved_doc_id 补上（避免二选一漏）
-                if deleted_from_mysql and resolved_doc_id not in deleted_doc_ids_for_rebuild:
-                    deleted_doc_ids_for_rebuild.append(resolved_doc_id)
+                if target.stem not in deleted_doc_ids_for_rebuild:
+                    deleted_doc_ids_for_rebuild.append(target.stem)
                 target.unlink()
                 deleted_file = True
                 logger.info("已删除原始文件: %s (tenant=%s)", target, tenant_id)
-            else:
-                # 文件没找到但 MySQL 删成功了：把 MySQL 的 doc_id 给重建流程
-                if deleted_from_mysql and resolved_doc_id not in deleted_doc_ids_for_rebuild:
-                    deleted_doc_ids_for_rebuild.append(resolved_doc_id)
 
         if not deleted_from_mysql and not deleted_file:
             raise _NotFoundError(doc_id)
@@ -632,49 +632,77 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
                 detail="无权删除文档: {}（非归属人或未授权）".format(resolved_doc_id),
             )
 
-        # 3. 增量重建受影响的索引（fixed + recursive，按租户隔离）
-        #    - ES 增量：只删 deleted_doc_ids 的 chunks
-        #    - Milvus 清理 + FAISS + metadata：重写（保证 vector_id 顺序）
-        #    - MySQL：外层已按文档级清理完，**跳过** delete_by_strategy 避免全表删插
-        try:
-            from app.ingestion.writer import IndexWriter
-            writer = IndexWriter(config=config)
-            for strategy in ("fixed", "recursive"):
-                writer.incremental_rebuild_after_delete(
-                    strategy=strategy,
-                    deleted_doc_ids=deleted_doc_ids_for_rebuild,
-                    tenant_id=tenant_id,
-                )
-                rebuilt_indexes.append(strategy)
-        except Exception as e:
-            logger.error("增量重建索引失败（文档已删除）: %s", e, exc_info=True)
-
-        # 索引已变更，无需清空缓存：get_service 按索引版本号自动刷新 service
-        logger.info("索引已更新（删除文档后，service 缓存将按版本号自动刷新）")
-
-        return DeleteResponse(
-            document_id=doc_id,
-            deleted_from_mysql=deleted_from_mysql,
-            deleted_chunks=deleted_chunks,
-            deleted_file=deleted_file,
-            rebuilt_indexes=rebuilt_indexes,
-        )
+        return {
+            "deleted_from_mysql": deleted_from_mysql,
+            "deleted_chunks": deleted_chunks,
+            "deleted_file": deleted_file,
+            "deleted_doc_ids": deleted_doc_ids_for_rebuild,
+        }
 
     try:
-        result = await run_in_threadpool(_do_delete)
+        r = await run_in_threadpool(_do_delete)
     except _NotFoundError:
         raise HTTPException(status_code=404, detail="文档不存在: {}".format(doc_id))
     except _MysqlError as e:
         raise HTTPException(status_code=500, detail="MySQL 删除失败: {}".format(e))
+
+    # 3. 索引重建改为后台任务：同步全量重建（重 embedding + ES/Milvus）耗时可达数分钟，
+    #    阻塞响应会让管理台删除后列表长时间不更新。这里只提交任务，立即返回。
+    task_id = None
+    if r["deleted_doc_ids"]:
+        from app.core.task_queue import task_manager
+        task_id = task_manager.submit(
+            "rebuild", _do_rebuild_after_delete, tenant_id, r["deleted_doc_ids"],
+        )
+        logger.info(
+            "已提交删除后索引重建任务: task_id=%s, tenant=%s, docs=%s",
+            task_id, tenant_id, r["deleted_doc_ids"],
+        )
 
     record(
         action="document.delete", tenant_id=tenant_id,
         actor_user_id=user.user_id if user else "",
         actor_username=user.username if user else "",
         resource=doc_id,
-        detail="deleted_chunks={}, rebuilt={}".format(
-            result.deleted_chunks, result.rebuilt_indexes
+        detail="deleted_chunks={}, rebuild_task={}".format(
+            r["deleted_chunks"], task_id or "-",
         ),
+    )
+    return DeleteResponse(
+        document_id=doc_id,
+        deleted_from_mysql=r["deleted_from_mysql"],
+        deleted_chunks=r["deleted_chunks"],
+        deleted_file=r["deleted_file"],
+        rebuilt_indexes=["fixed", "recursive"] if r["deleted_doc_ids"] else [],
+        task_id=task_id,
+    )
+
+
+def _do_rebuild_after_delete(tenant_id: str, deleted_doc_ids: List[str]) -> dict:
+    """后台任务：删除文档后增量重建 fixed/recursive 索引。
+
+    独立于 HTTP 请求在任务线程池执行；索引重建后 get_service 按版本号自动刷新。
+    """
+    from app.ingestion.writer import IndexWriter
+    writer = IndexWriter()
+    result = {}
+    for strategy in ("fixed", "recursive"):
+        try:
+            writer.incremental_rebuild_after_delete(
+                strategy=strategy,
+                deleted_doc_ids=deleted_doc_ids,
+                tenant_id=tenant_id,
+            )
+            result[strategy] = True
+        except Exception as e:
+            logger.error(
+                "删除后索引重建失败: strategy=%s, tenant=%s, %s",
+                strategy, tenant_id, e, exc_info=True,
+            )
+            result[strategy] = False
+    logger.info(
+        "删除后索引重建完成: tenant=%s, docs=%s, result=%s",
+        tenant_id, deleted_doc_ids, result,
     )
     return result
 
@@ -714,6 +742,7 @@ async def list_documents(user: AuthUser = Depends(get_current_user)):
                         file_name=row.get("file_name", ""),
                         content_length=row.get("content_length", 0),
                         source=row.get("source") or "",
+                        owner_user_id=row.get("owner_user_id") or "",
                         chunk_count=len(chunk_repo.get_by_document(doc_id)),
                         created_at=str(row.get("created_at", "")),
                     ))

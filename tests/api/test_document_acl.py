@@ -150,7 +150,8 @@ class TestDeletePermission:
         assert resp.status_code == 403
         assert "无权删除" in resp.json()["detail"]
 
-    def test_owner_can_delete(self, anon_client, make_token, seeded_docs):
+    def test_owner_can_delete(self, anon_client, make_token, seeded_docs,
+                              noop_background_rebuild):
         doc_id, owner, _ = seeded_docs
         owner_headers = _headers(make_token, owner)
         resp = anon_client.delete("/api/knowledge/{}".format(doc_id), headers=owner_headers)
