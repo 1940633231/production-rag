@@ -1,7 +1,7 @@
 """ES 存储层集成测试。
 
 验证 ESClient / ChunkESRepository 的核心接口，重点验证
-vector_id 与 FAISS 位置 ID 的对齐（修复 ID 错位隐患）。
+稳定 ID 索引下 vector_id（由 chunk_id 哈希派生）的写入/读取一致性。
 
 前置条件:
   1. ES 服务运行中（默认 http://127.0.0.1:9200）
@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.core.env import load_env
 load_env()
 
-from app.ingestion.chunk import Chunk
+from app.ingestion.chunk import Chunk, vector_id_for
 from app.storage.es_client import ESClient, _ES_AVAILABLE
 from app.storage.es_repository import ChunkESRepository
 
@@ -72,6 +72,7 @@ def _make_chunk(chunk_id: str, document_id: str, chunk_index: int,
         start_offset=start,
         end_offset=end,
         metadata={"source": "test"},
+        vector_id=vector_id_for(chunk_id),
     )
 
 
@@ -91,10 +92,10 @@ def test_create_and_drop_index(es_client):
     assert bool(es_client._client.indices.exists(index=idx)) is False
 
 
-# ---- vector_id 对齐（核心修复点）----
+# ---- vector_id（稳定 ID 索引）----
 
 def test_batch_insert_writes_vector_id(es_repo, es_client):
-    """batch_insert 写入的 ES 文档必须包含 vector_id 字段，且与 chunks 顺序对齐。"""
+    """batch_insert 写入的 ES 文档必须包含与 chunk 一致的稳定 vector_id。"""
     chunks = [
         _make_chunk("c-0", "doc-1", 0, "第一段内容", 0, 10),
         _make_chunk("c-1", "doc-1", 1, "第二段内容", 10, 20),
@@ -105,13 +106,13 @@ def test_batch_insert_writes_vector_id(es_repo, es_client):
         index=es_client._index_name(STRATEGY)
     )
 
-    # 拉取全量，按 vector_id 升序
     results = es_client.search(STRATEGY, query="*", top_k=100,
-                                sort_by_vector_id=True)
+                               sort_by_vector_id=True)
     assert len(results) == 3
-    # 关键断言：vector_id 必须存在且与 chunks 顺序对齐
-    assert [r["vector_id"] for r in results] == [0, 1, 2]
-    assert [r["chunk_id"] for r in results] == ["c-0", "c-1", "c-2"]
+    # 稳定 ID：vector_id 与各 chunk 的 vector_id 一致（非 enumerate）
+    expected = sorted(c.vector_id for c in chunks)
+    assert sorted(r["vector_id"] for r in results) == expected
+    assert {r["chunk_id"] for r in results} == {"c-0", "c-1", "c-2"}
 
 
 def test_count_returns_correct_number(es_repo, es_client):
@@ -129,11 +130,10 @@ def test_count_returns_correct_number(es_repo, es_client):
     assert es_repo.count() == 5
 
 
-def test_get_by_id_aligned_with_faiss_position(es_repo, es_client):
-    """get_by_id(int) 必须返回 vector_id == int 的 chunk（不是 enumerate 顺序）。
+def test_get_by_id_aligned_with_vector_id(es_repo, es_client):
+    """get_by_id(int) 必须返回 vector_id == int 的 chunk（稳定 ID 索引）。
 
-    模拟 Retriever.search 的调用方式：FAISS 返回 ids=[1, 0, 2]，
-    用 get_by_id(1/0/2) 必须拿到对应 chunks[1/0/2]。
+    模拟 Retriever.search 的调用方式：按 vector_id 取 chunk。
     """
     chunks = [
         _make_chunk("alpha", "doc-1", 0, "alpha 内容", 0, 10),
@@ -145,17 +145,20 @@ def test_get_by_id_aligned_with_faiss_position(es_repo, es_client):
         index=es_client._index_name(STRATEGY)
     )
 
-    # 模拟 FAISS 返回 ids=[1, 0, 2]（任意顺序）
-    retrieved = [es_repo.get_by_id(i) for i in [1, 0, 2]]
-    assert retrieved[0]["chunk_id"] == "beta"   # vector_id=1
-    assert retrieved[1]["chunk_id"] == "alpha"  # vector_id=0
-    assert retrieved[2]["chunk_id"] == "gamma"  # vector_id=2
-    # 越界返回 None
-    assert es_repo.get_by_id(99) is None
+    vids = {c.chunk_id: c.vector_id for c in chunks}
+    # 任意顺序按 vector_id 取回对应 chunk
+    retrieved = [es_repo.get_by_id(vids["beta"]),
+                 es_repo.get_by_id(vids["alpha"]),
+                 es_repo.get_by_id(vids["gamma"])]
+    assert retrieved[0]["chunk_id"] == "beta"
+    assert retrieved[1]["chunk_id"] == "alpha"
+    assert retrieved[2]["chunk_id"] == "gamma"
+    # 不存在的 id 返回 None
+    assert es_repo.get_by_id(999999999) is None
 
 
 def test_list_all_sorted_by_vector_id(es_repo, es_client):
-    """list_all() 按 vector_id 升序返回，顺序与写入一致。"""
+    """list_all() 按 vector_id 升序返回，且每个 chunk 带自身 vector_id。"""
     chunks = [
         _make_chunk("c-{}".format(i), "doc-1", i, "内容{}".format(i),
                     i * 10, i * 10 + 10)
@@ -166,13 +169,14 @@ def test_list_all_sorted_by_vector_id(es_repo, es_client):
         index=es_client._index_name(STRATEGY)
     )
     all_chunks = es_repo.list_all()
-    assert [c["vector_id"] for c in all_chunks] == [0, 1, 2, 3]
+    assert sorted(c["vector_id"] for c in all_chunks) == \
+        sorted(c.vector_id for c in chunks)
 
 
 # ---- search 全文检索 ----
 
 def test_search_match_returns_vector_id(es_repo, es_client):
-    """match 查询结果必须包含 vector_id 字段。"""
+    """match 查询结果必须包含 vector_id 字段（稳定 ID）。"""
     chunks = [
         _make_chunk("c-0", "doc-1", 0,
                     "Elasticsearch 是一个分布式的全文检索引擎", 0, 30),
@@ -186,4 +190,4 @@ def test_search_match_returns_vector_id(es_repo, es_client):
     results = es_client.search(STRATEGY, query="全文检索", top_k=5)
     assert len(results) >= 1
     assert "vector_id" in results[0]
-    assert results[0]["vector_id"] in (0, 1)
+    assert results[0]["vector_id"] in {c.vector_id for c in chunks}

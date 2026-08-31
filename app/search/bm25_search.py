@@ -48,7 +48,7 @@ class BM25Search:
 
         scores = self.bm25.get_scores(query_tokens)
 
-        # 按分数降序取 top_k；local_idx 即为 vector_id（list_all 顺序）
+        # 按分数降序取 top_k；vector_id 用 chunk 自带的稳定 ID（非列表下标）
         ranked = sorted(
             enumerate(scores), key=lambda x: x[1], reverse=True
         )[:top_k]
@@ -73,7 +73,7 @@ class BM25Search:
                 {
                     "rank": rank,
                     "score": float(score),
-                    "vector_id": local_idx,
+                    "vector_id": int(document.get("vector_id", 0)),
                     "chunk_id": document["chunk_id"],
                     "content": document["content"],
                     "start_offset": document.get("start_offset", 0),

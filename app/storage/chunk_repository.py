@@ -50,16 +50,20 @@ class ChunkRepository(BaseChunkRepository):
             return "", []
         return " AND tenant_id = %s", [tenant_id]
 
-    # ---- BaseChunkRepository 读接口（按 strategy + tenant 过滤）----
+    # ---- BaseChunkRepository 读接口（按 strategy + tenant 过滤，按 vector_id 索引）----
 
     def _ensure_loaded(self):
-        """首次访问时按 strategy(+tenant) 全量加载 chunks 到内存缓存。"""
+        """首次访问时按 strategy(+tenant) 全量加载 chunks 到内存缓存。
+
+        _cache_map 以 vector_id（稳定 ID）为 key，而非 enumerate 位置；
+        get_by_id(int) 即按 vector_id 查询，与 FAISS/Milvus 显式主键一致。
+        """
         if self._cache_list is not None:
             return
         t_load = time.time()
         tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
         sql = (
-            "SELECT chunk_id, document_id, content, start_offset, end_offset, metadata "
+            "SELECT chunk_id, document_id, vector_id, content, start_offset, end_offset, metadata "
             "FROM {} WHERE strategy = %s{} ORDER BY id ASC"
         ).format(self.TABLE, tenant_clause)
         rows = []
@@ -71,7 +75,7 @@ class ChunkRepository(BaseChunkRepository):
             if r.get("metadata"):
                 r["metadata"] = json.loads(r["metadata"])
         self._cache_list = rows
-        self._cache_map = {i: r for i, r in enumerate(rows)}
+        self._cache_map = {int(r.get("vector_id", 0)): r for r in rows}
         logger.info(
             "ChunkRepository 全量加载: strategy=%s, tenant=%s, %.3fs, chunks=%d",
             self.strategy, self.tenant_id if self.tenant_id is not None else "*",
@@ -79,9 +83,9 @@ class ChunkRepository(BaseChunkRepository):
         )
 
     def get_by_id(self, id: int) -> Optional[Dict]:
-        """按向量位置 ID 查询单个 chunk。"""
+        """按向量 ID（稳定 vector_id）查询单个 chunk。"""
         self._ensure_loaded()
-        return self._cache_map.get(id)
+        return self._cache_map.get(int(id))
 
     def batch_get_by_ids(self, ids: List[int]) -> List[Dict]:
         """批量按向量位置 ID 查询 chunks。"""
@@ -117,26 +121,28 @@ class ChunkRepository(BaseChunkRepository):
                content: str, start_offset: int, end_offset: int,
                metadata: Optional[Dict] = None,
                strategy: Optional[str] = None,
-               tenant_id: Optional[str] = None) -> int:
+               tenant_id: Optional[str] = None,
+               vector_id: int = 0) -> int:
         """插入单个 chunk（INSERT IGNORE 避免重复）。
 
         strategy 默认取构造函数的 self.strategy；
-        tenant_id 默认取 self.tenant_id（None 时写入 'default'）。
+        tenant_id 默认取 self.tenant_id（None 时写入 'default'）；
+        vector_id 为稳定向量 ID（FAISS/Milvus 显式主键），默认 0。
         """
         strat = strategy or self.strategy
         tnt = tenant_id or self.tenant_id or "default"
         sql = (
             "INSERT IGNORE INTO {} "
-            "(chunk_id, document_id, tenant_id, strategy, chunk_index, content, "
+            "(chunk_id, document_id, tenant_id, strategy, vector_id, chunk_index, content, "
             "start_offset, end_offset, metadata) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         ).format(self.TABLE)
         meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 rows = cur.execute(
-                    sql, (chunk_id, document_id, tnt, strat, chunk_index, content,
-                          start_offset, end_offset, meta_json)
+                    sql, (chunk_id, document_id, tnt, strat, int(vector_id),
+                          chunk_index, content, start_offset, end_offset, meta_json)
                 )
         return rows
 
@@ -147,7 +153,8 @@ class ChunkRepository(BaseChunkRepository):
 
         参数 chunks 是 app.ingestion.chunk.Chunk 对象列表。
         strategy 默认取构造函数的 self.strategy；
-        tenant_id 默认取 self.tenant_id（None 时写入 'default'）。
+        tenant_id 默认取 self.tenant_id（None 时写入 'default'）；
+        vector_id 取各 chunk 的 vector_id（稳定 ID）。
         """
         if not chunks:
             return 0
@@ -156,15 +163,15 @@ class ChunkRepository(BaseChunkRepository):
         tnt = tenant_id or self.tenant_id or "default"
         sql = (
             "INSERT IGNORE INTO {} "
-            "(chunk_id, document_id, tenant_id, strategy, chunk_index, content, "
+            "(chunk_id, document_id, tenant_id, strategy, vector_id, chunk_index, content, "
             "start_offset, end_offset, metadata) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         ).format(self.TABLE)
 
         rows_data = [
             (
-                c.chunk_id, c.document_id, tnt, strat, c.chunk_index, c.content,
-                c.start_offset, c.end_offset,
+                c.chunk_id, c.document_id, tnt, strat, int(getattr(c, "vector_id", 0) or 0),
+                c.chunk_index, c.content, c.start_offset, c.end_offset,
                 json.dumps(c.metadata, ensure_ascii=False) if c.metadata else None,
             )
             for c in chunks
@@ -231,6 +238,23 @@ class ChunkRepository(BaseChunkRepository):
             if r.get("metadata"):
                 r["metadata"] = json.loads(r["metadata"])
         return rows
+
+    def get_vector_ids_by_document(self, document_id: str,
+                                   tenant_id: Optional[str] = None) -> List[int]:
+        """返回某文档的全部稳定向量 ID（跨 strategy 去重）。
+
+        删除文档时据此从向量后端 / metadata.json 移除，无需重建索引。
+        """
+        tnt = tenant_id if tenant_id is not None else self.tenant_id
+        tenant_clause, tenant_params = self._tenant_clause(tnt)
+        sql = (
+            "SELECT DISTINCT vector_id FROM {} "
+            "WHERE document_id = %s AND vector_id > 0{}"
+        ).format(self.TABLE, tenant_clause)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (document_id, *tenant_params))
+                return [int(r["vector_id"]) for r in cur.fetchall()]
 
     # ---- 删除接口 ----
 

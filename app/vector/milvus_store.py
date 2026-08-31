@@ -173,11 +173,13 @@ class MilvusStore(BaseVectorStore):
 
     # ---- 接口实现 ----
 
-    def add(self, vectors):
+    def add(self, vectors, ids=None):
         """批量写入向量。
 
         参数:
             vectors: numpy.ndarray 或 list，shape=(n, dimension)
+            ids: 可选，与 vectors 一一对应的显式 int64 主键；
+                 不传时用末尾序号 0..N-1（向后兼容）
         """
         import numpy as np
 
@@ -197,10 +199,21 @@ class MilvusStore(BaseVectorStore):
         t = time.time()
         logger.info("Milvus 写入向量: count=%d", vectors.shape[0])
 
-        # 显式生成 vector_id=0..N-1 并作为主键写入（auto_id=False）
-        # 保证 Milvus 返回的 id 与 chunks enumerate 顺序、FAISS position 严格对齐
+        # 显式主键：优先用传入 ids（稳定 ID），否则用末尾序号 0..N-1（向后兼容）
+        if ids is not None:
+            ids_list = [int(i) for i in ids]
+            if len(ids_list) != vectors.shape[0]:
+                raise ValueError(
+                    "ids 长度必须与 vectors 一致: ids={}, vectors={}".format(
+                        len(ids_list), vectors.shape[0]
+                    )
+                )
+        else:
+            current = self._row_count(self._collection_name)
+            ids_list = list(range(current, current + vectors.shape[0]))
+
         data = [
-            {"id": i, "embedding": vectors[i].tolist()}
+            {"id": ids_list[i], "embedding": vectors[i].tolist()}
             for i in range(vectors.shape[0])
         ]
         self._client.insert(self.collection_name, data)
@@ -209,6 +222,27 @@ class MilvusStore(BaseVectorStore):
             "Milvus 写入完成: %.3fs, total_rows=%d",
             time.time() - t, self._row_count(self.collection_name),
         )
+
+    def remove(self, ids):
+        """按 id 删除向量（其余向量 id 不变，无需重建）。
+
+        参数:
+            ids: 待删除的 int64 id 列表
+        """
+        if self._collection_name is None:
+            raise RuntimeError(
+                "collection 未加载，请先调用 load(path) 或 add(vectors)"
+            )
+        t = time.time()
+        ids_list = [int(i) for i in ids]
+        self._connect()
+        self._client.delete(self._collection_name, ids=ids_list)
+        self._client.flush(self._collection_name)
+        logger.info(
+            "Milvus 删除向量: ids=%s, %.3fs",
+            ids_list, time.time() - t,
+        )
+        return len(ids_list)
 
     def search(self, query_vector, top_k):
         """检索最相似的 top_k 个向量。

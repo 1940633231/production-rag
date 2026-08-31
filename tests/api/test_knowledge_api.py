@@ -89,9 +89,8 @@ class TestUploadRoute:
 
 
 class TestDeleteRoute:
-    def test_delete_removes_file_and_rebuilds(self, client, no_mysql,
-                                              fake_index_writer, raw_dir,
-                                              sync_background_rebuild):
+    def test_delete_removes_file_no_rebuild(self, client, no_mysql, raw_dir):
+        """稳定 ID 索引：删除只移除文件/记录，不触发索引重建。"""
         fname = "_pytest_del_{}.txt".format(uuid.uuid4().hex[:8])
         target = raw_dir / fname
         target.write_text("待删除文档", encoding="utf-8")
@@ -101,10 +100,9 @@ class TestDeleteRoute:
         data = resp.json()
         assert data["deleted_file"] is True
         assert not target.exists()  # 文件已删
-        # 两个策略都已提交后台重建（sync fixture 下同步执行）
-        assert data["rebuilt_indexes"] == ["fixed", "recursive"]
-        assert data["task_id"]
-        assert set(fake_index_writer["strategies"]) == {"fixed", "recursive"}
+        # 稳定 ID 索引：删除无需重建
+        assert data["rebuilt_indexes"] == []
+        assert data["task_id"] is None
 
     def test_delete_not_found_404(self, client, no_mysql, raw_dir):
         resp = client.delete("/api/knowledge/_pytest_missing_{}".format(

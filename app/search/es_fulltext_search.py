@@ -72,8 +72,11 @@ class ESFulltextSearch:
     # 对外接口（与 BM25Search / Retriever 一致）
     # ------------------------------------------------------------------
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict]:
-        """ES match 查询，返回与 BM25Search 格式相同的命中列表。"""
+    def search(self, query: str, top_k: int = 10, document_ids=None) -> List[Dict]:
+        """ES match 查询，返回与 BM25Search 格式相同的命中列表。
+
+        document_ids: 文档级 ACL 可读文档集合（None 表示不设文档级过滤）。
+        """
         t = time.time()
         logger.info(
             "ES 全文检索开始: strategy=%s, query=%r, top_k=%d",
@@ -99,6 +102,11 @@ class ESFulltextSearch:
             score = float(h.get("score", 0) or 0)
             if score <= self.min_score:
                 continue
+            # 文档级 ACL：跳过用户不可读文档的 chunk
+            if document_ids is not None:
+                doc_id = h.get("document_id")
+                if doc_id not in document_ids:
+                    continue
             vector_id = h.get("vector_id")
             if vector_id is None:
                 # 缺少 vector_id 就无法参与 RRF + chunk_repo 映射，跳过

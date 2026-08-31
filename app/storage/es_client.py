@@ -94,7 +94,7 @@ class ESClient:
                     "document_id": {"type": "keyword"},
                     "strategy": {"type": "keyword"},
                     "chunk_index": {"type": "integer"},
-                    "vector_id": {"type": "integer"},
+                    "vector_id": {"type": "long"},
                     "content": {"type": "text", "analyzer": "ik_max_word"},
                     "start_offset": {"type": "integer"},
                     "end_offset": {"type": "integer"},

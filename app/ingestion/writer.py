@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 
 from app.core.config import Config
 from app.core.logger import get_logger
+from app.ingestion.chunk import vector_id_for
 
 logger = get_logger(__name__)
 
@@ -147,6 +148,12 @@ class IndexWriter:
             "Chunk 完成: %.3fs, 总 chunks=%d", time.time() - t, len(chunks)
         )
 
+        # 2b. 分配稳定向量 ID（chunk_id 哈希派生）——作为 FAISS/Milvus 显式主键，
+        #     使向量 id 稳定、删除不影响其余向量（无需重建）
+        for c in chunks:
+            if not c.vector_id:
+                c.vector_id = vector_id_for(c.chunk_id)
+
         # 3. Embed
         t = time.time()
         embedding_model = EmbeddingModel(self.config.embedding_model)
@@ -171,6 +178,7 @@ class IndexWriter:
         )
 
         milvus_persisted = False
+        chunk_ids = [c.vector_id for c in chunks]
         if use_milvus_backend:
             try:
                 from app.vector import create_vector_store
@@ -189,16 +197,16 @@ class IndexWriter:
                     hnsw_ef_construction=self.config.hnsw_ef_construction,
                     hnsw_ef_search=self.config.hnsw_ef_search,
                 )
-                # 幂等：先删除旧 collection（rebuild 已单独清理，但 write 是单次上传入口，
-                # 直接追加会与旧数据 vector_id 冲突，故 write 时也 drop 再重建）
+                # 追加语义：加载已有 collection（存在则复用，不存在则创建），
+                # 用稳定 vector_id 显式主键写入，避免与旧向量冲突
                 try:
-                    vector_store.drop()
-                except Exception as de:
+                    vector_store.load(collection_name)
+                except Exception as le:
                     logger.info(
-                        "Milvus 预清理 drop 跳过: collection=%s, error=%s",
-                        collection_name, de,
+                        "Milvus collection 不存在，将新建: collection=%s, error=%s",
+                        collection_name, le,
                     )
-                vector_store.add(vectors)
+                vector_store.add(vectors, ids=chunk_ids)
                 # save 不写本地文件，仅确保 collection_name 生效 + flush
                 vector_store.save(collection_name)
                 milvus_persisted = True
@@ -228,20 +236,45 @@ class IndexWriter:
                 hnsw_ef_construction=self.config.hnsw_ef_construction,
                 hnsw_ef_search=self.config.hnsw_ef_search,
             )
-            vector_store.add(vectors)
+            # 追加语义：已有索引文件则加载（保留原向量 + id），再追加本次向量
+            if Path(index_path).exists():
+                try:
+                    vector_store.load(str(index_path))
+                except Exception as le:
+                    logger.warning(
+                        "FAISS 索引加载失败，重建新索引: %s", le,
+                    )
+            vector_store.add(vectors, ids=chunk_ids)
             vector_store.save(index_path)
             logger.info(
                 "FAISS 写入完成: %.3fs, path=%s, dim=%d, vectors=%d",
                 time.time() - t, index_path, vectors.shape[1], vectors.shape[0],
             )
 
-        # 5. 写 metadata.json（始终写入，作为降级兜底）
+        # 5. 写 metadata.json（追加合并：已有条目按 vector_id 保留，新增/覆盖本次）
         t = time.time()
         metadata_store = MetadataStore()
-        metadata_store.save(chunks, metadata_path)
+        entries = {}
+        if Path(metadata_path).exists():
+            try:
+                entries = metadata_store.load(str(metadata_path)) or {}
+            except Exception as le:
+                logger.warning("metadata.json 加载失败，重新写入: %s", le)
+                entries = {}
+        for c in chunks:
+            entries[str(c.vector_id)] = {
+                "chunk_id": c.chunk_id,
+                "document_id": c.document_id,
+                "vector_id": c.vector_id,
+                "content": c.content,
+                "start_offset": c.start_offset,
+                "end_offset": c.end_offset,
+                "metadata": c.metadata,
+            }
+        metadata_store.save_entries(entries, metadata_path)
         logger.info(
-            "metadata.json 写入完成: %.3fs, path=%s, chunks=%d",
-            time.time() - t, metadata_path, len(chunks),
+            "metadata.json 写入完成: %.3fs, path=%s, 本次=%d, 累计=%d",
+            time.time() - t, metadata_path, len(chunks), len(entries),
         )
 
         # 6. 写 MySQL（软失败）
@@ -315,8 +348,17 @@ class IndexWriter:
         mysql_deleted = self._cleanup_mysql(strategy, tenant_id)
         es_dropped = self._cleanup_es(strategy, tenant_id)
         milvus_dropped = self._cleanup_milvus(strategy, tenant_id)
+        # 本地 FAISS 索引 + metadata.json 也一并清掉（write 是追加语义，需从空开始）
+        index_dir = self.config.index_dir_for(strategy, tenant_id)
+        for fname in ("faiss.index", "metadata.json"):
+            f = index_dir / fname
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception as e:
+                logger.warning("清理本地索引文件失败: %s, %s", f, e)
         logger.info(
-            "rebuild 清理完成: mysql_deleted=%d, es_dropped=%s, milvus_dropped=%s",
+            "rebuild 清理完成: mysql_deleted=%d, es_dropped=%s, milvus_dropped=%s, local_index=cleared",
             mysql_deleted, es_dropped, milvus_dropped,
         )
 
@@ -475,6 +517,106 @@ class IndexWriter:
             result["document_count"], result["chunk_count"],
         )
         return result
+
+    def remove_document(self, strategy: str, tenant_id: str,
+                        document_id: str, vector_ids: List[int]) -> None:
+        """删除文档后，从向量后端 + metadata.json + ES 移除对应数据（无需重建索引）。
+
+        稳定 ID 索引：向量按显式 vector_id 删除，其余向量 id 不变；
+        metadata.json 按 str(vector_id) 摘除对应条目。
+
+        参数:
+            strategy: 分块策略
+            tenant_id: 租户
+            document_id: 文档 ID（ES 按文档删除用）
+            vector_ids: 该文档 chunk 的稳定向量 ID 列表
+        """
+        vector_ids = [int(v) for v in vector_ids if v]
+        logger.info(
+            "remove_document: strategy=%s, tenant=%s, doc=%s, vector_ids=%d",
+            strategy, tenant_id, document_id, len(vector_ids),
+        )
+
+        # 1. 向量后端（Milvus 优先，否则 FAISS）——按 vector_id 删除
+        if vector_ids and self.config.storage_milvus_enabled:
+            try:
+                from app.vector import create_vector_store
+
+                col = self.config.milvus_collection_for(strategy, tenant_id)
+                store = create_vector_store(
+                    backend="milvus", dimension=1,
+                    host=self.config.milvus_host,
+                    port=self.config.milvus_port,
+                    collection_name=col,
+                )
+                store.load(col)
+                store.remove(vector_ids)
+                logger.info(
+                    "Milvus 移除向量: collection=%s, ids=%d",
+                    col, len(vector_ids),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Milvus 移除向量失败（可稍后重建索引修复）: %s", e,
+                )
+        elif vector_ids:
+            try:
+                from app.vector import create_vector_store
+
+                index_path = self.config.index_dir_for(strategy, tenant_id) / "faiss.index"
+                if Path(index_path).exists():
+                    store = create_vector_store(
+                        backend="faiss", dimension=1,
+                        index_type=self.config.vector_index_type,
+                    )
+                    store.load(str(index_path))
+                    store.remove(vector_ids)
+                    store.save(str(index_path))
+                    logger.info(
+                        "FAISS 移除向量: path=%s, ids=%d",
+                        index_path, len(vector_ids),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "FAISS 移除向量失败（可稍后重建索引修复）: %s", e,
+                )
+
+        # 2. metadata.json：按 vector_id 摘除条目
+        if vector_ids:
+            try:
+                from app.storage.metadata_store import MetadataStore
+
+                meta_path = self.config.index_dir_for(strategy, tenant_id) / "metadata.json"
+                if Path(meta_path).exists():
+                    ms = MetadataStore()
+                    entries = ms.load(str(meta_path)) or {}
+                    for vid in vector_ids:
+                        entries.pop(str(vid), None)
+                    ms.save_entries(entries, str(meta_path))
+                    logger.info(
+                        "metadata.json 移除条目: path=%s, 剩余=%d",
+                        meta_path, len(entries),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "metadata.json 移除条目失败（可稍后重建索引修复）: %s", e,
+                )
+
+        # 3. ES：按文档删除 chunks
+        if self.config.storage_es_enabled:
+            try:
+                from app.storage.es_repository import ChunkESRepository
+
+                es_repo = ChunkESRepository(strategy=strategy, tenant_id=tenant_id)
+                es_repo.incremental_reindex(chunks=[], deleted_doc_ids=[document_id])
+                logger.info(
+                    "ES 删除文档 chunks: strategy=%s, doc=%s",
+                    strategy, document_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "ES 删除文档 chunks 失败（可稍后重建索引修复）: %s", e,
+                )
 
     def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str],
                                 tenant_id: str = "default") -> bool:

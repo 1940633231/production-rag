@@ -297,6 +297,11 @@ async function doLogin() {
 function logout() {
   token = ""; currentUser = null;
   localStorage.removeItem("rag_token");
+  // 清空上一用户的对话与临时状态，避免切换用户后残留
+  $("chat-area").innerHTML = `<span class="muted">对话将显示在这里</span>`;
+  $("chat-query").value = "";
+  $("chat-history").value = "";
+  $("upload-result").innerHTML = "";
   $("login-overlay").style.display = "flex";
   $("nav").classList.add("hidden");
   $("main").classList.add("hidden");

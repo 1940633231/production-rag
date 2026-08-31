@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     document_id   VARCHAR(128)  NOT NULL,
     tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'default',
     strategy      VARCHAR(32)   NOT NULL DEFAULT 'recursive',
+    vector_id     BIGINT        NOT NULL DEFAULT 0,
     chunk_index   INT           NOT NULL,
     content       MEDIUMTEXT    NOT NULL,
     start_offset  INT           NOT NULL DEFAULT 0,
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     KEY idx_document_id (document_id),
     KEY idx_strategy (strategy),
     KEY idx_chunks_tenant (tenant_id, strategy),
+    KEY idx_chunks_vector (vector_id),
     CONSTRAINT fk_chunk_document FOREIGN KEY (document_id)
         REFERENCES documents(document_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -193,6 +195,8 @@ class MySQLManager:
                 self._migrate_tenant_id(cur)
                 # 迁移：旧表无 owner_user_id 列时补加（文档级 ACL）
                 self._migrate_owner_user_id(cur)
+                # 迁移：旧表无 vector_id 列时补加（稳定 ID 索引）
+                self._migrate_chunks_vector_id(cur)
                 # 认证/RBAC 表（软失败：不影响文档表）
                 try:
                     from app.auth.rbac_repository import DDL_STATEMENTS as AUTH_DDL
@@ -283,6 +287,27 @@ class MySQLManager:
             except Exception as ie:
                 logger.info("owner_user_id 索引已存在或创建失败（忽略）: %s", ie)
             logger.info("documents 表 owner_user_id 列迁移完成")
+
+    def _migrate_chunks_vector_id(self, cur):
+        """检测 chunks 表是否有 vector_id 列，缺失则补加 + 建索引。
+
+        稳定 ID 索引：vector_id 为 FAISS/Milvus 的显式主键，删除按此 id 移除。
+        老库升级后由 rebuild 重新写入 vector_id。
+        """
+        try:
+            cur.execute("SELECT vector_id FROM chunks LIMIT 1")
+        except Exception:
+            logger.info("chunks 表缺少 vector_id 列，执行迁移")
+            cur.execute(
+                "ALTER TABLE chunks ADD COLUMN vector_id BIGINT NOT NULL DEFAULT 0"
+            )
+            try:
+                cur.execute(
+                    "ALTER TABLE chunks ADD KEY idx_chunks_vector (vector_id)"
+                )
+            except Exception as ie:
+                logger.info("vector_id 索引已存在或创建失败（忽略）: %s", ie)
+            logger.info("chunks 表 vector_id 列迁移完成")
 
     def ping(self) -> bool:
         """检查连接是否可用。"""

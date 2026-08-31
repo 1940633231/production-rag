@@ -107,13 +107,13 @@ class ChunkESRepository(BaseChunkRepository):
                 "document_id": c.document_id,
                 "strategy": strat,
                 "chunk_index": c.chunk_index,
-                "vector_id": i,
+                "vector_id": int(getattr(c, "vector_id", 0) or 0),
                 "content": c.content,
                 "start_offset": c.start_offset,
                 "end_offset": c.end_offset,
                 "metadata": c.metadata or {},
             }
-            for i, c in enumerate(chunks)
+            for c in chunks
         ]
         self._es.bulk_index(strat, es_docs)
         # 失效缓存

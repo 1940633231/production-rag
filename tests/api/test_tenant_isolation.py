@@ -182,8 +182,8 @@ class TestTenantDataIsolation:
             (Config().raw_dir_for("acme") / fname).unlink()
 
     def test_delete_tenant_scoped(self, anon_client, tenant_token, mock_upload,
-                                  no_mysql, fake_index_writer, sync_background_rebuild):
-        """A 上传后：B 删除 → 404；A 删除 → 200 且触发租户重建。"""
+                                  no_mysql):
+        """A 上传后：B 删除 → 404；A 删除 → 200（稳定 ID 索引，不重建）。"""
         token_a = tenant_token("acme")
         token_b = tenant_token("beta")
         fname = _uniq("del")
@@ -204,16 +204,15 @@ class TestTenantDataIsolation:
             # A 的文件应仍在
             assert (Config().raw_dir_for("acme") / fname).exists()
 
-            # A 删除自己的文件 → 200
+            # A 删除自己的文件 → 200，且不触发重建
             resp_a = anon_client.delete(
                 "/api/knowledge/{}".format(fname),
                 headers={"Authorization": "Bearer {}".format(token_a)},
             )
             assert resp_a.status_code == 200
             assert resp_a.json()["deleted_file"] is True
+            assert resp_a.json()["rebuilt_indexes"] == []
             assert not (Config().raw_dir_for("acme") / fname).exists()
-            # 增量重建按 acme 租户触发
-            assert all(tenant == "acme" for _, tenant in fake_index_writer["tenants"])
         finally:
             f = Config().raw_dir_for("acme") / fname
             if f.exists():
