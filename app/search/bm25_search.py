@@ -39,7 +39,7 @@ class BM25Search:
 
         logger.info("BM25 初始化完成: %.3fs, 语料=%d", time.time() - t, len(corpus_tokens))
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict]:
+    def search(self, query: str, top_k: int = 10, document_ids=None) -> List[Dict]:
 
         t = time.time()
         logger.info("BM25 检索开始: query=%r, top_k=%d", query, top_k)
@@ -62,6 +62,12 @@ class BM25Search:
                 continue
 
             document = self.chunks[local_idx]
+
+            # 文档级 ACL：跳过用户不可读文档的 chunk
+            if document_ids is not None:
+                doc_id = document.get("document_id")
+                if doc_id not in document_ids:
+                    continue
 
             results.append(
                 {

@@ -26,11 +26,13 @@ import json
 import time
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.auth.dependencies import AuthUser, get_current_user, require_permission
+from app.cache.query_cache import build_query_cache_key, get_query_cache
 from app.core.logger import get_logger
-from app.rag.service import get_service, reset_service_cache
+from app.rag.service import _index_version, get_service, reset_service_cache
 
 logger = get_logger(__name__)
 
@@ -90,15 +92,21 @@ def _get_config():
     return Config()
 
 
-@router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    dependencies=[Depends(require_permission("chat:query"))],
+)
+async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_user)):
     """RAG 问答接口（普通 JSON 响应）。
 
     流程：query → RAGService.query() → 返回 answer + citations + stats + chunks
+    租户隔离：service 按当前用户 tenant_id 构建，只检索该租户的索引。
     """
     logger.info(
-        "API /chat: query=%r, strategy=%s, mode=%s, rerank=%s",
+        "API /chat: query=%r, strategy=%s, mode=%s, rerank=%s, tenant=%s",
         req.query[:80], req.strategy, req.mode, req.use_rerank,
+        user.tenant_id if user else "default",
     )
 
     if req.stream:
@@ -108,12 +116,56 @@ async def chat(req: ChatRequest):
             detail="stream=true 请使用 /api/chat/stream 端点",
         )
 
+    tenant_id = user.tenant_id if user else "default"
     config = _get_config()
+
+    # ---- 文档级 ACL：计算当前用户可读文档集合（失败回退为不设过滤）----
+    document_ids = None
+    if user is not None:
+        try:
+            from app.acl.repository import ACLRepository
+            document_ids = ACLRepository().get_readable_document_ids(user, tenant_id)
+        except Exception as e:
+            logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
+            document_ids = None
+
+    # ---- 权限感知查询缓存：命中直接返回，未命中再实时检索 ----
+    cache_enabled = config.cache_enabled
+    cache_key = None
+    cache = None
+    if cache_enabled:
+        cache = get_query_cache(config)
+        permissions = sorted(user.permissions) if user else []
+        cache_key = build_query_cache_key(
+            tenant_id=tenant_id,
+            user_id=user.user_id if user else None,
+            permissions=permissions,
+            query=req.query,
+            strategy=req.strategy,
+            mode=req.mode,
+            use_rerank=req.use_rerank,
+            index_version=_index_version(req.strategy, tenant_id),
+            history=req.history,
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            from app.core.metrics import metrics
+            metrics.record_cache_hit()
+            logger.info(
+                "API /chat 缓存命中: tenant=%s, query=%r",
+                tenant_id, req.query[:60],
+            )
+            return ChatResponse(**cached)
+
+    from app.core.metrics import metrics
+    metrics.record_cache_miss()
+
     service = get_service(
         config=config,
         strategy=req.strategy,
         mode=req.mode,
         use_rerank=req.use_rerank,
+        tenant_id=tenant_id,
     )
 
     # RAG 查询为同步阻塞（embedding + rerank + LLM），用线程池避免阻塞事件循环
@@ -121,7 +173,9 @@ async def chat(req: ChatRequest):
 
     t = time.time()
     try:
-        response = await run_in_threadpool(service.query, req.query, req.history)
+        response = await run_in_threadpool(
+            service.query, req.query, req.history, document_ids
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail="索引文件不存在: {}".format(e))
     except Exception as e:
@@ -131,7 +185,7 @@ async def chat(req: ChatRequest):
     elapsed = time.time() - t
     logger.info("API /chat 完成: %.3fs, answer_len=%d", elapsed, len(response.answer or ""))
 
-    return ChatResponse(
+    result = ChatResponse(
         query=response.query,
         answer=response.answer or "",
         context=response.context,
@@ -141,9 +195,19 @@ async def chat(req: ChatRequest):
         elapsed=round(elapsed, 3),
     )
 
+    # 写入权限感知缓存（key 已含 tenant + 权限 + 索引版本）
+    if cache_enabled and cache_key is not None and cache is not None:
+        cache.set(cache_key, result.model_dump())
+        logger.info("API /chat 写入缓存: tenant=%s, query=%r", tenant_id, req.query[:60])
 
-@router.post("/chat/stream")
-async def chat_stream(req: ChatRequest):
+    return result
+
+
+@router.post(
+    "/chat/stream",
+    dependencies=[Depends(require_permission("chat:query"))],
+)
+async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_user)):
     """RAG 问答接口（SSE 流式响应，真流式）。
 
     SSE 事件序列：
@@ -153,21 +217,36 @@ async def chat_stream(req: ChatRequest):
       4. event: done      → 结束标记
 
     采用 RAGPipeline.run_stream() 真流式输出，首字延迟≈模型开始输出时间。
+    租户隔离：service 按当前用户 tenant_id 构建。
     """
     from sse_starlette.sse import EventSourceResponse
     from starlette.concurrency import iterate_in_threadpool
 
     logger.info(
-        "API /chat/stream: query=%r, strategy=%s, mode=%s, rerank=%s",
+        "API /chat/stream: query=%r, strategy=%s, mode=%s, rerank=%s, tenant=%s",
         req.query[:80], req.strategy, req.mode, req.use_rerank,
+        user.tenant_id if user else "default",
     )
 
+    tenant_id = user.tenant_id if user else "default"
     config = _get_config()
+
+    # ---- 文档级 ACL：计算当前用户可读文档集合（失败回退为不设过滤）----
+    document_ids = None
+    if user is not None:
+        try:
+            from app.acl.repository import ACLRepository
+            document_ids = ACLRepository().get_readable_document_ids(user, tenant_id)
+        except Exception as e:
+            logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
+            document_ids = None
+
     service = get_service(
         config=config,
         strategy=req.strategy,
         mode=req.mode,
         use_rerank=req.use_rerank,
+        tenant_id=tenant_id,
     )
 
     async def event_generator():
@@ -175,7 +254,7 @@ async def chat_stream(req: ChatRequest):
         t = time.time()
         # 用线程池迭代同步生成器，避免阻塞事件循环
         async for event in iterate_in_threadpool(
-            service.query_stream(req.query, req.history)
+            service.query_stream(req.query, req.history, document_ids)
         ):
             evt_type = event.get("type")
             if evt_type == "meta":

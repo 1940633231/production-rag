@@ -23,7 +23,7 @@ class Retriever:
         # 本地缓存：vector_id(int) → chunk_dict，同一实例内避免重复查 repo
         self._cache = {}
 
-    def search(self, query, top_k=10):
+    def search(self, query, top_k=10, document_ids=None):
 
         t = time.time()
         logger.info("向量检索开始: query=%r, top_k=%d", query, top_k)
@@ -49,6 +49,16 @@ class Retriever:
             if document is None:
                 logger.warning("chunk_repo 未找到 vector_id=%d，跳过", idx)
                 continue
+
+            # 文档级 ACL：仅返回用户可读文档的 chunk
+            if document_ids is not None:
+                doc_id = document.get("document_id")
+                if doc_id not in document_ids:
+                    logger.debug(
+                        "ACL 过滤向量结果: vector_id=%d, document_id=%s 不可读",
+                        idx, doc_id,
+                    )
+                    continue
 
             results.append(
                 {

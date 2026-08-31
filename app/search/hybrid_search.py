@@ -21,7 +21,7 @@ class HybridSearch:
         self.sparse = sparse_retriever
         self.rrf_k = rrf_k
 
-    def search(self, query: str, top_k: int = 10) -> List[Dict]:
+    def search(self, query: str, top_k: int = 10, document_ids=None) -> List[Dict]:
 
         t = time.time()
         # 候选池放宽到 5×top_k（至少 20），给 RRF 足够融合空间
@@ -32,8 +32,8 @@ class HybridSearch:
             query, top_k, candidate_k, self.rrf_k,
         )
 
-        dense_results = self.dense.search(query, top_k=candidate_k)
-        sparse_results = self.sparse.search(query, top_k=candidate_k)
+        dense_results = self.dense.search(query, top_k=candidate_k, document_ids=document_ids)
+        sparse_results = self.sparse.search(query, top_k=candidate_k, document_ids=document_ids)
 
         logger.info(
             "Hybrid 两路检索完成: dense=%d, sparse=%d",

@@ -44,12 +44,16 @@ except ImportError:
 _DDL_DOCUMENTS = """
 CREATE TABLE IF NOT EXISTS documents (
     document_id    VARCHAR(128)  NOT NULL,
+    tenant_id      VARCHAR(64)   NOT NULL DEFAULT 'default',
+    owner_user_id  VARCHAR(64)   NOT NULL DEFAULT '',
     file_name      VARCHAR(512)  NOT NULL,
     content_length INT           NOT NULL DEFAULT 0,
     source         VARCHAR(512)  DEFAULT NULL,
     created_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (document_id)
+    PRIMARY KEY (document_id),
+    KEY idx_documents_tenant (tenant_id),
+    KEY idx_documents_owner (owner_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -58,6 +62,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     id            BIGINT        NOT NULL AUTO_INCREMENT,
     chunk_id      VARCHAR(128)  NOT NULL,
     document_id   VARCHAR(128)  NOT NULL,
+    tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'default',
     strategy      VARCHAR(32)   NOT NULL DEFAULT 'recursive',
     chunk_index   INT           NOT NULL,
     content       MEDIUMTEXT    NOT NULL,
@@ -69,6 +74,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     KEY idx_id (id),
     KEY idx_document_id (document_id),
     KEY idx_strategy (strategy),
+    KEY idx_chunks_tenant (tenant_id, strategy),
     CONSTRAINT fk_chunk_document FOREIGN KEY (document_id)
         REFERENCES documents(document_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -172,6 +178,7 @@ class MySQLManager:
         """初始化表结构（幂等）。
 
         对已存在的旧表，检测并迁移缺失的列（id / strategy）。
+        同时创建认证/RBAC 相关表（users/roles/permissions/...）。
         """
         logger.info("初始化 MySQL 表结构")
         with self.get_connection() as conn:
@@ -182,6 +189,34 @@ class MySQLManager:
                 self._migrate_chunks_id(cur)
                 # 迁移：旧表无 strategy 列时补加 + 切换复合主键
                 self._migrate_chunks_strategy(cur)
+                # 迁移：旧表无 tenant_id 列时补加（租户隔离）
+                self._migrate_tenant_id(cur)
+                # 迁移：旧表无 owner_user_id 列时补加（文档级 ACL）
+                self._migrate_owner_user_id(cur)
+                # 认证/RBAC 表（软失败：不影响文档表）
+                try:
+                    from app.auth.rbac_repository import DDL_STATEMENTS as AUTH_DDL
+                    for ddl in AUTH_DDL:
+                        cur.execute(ddl)
+                    logger.info("认证/RBAC 表初始化完成: users, roles, permissions, user_roles, role_permissions")
+                except Exception as e:
+                    logger.warning("认证/RBAC 表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
+                # 审计日志表（软失败：不影响文档表）
+                try:
+                    from app.audit.logger import DDL_STATEMENTS as AUDIT_DDL
+                    for ddl in AUDIT_DDL:
+                        cur.execute(ddl)
+                    logger.info("审计日志表初始化完成: audit_logs")
+                except Exception as e:
+                    logger.warning("审计日志表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
+                # 文档级 ACL 表（软失败：不影响文档表）
+                try:
+                    from app.acl.repository import DDL_STATEMENTS as ACL_DDL
+                    for ddl in ACL_DDL:
+                        cur.execute(ddl)
+                    logger.info("文档级 ACL 表初始化完成: document_acl")
+                except Exception as e:
+                    logger.warning("文档级 ACL 表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
         logger.info("MySQL 表结构初始化完成: documents, chunks")
 
     def _migrate_chunks_id(self, cur):
@@ -202,6 +237,52 @@ class MySQLManager:
             for stmt in _MIGRATE_ADD_STRATEGY:
                 cur.execute(stmt)
             logger.info("chunks 表 strategy 列 + 复合主键迁移完成")
+
+    def _migrate_tenant_id(self, cur):
+        """检测 documents / chunks 表是否有 tenant_id 列，缺失则补加 + 建索引。
+
+        老库升级为租户隔离时执行；既有数据统一归属 default 租户。
+        """
+        for table, index_name in (
+            ("documents", "idx_documents_tenant"),
+            ("chunks", "idx_chunks_tenant"),
+        ):
+            try:
+                cur.execute("SELECT tenant_id FROM {} LIMIT 1".format(table))
+            except Exception:
+                logger.info("%s 表缺少 tenant_id 列，执行迁移", table)
+                cur.execute(
+                    "ALTER TABLE {} ADD COLUMN tenant_id VARCHAR(64) "
+                    "NOT NULL DEFAULT 'default'".format(table)
+                )
+                try:
+                    cur.execute(
+                        "ALTER TABLE {} ADD KEY {} (tenant_id)".format(table, index_name)
+                    )
+                except Exception as ie:
+                    logger.info("tenant_id 索引已存在或创建失败（忽略）: %s", ie)
+                logger.info("%s 表 tenant_id 列迁移完成", table)
+
+    def _migrate_owner_user_id(self, cur):
+        """检测 documents 表是否有 owner_user_id 列，缺失则补加 + 建索引。
+
+        老库升级为文档级 ACL 时执行；存量文档 owner 为空（视为租户内共享，向后兼容）。
+        """
+        try:
+            cur.execute("SELECT owner_user_id FROM documents LIMIT 1")
+        except Exception:
+            logger.info("documents 表缺少 owner_user_id 列，执行迁移")
+            cur.execute(
+                "ALTER TABLE documents ADD COLUMN owner_user_id VARCHAR(64) "
+                "NOT NULL DEFAULT ''"
+            )
+            try:
+                cur.execute(
+                    "ALTER TABLE documents ADD KEY idx_documents_owner (owner_user_id)"
+                )
+            except Exception as ie:
+                logger.info("owner_user_id 索引已存在或创建失败（忽略）: %s", ie)
+            logger.info("documents 表 owner_user_id 列迁移完成")
 
     def ping(self) -> bool:
         """检查连接是否可用。"""

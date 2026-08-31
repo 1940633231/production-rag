@@ -27,6 +27,7 @@ class ESClient:
     """Elasticsearch 客户端封装。
 
     索引命名: {index_prefix}_{strategy}（如 production_rag_recursive）
+    租户隔离: tenant_id != 'default' 时索引为 {index_prefix}_{tenant_id}_{strategy}
     每个分块策略对应一个独立 ES 索引。
     """
 
@@ -35,7 +36,8 @@ class ESClient:
         hosts: Optional[List[str]] = None,
         basic_auth: Optional[tuple[str, str]] = None,
         index_prefix: Optional[str] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        tenant_id: str = "default"
     ):
         if not _ES_AVAILABLE:
             raise RuntimeError(
@@ -66,6 +68,7 @@ class ESClient:
             timeout = int(os.getenv("ES_TIMEOUT", "30"))
 
         self.index_prefix = index_prefix
+        self.tenant_id = tenant_id
 
         client_kwargs = {"hosts": hosts}
 
@@ -77,7 +80,9 @@ class ESClient:
         self._client = Elasticsearch(**client_kwargs)
 
     def _index_name(self, strategy: str) -> str:
-        return "{}_{}".format(self.index_prefix, strategy)
+        if self.tenant_id == "default":
+            return "{}_{}".format(self.index_prefix, strategy)
+        return "{}_{}_{}".format(self.index_prefix, self.tenant_id, strategy)
 
     def create_index(self, strategy: str, mappings: Optional[Dict] = None):
         """创建 ES 索引（幂等）。"""

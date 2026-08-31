@@ -16,19 +16,21 @@ logger = get_logger(__name__)
 class ChunkESRepository(BaseChunkRepository):
     """ES 后端分块仓库。
 
-    每个 strategy 对应一个 ES 索引（如 production_rag_recursive）。
+    每个 (tenant, strategy) 对应一个 ES 索引（如 production_rag_recursive /
+    production_rag_tenantA_recursive），租户间完全隔离。
     支持增量更新：incremental_reindex 只删除被移除文档的 chunks。
     """
 
     def __init__(self, strategy: str = "recursive",
-                 es_client=None, **kwargs):
+                 es_client=None, tenant_id: str = "default", **kwargs):
         self.strategy = strategy
+        self.tenant_id = tenant_id
 
         if es_client is not None:
             self._es = es_client
         else:
             from app.storage.es_client import ESClient
-            self._es = ESClient(**kwargs)
+            self._es = ESClient(tenant_id=tenant_id, **kwargs)
 
         # 懒加载缓存
         self._cache_list: Optional[List[Dict]] = None
@@ -125,8 +127,8 @@ class ChunkESRepository(BaseChunkRepository):
         """
         strat = self.strategy
         if deleted_doc_ids:
+            idx = self._es._index_name(strat)
             for doc_id in deleted_doc_ids:
-                idx = "{}_{}".format(self._es.index_prefix, strat)
                 self._es._client.delete_by_query(
                     index=idx,
                     body={"query": {"term": {"document_id": doc_id}}},

@@ -21,11 +21,25 @@ logger = get_logger(__name__)
 
 @pytest.fixture
 def no_mysql(monkeypatch):
-    """把 Config.storage_mysql_enabled 置为 False，跳过 MySQL 路径。"""
+    """把 Config.storage_mysql_enabled 置为 False，跳过 MySQL 路径。
+
+    路径助手委托给真实 Config（保持租户目录语义）。
+    """
     import app.core.config as config_mod
+    from app.core.config import Config as RealConfig
 
     class FakeConfig:
         storage_mysql_enabled = False
+        storage_es_enabled = False
+        storage_milvus_enabled = False
+
+        @staticmethod
+        def raw_dir_for(tenant_id="default"):
+            return RealConfig().raw_dir_for(tenant_id)
+
+        @staticmethod
+        def index_dir_for(strategy, tenant_id="default"):
+            return RealConfig().index_dir_for(strategy, tenant_id)
 
     monkeypatch.setattr(config_mod, "Config", FakeConfig)
     return FakeConfig
@@ -56,7 +70,7 @@ class TestUploadRoute:
 
         monkeypatch.setattr(
             knowledge, "_do_upload",
-            lambda path, strategy: {
+            lambda path, strategy, tenant_id="default", owner_user_id="": {
                 "document_count": 1, "chunk_count": 2, "dimension": 768,
                 "index_path": "data/index/recursive/faiss.index",
                 "metadata_path": "data/index/recursive/metadata.json",

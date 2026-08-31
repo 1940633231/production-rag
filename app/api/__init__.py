@@ -43,14 +43,22 @@ def create_app() -> FastAPI:
     from app.core.tracing import TracingMiddleware
     app.add_middleware(TracingMiddleware)
 
+    # 审计中间件：自动记录 401/403 越权拒绝事件
+    from app.audit.middleware import AuditMiddleware
+    app.add_middleware(AuditMiddleware)
+
     # 注册路由
     from app.api.chat import router as chat_router
     from app.api.health import router as health_router
     from app.api.knowledge import router as knowledge_router
+    from app.api.admin import router as admin_router
+    from app.auth.router import router as auth_router
 
     app.include_router(chat_router)
     app.include_router(health_router)
     app.include_router(knowledge_router)
+    app.include_router(admin_router)
+    app.include_router(auth_router)
 
     # Prometheus 指标端点
     @app.get("/metrics", tags=["monitoring"])

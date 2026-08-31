@@ -11,6 +11,7 @@ class MetadataStore:
 
             data[str(index)] = {
                 "chunk_id": doc.chunk_id,
+                "document_id": doc.document_id,
                 "content": doc.content,
                 "start_offset": doc.start_offset,
                 "end_offset": doc.end_offset,

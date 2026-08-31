@@ -32,8 +32,11 @@ def mock_upload(monkeypatch):
     """替换 _do_upload 为假实现，跳过索引构建。"""
     import app.api.knowledge as knowledge
 
-    def fake_do_upload(save_path, strategy):
-        logger.info("[test] fake _do_upload: %s (strategy=%s)", save_path, strategy)
+    def fake_do_upload(save_path, strategy, tenant_id="default", owner_user_id=""):
+        logger.info(
+            "[test] fake _do_upload: %s (strategy=%s, tenant=%s)",
+            save_path, strategy, tenant_id,
+        )
         return dict(_FAKE_UPLOAD_RESULT)
 
     monkeypatch.setattr(knowledge, "_do_upload", fake_do_upload)

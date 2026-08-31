@@ -12,6 +12,10 @@ python-multipart>=0.0.6       # FastAPI 文件上传（UploadFile）
 # ---- 数据模型 ----
 pydantic>=2.5.0
 
+# ---- 认证 / RBAC ----
+PyJWT>=2.8.0                 # JWT 签发与校验
+bcrypt>=4.0.0                # 密码哈希
+
 # ---- 摄入：文档加载 ----
 beautifulsoup4>=4.12.0        # HTML 解析
 pypdf>=4.0.0                  # PDF 文本抽取

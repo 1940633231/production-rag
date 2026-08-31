@@ -35,6 +35,8 @@ class IndexWriter:
     # ---- 核心写入 ----
 
     def write(self, documents: List, strategy: str,
+              tenant_id: str = "default",
+              owner_user_id: str = "",
               index_path: Optional[str] = None,
               metadata_path: Optional[str] = None) -> Dict:
         """写入文档到所有启用的存储后端。
@@ -46,11 +48,21 @@ class IndexWriter:
           4. 写 MySQL（如果 storage.backends.mysql.enabled，软失败）
           5. 写 ES（如果 storage.backends.es.enabled，软失败）
 
+        租户隔离:
+          - tenant_id 决定索引文件 / MySQL 行 / ES 索引 / Milvus collection 的归属
+          - 'default' 租户沿用旧路径/命名（data/index/{strategy} 等），向后兼容
+          - 其他租户使用 data/index/{tenant_id}/{strategy}/ 等隔离目录
+
+        文档级 ACL:
+          - owner_user_id 记录上传者（documents.owner_user_id），用于文档级授权
+
         参数:
             documents: app.ingestion.document.Document 列表（未 clean）
             strategy: 分块策略 'fixed'/'recursive'
-            index_path: FAISS 索引输出路径（None 时自动构造）
-            metadata_path: metadata.json 输出路径（None 时自动构造）
+            tenant_id: 归属租户（默认 'default'）
+            owner_user_id: 上传者 user_id（默认 ''，表示存量/共享文档）
+            index_path: FAISS 索引输出路径（None 时按租户自动构造）
+            metadata_path: metadata.json 输出路径（None 时按租户自动构造）
 
         返回:
             {document_count, chunk_count, dimension, documents, chunks,
@@ -63,8 +75,8 @@ class IndexWriter:
         from app.ingestion.chunker.recursive_chunker import RecursiveChunker
         from app.storage.metadata_store import MetadataStore
 
-        # 路径默认值
-        index_dir = Path("data/index") / strategy
+        # 路径默认值（按租户隔离）
+        index_dir = self.config.index_dir_for(strategy, tenant_id)
         index_dir.mkdir(parents=True, exist_ok=True)
         if index_path is None:
             index_path = str(index_dir / "faiss.index")
@@ -73,9 +85,9 @@ class IndexWriter:
 
         t_total = time.time()
         logger.info(
-            "IndexWriter.write 开始: strategy=%s, docs=%d, "
+            "IndexWriter.write 开始: strategy=%s, tenant=%s, owner=%s, docs=%d, "
             "mysql_enabled=%s, es_enabled=%s, milvus_enabled=%s",
-            strategy, len(documents),
+            strategy, tenant_id, owner_user_id or "-", len(documents),
             self.config.storage_mysql_enabled, self.config.storage_es_enabled,
             self.config.storage_milvus_enabled,
         )
@@ -163,7 +175,7 @@ class IndexWriter:
             try:
                 from app.vector import create_vector_store
 
-                collection_name = self.config.milvus_collection_name(strategy)
+                collection_name = self.config.milvus_collection_for(strategy, tenant_id)
                 vector_store = create_vector_store(
                     backend="milvus",
                     dimension=vectors.shape[1],
@@ -233,12 +245,14 @@ class IndexWriter:
         )
 
         # 6. 写 MySQL（软失败）
-        logger.info("MySQL 持久化开始: strategy=%s", strategy)
-        mysql_persisted = self._persist_to_mysql(cleaned_documents, chunks, strategy)
+        logger.info("MySQL 持久化开始: strategy=%s, tenant=%s", strategy, tenant_id)
+        mysql_persisted = self._persist_to_mysql(
+            cleaned_documents, chunks, strategy, tenant_id, owner_user_id
+        )
 
         # 7. 写 ES（软失败）
-        logger.info("ES 持久化开始: strategy=%s", strategy)
-        es_persisted = self._persist_to_es(chunks, strategy)
+        logger.info("ES 持久化开始: strategy=%s, tenant=%s", strategy, tenant_id)
+        es_persisted = self._persist_to_es(chunks, strategy, tenant_id)
 
         result = {
             "document_count": len(cleaned_documents),
@@ -248,6 +262,7 @@ class IndexWriter:
             "chunks": chunks,
             "index_path": index_path,
             "metadata_path": metadata_path,
+            "tenant_id": tenant_id,
             "vector_backend": vector_backend,
             "mysql_persisted": mysql_persisted,
             "es_persisted": es_persisted,
@@ -255,9 +270,9 @@ class IndexWriter:
         }
 
         logger.info(
-            "IndexWriter.write 完成: %.3fs, strategy=%s, vector_backend=%s, docs=%d, chunks=%d, "
+            "IndexWriter.write 完成: %.3fs, strategy=%s, tenant=%s, vector_backend=%s, docs=%d, chunks=%d, "
             "mysql=%s, es=%s, milvus=%s",
-            time.time() - t_total, strategy, vector_backend,
+            time.time() - t_total, strategy, tenant_id, vector_backend,
             len(cleaned_documents), len(chunks),
             mysql_persisted, es_persisted, milvus_persisted,
         )
@@ -266,19 +281,22 @@ class IndexWriter:
     # ---- 幂等重建 ----
 
     def rebuild(self, strategy: str,
+                tenant_id: str = "default",
+                owner_user_id: str = "",
                 index_path: Optional[str] = None,
                 metadata_path: Optional[str] = None) -> Dict:
         """幂等重建索引：先清理旧数据，再全量写入。
 
         清理顺序:
-          1. MySQL: chunk_repo.delete_by_strategy(strategy)
-          2. ES: es_client.drop_index(strategy)
-          3. Milvus: milvus_store.drop(strategy 对应的 collection)
+          1. MySQL: chunk_repo.delete_by_strategy(strategy, tenant_id)
+          2. ES: es_client.drop_index(strategy)（租户索引）
+          3. Milvus: milvus_store.drop(tenant 对应的 collection)
 
-        然后加载 data/raw/ 下所有文档，调用 write()。
+        然后加载 data/raw/{tenant_id}/ 下所有文档，调用 write()。
 
         参数:
             strategy: 分块策略
+            tenant_id: 归属租户（默认 'default'，使用旧目录 data/raw/）
             index_path / metadata_path: 见 write()
 
         返回:
@@ -286,25 +304,25 @@ class IndexWriter:
         """
         t_total = time.time()
         logger.info(
-            "IndexWriter.rebuild 开始: strategy=%s, mysql_enabled=%s, es_enabled=%s, "
+            "IndexWriter.rebuild 开始: strategy=%s, tenant=%s, mysql_enabled=%s, es_enabled=%s, "
             "milvus_enabled=%s",
-            strategy, self.config.storage_mysql_enabled, self.config.storage_es_enabled,
+            strategy, tenant_id, self.config.storage_mysql_enabled, self.config.storage_es_enabled,
             self.config.storage_milvus_enabled,
         )
 
         # 1. 幂等清理
-        logger.info("rebuild 步骤1: 幂等清理旧数据, strategy=%s", strategy)
-        mysql_deleted = self._cleanup_mysql(strategy)
-        es_dropped = self._cleanup_es(strategy)
-        milvus_dropped = self._cleanup_milvus(strategy)
+        logger.info("rebuild 步骤1: 幂等清理旧数据, strategy=%s, tenant=%s", strategy, tenant_id)
+        mysql_deleted = self._cleanup_mysql(strategy, tenant_id)
+        es_dropped = self._cleanup_es(strategy, tenant_id)
+        milvus_dropped = self._cleanup_milvus(strategy, tenant_id)
         logger.info(
             "rebuild 清理完成: mysql_deleted=%d, es_dropped=%s, milvus_dropped=%s",
             mysql_deleted, es_dropped, milvus_dropped,
         )
 
-        # 2. 加载所有文档
-        logger.info("rebuild 步骤2: 加载 data/raw/ 下所有文档")
-        documents = self._load_all_documents()
+        # 2. 加载所有文档（租户目录）
+        logger.info("rebuild 步骤2: 加载 data/raw 下所有文档 (tenant=%s)", tenant_id)
+        documents = self._load_all_documents(tenant_id)
         logger.info("rebuild 文档加载完成: %d 个", len(documents))
 
         # 3. 全量写入
@@ -312,6 +330,8 @@ class IndexWriter:
         result = self.write(
             documents=documents,
             strategy=strategy,
+            tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
             index_path=index_path,
             metadata_path=metadata_path,
         )
@@ -320,10 +340,10 @@ class IndexWriter:
         result["milvus_dropped"] = milvus_dropped
 
         logger.info(
-            "IndexWriter.rebuild 完成: %.3fs, strategy=%s, vector_backend=%s, "
+            "IndexWriter.rebuild 完成: %.3fs, strategy=%s, tenant=%s, vector_backend=%s, "
             "mysql_deleted=%d, es_dropped=%s, milvus_dropped=%s, "
             "docs=%d, chunks=%d, mysql=%s, es=%s, milvus=%s",
-            time.time() - t_total, strategy, result.get("vector_backend", "faiss"),
+            time.time() - t_total, strategy, tenant_id, result.get("vector_backend", "faiss"),
             mysql_deleted, es_dropped, milvus_dropped,
             result["document_count"], result["chunk_count"],
             result["mysql_persisted"], result["es_persisted"], result.get("milvus_persisted", False),
@@ -334,6 +354,8 @@ class IndexWriter:
         self,
         strategy: str,
         deleted_doc_ids: List[str],
+        tenant_id: str = "default",
+        owner_user_id: str = "",
         index_path: Optional[str] = None,
         metadata_path: Optional[str] = None,
     ) -> Dict:
@@ -345,11 +367,12 @@ class IndexWriter:
           - ES 走 `incremental_reindex(deleted_doc_ids=...)`（delete_by_query 只删被移除文档的 chunks）
           - Milvus 仍必须 drop（向量层单独删除会破坏 auto_id 与 enumerate 顺序一致性）
           - FAISS/metadata.json 仍必须全量重写（理由同上：枚举索引必须与剩余文件 0..N-1 对应）
-          - 最后重新加载 data/raw/ 下剩余文件 + write（write 内部会 insert_ignore MySQL/ES，幂等）
+          - 最后重新加载 data/raw/{tenant_id}/ 下剩余文件 + write（write 内部会 insert_ignore MySQL/ES，幂等）
 
         参数:
             strategy: 分块策略
             deleted_doc_ids: 被删除的 document_id 列表（ES 增量清理用）
+            tenant_id: 归属租户（默认 'default'）
             index_path / metadata_path: 见 write()
 
         返回:
@@ -360,13 +383,16 @@ class IndexWriter:
                 "incremental_rebuild_after_delete: deleted_doc_ids 为空，"
                 "直接走正常 rebuild 以保证一致性"
             )
-            return self.rebuild(strategy, index_path=index_path, metadata_path=metadata_path)
+            return self.rebuild(
+                strategy, tenant_id=tenant_id, owner_user_id=owner_user_id,
+                index_path=index_path, metadata_path=metadata_path,
+            )
 
         t_total = time.time()
         logger.info(
-            "IndexWriter.incremental_rebuild_after_delete 开始: strategy=%s, "
+            "IndexWriter.incremental_rebuild_after_delete 开始: strategy=%s, tenant=%s, "
             "deleted_docs=%s, mysql_enabled=%s, es_enabled=%s, milvus_enabled=%s",
-            strategy, deleted_doc_ids,
+            strategy, tenant_id, deleted_doc_ids,
             self.config.storage_mysql_enabled, self.config.storage_es_enabled,
             self.config.storage_milvus_enabled,
         )
@@ -374,20 +400,20 @@ class IndexWriter:
         # 1. 增量清理
         # MySQL：外层已按 document_id 级 delete_by_document + delete(文档) 完成，**跳过** delete_by_strategy
         mysql_deleted: int = 0  # 仅用于日志对照，knowledge.py 里已经做过
-        es_deleted = self._cleanup_es_incremental(strategy, deleted_doc_ids)
-        milvus_dropped = self._cleanup_milvus(strategy)
+        es_deleted = self._cleanup_es_incremental(strategy, deleted_doc_ids, tenant_id)
+        milvus_dropped = self._cleanup_milvus(strategy, tenant_id)
         logger.info(
             "增量清理完成: mysql(跳过,外层已清)=0, es_incremental_deleted=%s, milvus_dropped=%s",
             es_deleted, milvus_dropped,
         )
 
-        # 2. 加载剩余文档（data/raw/ 中已没有被删除的文件，knowledge.py 已同步删）
-        logger.info("增量重建 步骤2: 加载 data/raw/ 下剩余文档")
+        # 2. 加载剩余文档（data/raw/{tenant_id}/ 中已没有被删除的文件，knowledge.py 已同步删）
+        logger.info("增量重建 步骤2: 加载 data/raw 下剩余文档 (tenant=%s)", tenant_id)
         try:
-            documents = self._load_all_documents()
+            documents = self._load_all_documents(tenant_id)
         except FileNotFoundError:
             # 全部文档被删光：保持空索引（不抛错），返回空结果
-            logger.warning("增量重建: data/raw/ 已无文档，生成空索引")
+            logger.warning("增量重建: data/raw 已无文档，生成空索引 (tenant=%s)", tenant_id)
             documents = []
         logger.info("增量重建 文档加载完成: 剩余 %d 个", len(documents))
 
@@ -397,15 +423,17 @@ class IndexWriter:
             result = self.write(
                 documents=documents,
                 strategy=strategy,
+                tenant_id=tenant_id,
+                owner_user_id=owner_user_id,
                 index_path=index_path,
                 metadata_path=metadata_path,
             )
         else:
             # 无文档：删除已有向量索引文件 / ES 索引 / Milvus collection，保证零残留
             logger.warning("增量重建: 无剩余文档，清理空索引残留")
-            self._cleanup_es(strategy)
-            self._cleanup_milvus(strategy)
-            index_dir = Path("data/index") / strategy
+            self._cleanup_es(strategy, tenant_id)
+            self._cleanup_milvus(strategy, tenant_id)
+            index_dir = self.config.index_dir_for(strategy, tenant_id)
             if index_path is None:
                 index_path = str(index_dir / "faiss.index")
             if metadata_path is None:
@@ -426,6 +454,7 @@ class IndexWriter:
                 "chunks": [],
                 "index_path": index_path,
                 "metadata_path": metadata_path,
+                "tenant_id": tenant_id,
                 "vector_backend": "none",
                 "mysql_persisted": False,
                 "es_persisted": False,
@@ -438,16 +467,17 @@ class IndexWriter:
         result["deleted_doc_ids"] = list(deleted_doc_ids)
 
         logger.info(
-            "IndexWriter.incremental_rebuild_after_delete 完成: %.3fs, strategy=%s, "
+            "IndexWriter.incremental_rebuild_after_delete 完成: %.3fs, strategy=%s, tenant=%s, "
             "vector_backend=%s, es_incremental=%s, milvus_dropped=%s, "
             "remaining_docs=%d, chunks=%d",
-            time.time() - t_total, strategy, result.get("vector_backend", "none"),
+            time.time() - t_total, strategy, tenant_id, result.get("vector_backend", "none"),
             es_deleted, milvus_dropped,
             result["document_count"], result["chunk_count"],
         )
         return result
 
-    def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str]) -> bool:
+    def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str],
+                                tenant_id: str = "default") -> bool:
         """ES 增量清理：仅删除被移除文档的 chunks（保留其他文档）。
 
         返回 True 表示执行成功（无数据可删也算成功），False=异常。
@@ -462,26 +492,30 @@ class IndexWriter:
         try:
             from app.storage.es_repository import ChunkESRepository
 
-            es_repo = ChunkESRepository(strategy=strategy)
+            es_repo = ChunkESRepository(strategy=strategy, tenant_id=tenant_id)
             es_repo.incremental_reindex(chunks=[], deleted_doc_ids=deleted_doc_ids)
             logger.info(
-                "ES 增量清理完成: %.3fs, strategy=%s, deleted_doc_ids=%s",
-                time.time() - t, strategy, deleted_doc_ids,
+                "ES 增量清理完成: %.3fs, strategy=%s, tenant=%s, deleted_doc_ids=%s",
+                time.time() - t, strategy, tenant_id, deleted_doc_ids,
             )
             return True
         except Exception as e:
             logger.warning(
                 "ES 增量清理失败（不影响重建，后续会通过 insert_ignore 幂等写入）: "
-                "strategy=%s, deleted_doc_ids=%s, error=%s: %s",
-                strategy, deleted_doc_ids, type(e).__name__, e, exc_info=True,
+                "strategy=%s, tenant=%s, deleted_doc_ids=%s, error=%s: %s",
+                strategy, tenant_id, deleted_doc_ids, type(e).__name__, e, exc_info=True,
             )
             return False
 
     # ---- 内部：MySQL 持久化（软失败）----
 
-    def _persist_to_mysql(self, documents, chunks, strategy) -> bool:
+    def _persist_to_mysql(self, documents, chunks, strategy,
+                          tenant_id: str = "default",
+                          owner_user_id: str = "") -> bool:
         """将文档和 chunks 写入 MySQL（如果启用）。
 
+        租户隔离：documents/chunks 均写入 tenant_id。
+        文档级 ACL：documents 写入 owner_user_id（上传者）。
         软失败：异常时记 warning 返回 False，不中断写入流程。
         """
         if not self.config.storage_mysql_enabled:
@@ -506,7 +540,7 @@ class IndexWriter:
                 return False
 
             doc_repo = DocumentRepository(mgr)
-            chunk_repo = ChunkRepository(mgr, strategy=strategy)
+            chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
 
             # 逐个插入文档，记录每个结果
             doc_inserted = 0
@@ -517,12 +551,14 @@ class IndexWriter:
                         file_name=doc.metadata.get("source", doc.document_id),
                         content_length=len(doc.content),
                         source=doc.metadata.get("source"),
+                        tenant_id=tenant_id,
+                        owner_user_id=owner_user_id,
                     )
                     doc_inserted += 1
                 except Exception as de:
                     logger.warning(
-                        "MySQL 文档插入失败: doc_id=%s, %s",
-                        doc.document_id, de, exc_info=True,
+                        "MySQL 文档插入失败: doc_id=%s, tenant=%s, %s",
+                        doc.document_id, tenant_id, de, exc_info=True,
                     )
             logger.info(
                 "MySQL 文档插入: 成功=%d/%d", doc_inserted, len(documents)
@@ -532,32 +568,32 @@ class IndexWriter:
             try:
                 chunk_repo.batch_insert(chunks)
                 logger.info(
-                    "MySQL chunks 批量插入成功: strategy=%s, chunks=%d",
-                    strategy, len(chunks),
+                    "MySQL chunks 批量插入成功: strategy=%s, tenant=%s, chunks=%d",
+                    strategy, tenant_id, len(chunks),
                 )
             except Exception as ce:
                 logger.warning(
-                    "MySQL chunks 批量插入失败: strategy=%s, chunks=%d, %s",
-                    strategy, len(chunks), ce, exc_info=True,
+                    "MySQL chunks 批量插入失败: strategy=%s, tenant=%s, chunks=%d, %s",
+                    strategy, tenant_id, len(chunks), ce, exc_info=True,
                 )
                 raise
 
             logger.info(
-                "MySQL 持久化完成: %.3fs, strategy=%s, docs=%d, chunks=%d",
-                time.time() - t, strategy, doc_inserted, len(chunks),
+                "MySQL 持久化完成: %.3fs, strategy=%s, tenant=%s, docs=%d, chunks=%d",
+                time.time() - t, strategy, tenant_id, doc_inserted, len(chunks),
             )
             return True
         except Exception as e:
             logger.warning(
-                "MySQL 持久化失败（不影响索引）: strategy=%s, docs=%d, chunks=%d, "
+                "MySQL 持久化失败（不影响索引）: strategy=%s, tenant=%s, docs=%d, chunks=%d, "
                 "error=%s: %s",
-                strategy, len(documents), len(chunks),
+                strategy, tenant_id, len(documents), len(chunks),
                 type(e).__name__, e, exc_info=True,
             )
             return False
 
-    def _cleanup_mysql(self, strategy) -> int:
-        """删除指定 strategy 的所有 chunks（重建前清理）。
+    def _cleanup_mysql(self, strategy, tenant_id: str = "default") -> int:
+        """删除指定 strategy（+tenant）的所有 chunks（重建前清理）。
 
         软失败：异常时记 warning 返回 0。
         """
@@ -571,25 +607,26 @@ class IndexWriter:
             from app.storage.mysql import MySQLManager
 
             mgr = MySQLManager(pool_size=self.config.storage_pool_size)
-            chunk_repo = ChunkRepository(mgr, strategy=strategy)
+            chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
             deleted = chunk_repo.delete_by_strategy()
             logger.info(
-                "MySQL 清理完成: %.3fs, strategy=%s, deleted=%d",
-                time.time() - t, strategy, deleted,
+                "MySQL 清理完成: %.3fs, strategy=%s, tenant=%s, deleted=%d",
+                time.time() - t, strategy, tenant_id, deleted,
             )
             return deleted
         except Exception as e:
             logger.warning(
-                "MySQL 清理失败（不影响重建）: strategy=%s, error=%s: %s",
-                strategy, type(e).__name__, e, exc_info=True,
+                "MySQL 清理失败（不影响重建）: strategy=%s, tenant=%s, error=%s: %s",
+                strategy, tenant_id, type(e).__name__, e, exc_info=True,
             )
             return 0
 
     # ---- 内部：ES 持久化（软失败）----
 
-    def _persist_to_es(self, chunks, strategy) -> bool:
+    def _persist_to_es(self, chunks, strategy, tenant_id: str = "default") -> bool:
         """将 chunks 写入 ES（如果启用）。
 
+        租户隔离：使用 {prefix}_{tenant}_{strategy} 索引。
         增量写入：不删旧数据，直接追加。
         软失败：异常时记 warning 返回 False。
         """
@@ -601,23 +638,23 @@ class IndexWriter:
         try:
             from app.storage.es_repository import ChunkESRepository
 
-            es_repo = ChunkESRepository(strategy=strategy)
+            es_repo = ChunkESRepository(strategy=strategy, tenant_id=tenant_id)
             es_repo.batch_insert(chunks)
             logger.info(
-                "ES 持久化完成: %.3fs, strategy=%s, chunks=%d",
-                time.time() - t, strategy, len(chunks),
+                "ES 持久化完成: %.3fs, strategy=%s, tenant=%s, chunks=%d",
+                time.time() - t, strategy, tenant_id, len(chunks),
             )
             return True
         except Exception as e:
             logger.warning(
-                "ES 持久化失败（不影响索引）: strategy=%s, chunks=%d, "
+                "ES 持久化失败（不影响索引）: strategy=%s, tenant=%s, chunks=%d, "
                 "error=%s: %s",
-                strategy, len(chunks), type(e).__name__, e, exc_info=True,
+                strategy, tenant_id, len(chunks), type(e).__name__, e, exc_info=True,
             )
             return False
 
-    def _cleanup_es(self, strategy) -> bool:
-        """删除 ES 索引（重建前清理）。
+    def _cleanup_es(self, strategy, tenant_id: str = "default") -> bool:
+        """删除 ES 索引（重建前清理，租户索引）。
 
         软失败：异常时记 warning 返回 False。
         """
@@ -629,21 +666,21 @@ class IndexWriter:
         try:
             from app.storage.es_repository import ChunkESRepository
 
-            es_repo = ChunkESRepository(strategy=strategy)
+            es_repo = ChunkESRepository(strategy=strategy, tenant_id=tenant_id)
             es_repo.drop_index()
             logger.info(
-                "ES 清理完成: %.3fs, strategy=%s", time.time() - t, strategy
+                "ES 清理完成: %.3fs, strategy=%s, tenant=%s", time.time() - t, strategy, tenant_id
             )
             return True
         except Exception as e:
             logger.warning(
-                "ES 清理失败（不影响重建）: strategy=%s, error=%s: %s",
-                strategy, type(e).__name__, e, exc_info=True,
+                "ES 清理失败（不影响重建）: strategy=%s, tenant=%s, error=%s: %s",
+                strategy, tenant_id, type(e).__name__, e, exc_info=True,
             )
             return False
 
-    def _cleanup_milvus(self, strategy) -> bool:
-        """删除 Milvus collection（重建前清理）。
+    def _cleanup_milvus(self, strategy, tenant_id: str = "default") -> bool:
+        """删除 Milvus collection（重建前清理，租户 collection）。
 
         软失败：异常时记 warning 返回 False。
         """
@@ -655,7 +692,7 @@ class IndexWriter:
         try:
             from app.vector import create_vector_store
 
-            collection_name = self.config.milvus_collection_name(strategy)
+            collection_name = self.config.milvus_collection_for(strategy, tenant_id)
             # 只需要维度存在，Milvus drop 不依赖维度；给个占位默认值
             store = create_vector_store(
                 backend="milvus",
@@ -666,27 +703,27 @@ class IndexWriter:
             )
             store.drop()
             logger.info(
-                "Milvus 清理完成: %.3fs, strategy=%s, collection=%s",
-                time.time() - t, strategy, collection_name,
+                "Milvus 清理完成: %.3fs, strategy=%s, tenant=%s, collection=%s",
+                time.time() - t, strategy, tenant_id, collection_name,
             )
             return True
         except Exception as e:
             logger.warning(
-                "Milvus 清理失败（不影响重建）: strategy=%s, error=%s: %s",
-                strategy, type(e).__name__, e, exc_info=True,
+                "Milvus 清理失败（不影响重建）: strategy=%s, tenant=%s, error=%s: %s",
+                strategy, tenant_id, type(e).__name__, e, exc_info=True,
             )
             return False
 
     # ---- 内部：文档加载 ----
 
-    def _load_all_documents(self) -> List:
-        """加载 data/raw/ 下所有支持的文档。"""
+    def _load_all_documents(self, tenant_id: str = "default") -> List:
+        """加载某租户 data/raw/ 目录下所有支持的文档。"""
         import importlib
 
-        raw_dir = Path("data/raw")
+        raw_dir = self.config.raw_dir_for(tenant_id)
         if not raw_dir.exists():
-            logger.error("data/raw/ 目录不存在")
-            raise FileNotFoundError("data/raw/ 目录不存在")
+            logger.error("data/raw 目录不存在 (tenant=%s): %s", tenant_id, raw_dir)
+            raise FileNotFoundError("data/raw 目录不存在 (tenant={})".format(tenant_id))
 
         loader_map = {
             ".txt": "app.ingestion.loader.txt_loader.TxtLoader",

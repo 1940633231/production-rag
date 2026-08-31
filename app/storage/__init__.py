@@ -36,7 +36,8 @@ __all__ = [
 ]
 
 
-def create_chunk_repo(config=None, manager=None, strategy="recursive"):
+def create_chunk_repo(config=None, manager=None, strategy="recursive",
+                      tenant_id: str = "default"):
     """工厂函数：按 config.storage.backends 创建 chunk 仓库实例。
 
     后端选择优先级:
@@ -48,6 +49,7 @@ def create_chunk_repo(config=None, manager=None, strategy="recursive"):
         config: Config 实例（为 None 时新建）
         manager: 可选的 MySQLManager 实例（复用连接池）
         strategy: 分块策略（'fixed'/'recursive'），用于按策略隔离 chunks
+        tenant_id: 租户 ID，用于按租户隔离 chunks（'default' 为单租户旧行为）
 
     返回:
         BaseChunkRepository 子类实例，或 None
@@ -62,14 +64,14 @@ def create_chunk_repo(config=None, manager=None, strategy="recursive"):
     # ES 后端（全文检索）
     if config.storage_es_enabled:
         from app.storage.es_repository import ChunkESRepository
-        return ChunkESRepository(strategy=strategy)
+        return ChunkESRepository(strategy=strategy, tenant_id=tenant_id)
 
     # MySQL 后端（结构化存储）
     if config.storage_mysql_enabled:
         from app.storage.chunk_repository import ChunkRepository
         from app.storage.mysql import MySQLManager
         mgr = manager or MySQLManager(pool_size=config.storage_pool_size)
-        return ChunkRepository(mgr, strategy=strategy)
+        return ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
 
     return None
 

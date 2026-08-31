@@ -70,11 +70,12 @@ class RAGPipeline:
         )
         return rewritten, rewritten != query
 
-    def _retrieve_and_context(self, query: str):
+    def _retrieve_and_context(self, query: str, document_ids=None):
         """执行 multi-query → retrieve → rerank → context_manager。
 
         返回 (context, chunks, stats)。供 run() 和 run_stream() 复用。
         同时记录检索/重排阶段 Prometheus 指标。
+        document_ids: 文档级 ACL 可读文档集合（None 表示不设文档级过滤）。
         """
         from app.core.metrics import metrics
 
@@ -93,7 +94,7 @@ class RAGPipeline:
 
         # 1. 多路检索 + 合并去重
         t = time.time()
-        candidates = self._search_all(query, queries)
+        candidates = self._search_all(query, queries, document_ids=document_ids)
         metrics.record_retrieval(strategy, time.time() - t)
 
         # 1b. 重排（整体重排，query 用主查询）
@@ -124,11 +125,12 @@ class RAGPipeline:
             "merged_candidates": len(candidates),
         }
 
-    def _search_all(self, query: str, queries: List[str]) -> List[Dict]:
+    def _search_all(self, query: str, queries: List[str], document_ids=None) -> List[Dict]:
         """对每路子查询检索并合并去重（按 chunk_id）。
 
         每路候选数：rerank 启用时均分 rerank_candidate_pool（合并后总量≈pool），
         未启用时每路取 top_k。合并结果供重排或按分数排序。
+        document_ids: 文档级 ACL 可读文档集合（None 表示不设文档级过滤）。
         """
         if len(queries) <= 1:
             topk = (
@@ -136,7 +138,7 @@ class RAGPipeline:
                 if self.reranker is not None
                 else self.top_k
             )
-            return self.retriever.search(query, top_k=topk)
+            return self.retriever.search(query, top_k=topk, document_ids=document_ids)
 
         per_query = (
             self.rerank_candidate_pool // len(queries)
@@ -147,7 +149,7 @@ class RAGPipeline:
         merged: List[Dict] = []
         seen = set()
         for q in queries:
-            for r in self.retriever.search(q, top_k=per_query):
+            for r in self.retriever.search(q, top_k=per_query, document_ids=document_ids):
                 cid = r.get("chunk_id")
                 if cid is None or cid not in seen:
                     seen.add(cid)
@@ -155,10 +157,12 @@ class RAGPipeline:
         logger.info("多路检索合并: %d 路 → %d 候选", len(queries), len(merged))
         return merged
 
-    def run(self, query: str, history: Optional[List] = None) -> RAGResponse:
+    def run(self, query: str, history: Optional[List] = None,
+            document_ids=None) -> RAGResponse:
         """执行 retrieve → rerank → context_manager → generator 链路。
 
         history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（默认 None）
+        document_ids: 文档级 ACL 可读文档集合（None 表示不设文档级过滤）
         """
         logger.info("pipeline 开始: query=%r, history_turns=%d", query, len(history or []))
         pipeline_start = time.time()
@@ -167,7 +171,7 @@ class RAGPipeline:
         effective_query, rewritten = self._rewrite_query(query, history)
 
         # 1+2: 检索 + ContextManager（用改写后的 query）
-        context, chunks, stats = self._retrieve_and_context(effective_query)
+        context, chunks, stats = self._retrieve_and_context(effective_query, document_ids=document_ids)
         if rewritten:
             stats = dict(stats)
             stats["rewritten_query"] = effective_query
@@ -225,10 +229,12 @@ class RAGPipeline:
             citations=citations,
         )
 
-    def run_stream(self, query: str, history: Optional[List] = None) -> Iterator[dict]:
+    def run_stream(self, query: str, history: Optional[List] = None,
+                   document_ids=None) -> Iterator[dict]:
         """流式执行 RAG 链路，逐事件 yield。
 
         history: 多轮对话历史 [{role, content}, ...]，透传给 LLM 理解指代（默认 None）
+        document_ids: 文档级 ACL 可读文档集合（None 表示不设文档级过滤）
 
         事件类型（dict 含 "type" 字段）:
           - {"type": "meta", "chunks": [...], "stats": {...}}      检索+上下文阶段完成
@@ -247,7 +253,9 @@ class RAGPipeline:
             effective_query, rewritten = self._rewrite_query(query, history)
 
             # 1+2: 检索 + ContextManager（用改写后的 query）
-            context, chunks, stats = self._retrieve_and_context(effective_query)
+            context, chunks, stats = self._retrieve_and_context(
+                effective_query, document_ids=document_ids
+            )
             if rewritten:
                 stats = dict(stats)
                 stats["rewritten_query"] = effective_query

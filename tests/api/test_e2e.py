@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 class FakeService:
     """mock RAGService：同步/流式均返回固定结果。"""
 
-    def query(self, query, history=None):
+    def query(self, query, history=None, document_ids=None):
         from app.rag.result import RAGResponse
         return RAGResponse(
             query=query,
@@ -36,7 +36,7 @@ class FakeService:
             citations=[{"number": 1, "chunk_id": "c1"}],
         )
 
-    def query_stream(self, query, history=None):
+    def query_stream(self, query, history=None, document_ids=None):
         yield {"type": "meta", "chunks": [], "stats": {}}
         yield {"type": "delta", "content": "测试回答"}
         yield {"type": "citations", "citations": []}
@@ -57,7 +57,7 @@ def mock_deps(monkeypatch):
     # 2. 上传索引构建
     monkeypatch.setattr(
         knowledge, "_do_upload",
-        lambda path, strategy: {
+        lambda path, strategy, tenant_id="default", owner_user_id="": {
             "document_count": 1, "chunk_count": 2, "dimension": 768,
             "index_path": "data/index/recursive/faiss.index",
             "metadata_path": "data/index/recursive/metadata.json",
@@ -65,8 +65,21 @@ def mock_deps(monkeypatch):
     )
 
     # 3. 无 MySQL
+    from app.core.config import Config as RealConfig
+
     class FakeConfig:
         storage_mysql_enabled = False
+        storage_es_enabled = False
+        storage_milvus_enabled = False
+        cache_enabled = False  # e2e 流程关闭查询缓存
+
+        @staticmethod
+        def raw_dir_for(tenant_id="default"):
+            return RealConfig().raw_dir_for(tenant_id)
+
+        @staticmethod
+        def index_dir_for(strategy, tenant_id="default"):
+            return RealConfig().index_dir_for(strategy, tenant_id)
 
     monkeypatch.setattr(config_mod, "Config", FakeConfig)
 

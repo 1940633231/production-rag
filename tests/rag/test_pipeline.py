@@ -31,7 +31,7 @@ class MockRetriever:
         self._results = results
         self.search_called = 0
 
-    def search(self, query, top_k=5):
+    def search(self, query, top_k=5, document_ids=None):
         self.search_called += 1
         return self._results[:top_k]
 
@@ -160,7 +160,7 @@ class TestPipelineRun:
 
     def test_retriever_failure_propagates(self):
         class FailingRetriever:
-            def search(self, query, top_k=5):
+            def search(self, query, top_k=5, document_ids=None):
                 raise RuntimeError("检索失败")
         pipeline = RAGPipeline(retriever=FailingRetriever())
         with pytest.raises(RuntimeError, match="检索失败"):
@@ -243,7 +243,7 @@ class TestPipelineRunStream:
 
     def test_stream_retriever_failure_yields_error(self):
         class FailingRetriever:
-            def search(self, query, top_k=5):
+            def search(self, query, top_k=5, document_ids=None):
                 raise RuntimeError("检索失败")
         pipeline = RAGPipeline(retriever=FailingRetriever())
         events = list(pipeline.run_stream("query"))
@@ -339,7 +339,7 @@ class _RecordingRetriever(MockRetriever):
         super().__init__(results)
         self.queries = []
 
-    def search(self, query, top_k=5):
+    def search(self, query, top_k=5, document_ids=None):
         self.queries.append(query)
         return super().search(query, top_k)
 

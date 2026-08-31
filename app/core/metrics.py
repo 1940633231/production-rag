@@ -95,6 +95,18 @@ class MetricsRegistry:
                 "rag_active_tasks",
                 "活跃后台任务数",
             )
+            self._cache_hits = Counter(
+                "rag_query_cache_hits_total",
+                "权限感知查询缓存命中次数",
+            )
+            self._cache_misses = Counter(
+                "rag_query_cache_misses_total",
+                "权限感知查询缓存未命中次数",
+            )
+            self._cache_entries = Gauge(
+                "rag_query_cache_entries",
+                "权限感知查询缓存当前条目数",
+            )
         else:
             noop = _NoopMetric()
             self._http_requests = noop
@@ -105,6 +117,9 @@ class MetricsRegistry:
             self._generation_duration = noop
             self._index_chunks = noop
             self._active_tasks = noop
+            self._cache_hits = noop
+            self._cache_misses = noop
+            self._cache_entries = noop
 
     # ---- HTTP 指标 ----
     def record_http_request(self, method: str, path: str, status: int, duration: float):
@@ -139,6 +154,19 @@ class MetricsRegistry:
     def set_active_tasks(self, count: int):
         """设置活跃后台任务数。"""
         self._active_tasks.set(count)
+
+    # ---- 权限感知查询缓存指标 ----
+    def record_cache_hit(self):
+        """记录一次缓存命中。"""
+        self._cache_hits.inc()
+
+    def record_cache_miss(self):
+        """记录一次缓存未命中。"""
+        self._cache_misses.inc()
+
+    def set_cache_entries(self, count: int):
+        """设置缓存当前条目数。"""
+        self._cache_entries.set(count)
 
     # ---- 导出 ----
     def export(self) -> tuple:

@@ -260,6 +260,51 @@ class Config:
         """
         return "{}_{}".format(self.milvus_collection_prefix, strategy)
 
+    def milvus_collection_for(self, strategy: str, tenant_id: str = "default") -> str:
+        """按 (tenant, strategy) 生成租户隔离的 Milvus collection 名称。
+
+        - default 租户: 保持旧命名 {prefix}_{strategy}（向后兼容存量数据）
+        - 其他租户: {prefix}_{tenant_id}_{strategy}，保证租户间向量完全隔离
+        """
+        if tenant_id == "default":
+            return self.milvus_collection_name(strategy)
+        return "{}_{}_{}".format(self.milvus_collection_prefix, tenant_id, strategy)
+
+    # ---- 租户隔离路径助手 ----
+
+    def raw_dir_for(self, tenant_id: str = "default") -> Path:
+        """某租户的原始文档目录。
+
+        - default 租户: data/raw（旧布局，向后兼容）
+        - 其他租户: data/raw/{tenant_id}
+        """
+        if tenant_id == "default":
+            return Path("data/raw")
+        return Path("data/raw") / tenant_id
+
+    def index_dir_for(self, strategy: str, tenant_id: str = "default") -> Path:
+        """某租户指定策略的索引目录。
+
+        - default 租户: data/index/{strategy}（旧布局，向后兼容）
+        - 其他租户: data/index/{tenant_id}/{strategy}
+        """
+        if tenant_id == "default":
+            return Path("data/index") / strategy
+        return Path("data/index") / tenant_id / strategy
+
+    def es_index_name_for(self, strategy: str, tenant_id: str = "default") -> str:
+        """某租户指定策略的 ES 索引名。
+
+        - default 租户: {prefix}_{strategy}（旧命名，向后兼容）
+        - 其他租户: {prefix}_{tenant_id}_{strategy}
+        """
+        prefix = self.storage_backends.get("es", {}).get(
+            "index_prefix", "production_rag"
+        )
+        if tenant_id == "default":
+            return "{}_{}".format(prefix, strategy)
+        return "{}_{}_{}".format(prefix, tenant_id, strategy)
+
     # ---- 通用 ----
 
     @property
@@ -290,3 +335,90 @@ class Config:
     def mysql_database(self):
         import os
         return os.getenv("MYSQL_DATABASE", "production_rag")
+
+    # ---- auth 段（认证 / RBAC）----
+
+    @property
+    def auth_config(self):
+        """auth 段整体，缺失时返回空 dict 保证默认值可用。"""
+        return self.data.get("auth", {})
+
+    @property
+    def auth_enabled(self):
+        """鉴权总开关（默认 true）。"""
+        return self.auth_config.get("enabled", True)
+
+    @property
+    def auth_jwt_secret(self):
+        """JWT 密钥：环境变量 auth.jwt_secret_env > config.yaml auth.jwt_secret > 默认值。"""
+        import os
+        env_name = self.auth_config.get("jwt_secret_env", "JWT_SECRET")
+        env_val = os.getenv(env_name)
+        if env_val:
+            return env_val
+        return self.auth_config.get("jwt_secret", "dev-secret-change-me")
+
+    @property
+    def auth_token_expire_hours(self):
+        return int(self.auth_config.get("token_expire_hours", 24))
+
+    @property
+    def auth_algorithm(self):
+        return self.auth_config.get("algorithm", "HS256")
+
+    @property
+    def auth_seed_username(self):
+        """种子账号用户名（scripts/seed_users.py 使用）。"""
+        return self.auth_config.get("seed_username", "admin")
+
+    @property
+    def auth_seed_password(self):
+        """种子账号密码（scripts/seed_users.py 使用）。"""
+        return self.auth_config.get("seed_password", "admin123")
+
+    # ---- cache 段（权限感知查询缓存）----
+
+    @property
+    def cache_config(self):
+        """cache 段整体，缺失时返回空 dict 保证默认值可用。"""
+        return self.data.get("cache", {})
+
+    @property
+    def cache_enabled(self):
+        """权限感知查询缓存总开关（默认 true）。"""
+        return self.cache_config.get("enabled", True)
+
+    @property
+    def cache_ttl_seconds(self):
+        """缓存有效期（秒）。0 表示立即过期。"""
+        return int(self.cache_config.get("ttl_seconds", 300))
+
+    @property
+    def cache_max_entries(self):
+        """最大缓存条目数（超出按 LRU 淘汰）。"""
+        return int(self.cache_config.get("max_entries", 2000))
+
+    # ---- audit 段（审计日志）----
+
+    @property
+    def audit_config(self):
+        """audit 段整体，缺失时返回空 dict 保证默认值可用。"""
+        return self.data.get("audit", {})
+
+    @property
+    def audit_enabled(self):
+        """审计总开关（默认 true）。"""
+        return self.audit_config.get("enabled", True)
+
+    @property
+    def audit_record_types(self):
+        """审计事件类型白名单。
+
+        "*" 表示全部；否则返回 set，如 {"login", "user", "document"}。
+        """
+        raw = self.audit_config.get("record", "*")
+        if isinstance(raw, str) and raw.strip() == "*":
+            return "*"
+        if isinstance(raw, str):
+            return set(t.strip() for t in raw.split(",") if t.strip())
+        return set(raw) if isinstance(raw, (list, set)) else "*"
