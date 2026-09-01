@@ -609,6 +609,21 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
                     vector_ids = chunk_repo.get_vector_ids_by_document(resolved_doc_id)
                     deleted_chunks = chunk_repo.delete_by_document(resolved_doc_id)
                     doc_repo.delete(resolved_doc_id, tenant_id=tenant_id)
+                    # 文档级 ACL：级联清理该文档的全部授权记录，
+                    # 防止孤儿 ACL 在 document_id 复用（同名文件重新上传）时静默挂到新文档
+                    try:
+                        from app.acl.repository import ACLRepository
+                        acl_removed = ACLRepository().delete_by_document(resolved_doc_id)
+                        if acl_removed:
+                            logger.info(
+                                "已清理文档 ACL 记录: doc_id=%s, 行数=%d",
+                                resolved_doc_id, acl_removed,
+                            )
+                    except Exception as acl_err:
+                        logger.warning(
+                            "清理文档 ACL 记录失败: doc_id=%s, %s",
+                            resolved_doc_id, acl_err, exc_info=True,
+                        )
                     deleted_from_mysql = True
                     deleted_doc_ids_for_rebuild.append(resolved_doc_id)
                     logger.info(

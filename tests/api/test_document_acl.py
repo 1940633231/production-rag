@@ -155,3 +155,23 @@ class TestDeletePermission:
         owner_headers = _headers(make_token, owner)
         resp = anon_client.delete("/api/knowledge/{}".format(doc_id), headers=owner_headers)
         assert resp.status_code == 200
+
+    def test_delete_cleans_up_acl_records(self, anon_client, make_token, seeded_docs, mysql_manager):
+        """删除文档必须级联清理 document_acl（防孤儿 ACL / 同名文档权限残留）。"""
+        from app.acl.repository import ACLRepository
+
+        doc_id, owner, _ = seeded_docs
+        owner_headers = _headers(make_token, owner)
+        # 先授予 u-bob 读权限
+        resp = anon_client.post(
+            "/api/knowledge/{}/acl".format(doc_id), headers=owner_headers,
+            json={"principal_type": "user", "principal_id": "u-bob", "permission": "read"},
+        )
+        assert resp.status_code == 200
+        acl = ACLRepository(mysql_manager)
+        assert len(acl.list_grants(doc_id)) == 1
+
+        # 删除文档后，该文档的授权记录必须被清空
+        resp = anon_client.delete("/api/knowledge/{}".format(doc_id), headers=owner_headers)
+        assert resp.status_code == 200
+        assert acl.list_grants(doc_id) == []

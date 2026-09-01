@@ -38,12 +38,15 @@ class BaseVectorStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def search(self, query_vector, top_k):
+    def search(self, query_vector, top_k, vector_ids=None):
         """检索最相似的 top_k 个向量。
 
         参数:
             query_vector: 单条查询向量，shape=(1, dimension) 或 (dimension,)
             top_k: 返回结果数
+            vector_ids: 可选，允许检索的显式 int64 id 集合（None 表示不过滤、检索全量）。
+                        提供时后端必须在集合内检索（先过滤后检索，permission-aware
+                        retrieval），不可读向量不会占用 top_k 名额。
 
         返回:
             (scores, ids) 二元组:

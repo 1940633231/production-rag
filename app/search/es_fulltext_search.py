@@ -89,6 +89,7 @@ class ESFulltextSearch:
                 query=query,
                 top_k=top_k,
                 sort_by_vector_id=False,  # 默认按 score 降序
+                document_ids=document_ids,  # 先过滤后检索：ES 端 terms 预过滤
             )
         except Exception as e:
             logger.warning(
@@ -102,11 +103,7 @@ class ESFulltextSearch:
             score = float(h.get("score", 0) or 0)
             if score <= self.min_score:
                 continue
-            # 文档级 ACL：跳过用户不可读文档的 chunk
-            if document_ids is not None:
-                doc_id = h.get("document_id")
-                if doc_id not in document_ids:
-                    continue
+            # 文档级 ACL 已在 ES 端 terms 预过滤，无需后置过滤
             vector_id = h.get("vector_id")
             if vector_id is None:
                 # 缺少 vector_id 就无法参与 RRF + chunk_repo 映射，跳过

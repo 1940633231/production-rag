@@ -34,10 +34,12 @@ logger = get_logger(__name__)
 
 # 尝试导入 pymilvus，不可用时降级
 try:
+    import pymilvus
     from pymilvus import MilvusClient, DataType
     from pymilvus.milvus_client.index import IndexParams
 
     _PYMILVUS_AVAILABLE = True
+    _PYMILVUS_MAJOR = int(pymilvus.__version__.split(".")[0])
 except ImportError:
     _PYMILVUS_AVAILABLE = False
 
@@ -244,7 +246,7 @@ class MilvusStore(BaseVectorStore):
         )
         return len(ids_list)
 
-    def search(self, query_vector, top_k):
+    def search(self, query_vector, top_k, vector_ids=None):
         """检索最相似的 top_k 个向量。
 
         返回格式与 FAISSStore 完全一致:
@@ -255,6 +257,8 @@ class MilvusStore(BaseVectorStore):
         参数:
             query_vector: 单条查询向量，shape=(1, dimension) 或 (dimension,)
             top_k: 返回结果数
+            vector_ids: 可选，允许检索的显式 id 集合；提供时通过 expr="id in [...]"
+                        在主键上先过滤后检索（permission-aware，不可读向量不占名额）。
         """
         import numpy as np
 
@@ -268,6 +272,17 @@ class MilvusStore(BaseVectorStore):
         if query_vector.ndim == 1:
             query_vector = query_vector.reshape(1, -1)
 
+        # 先过滤后检索：主键 id 过滤（vector_id）
+        expr = None
+        if vector_ids is not None:
+            ids_sorted = sorted(int(v) for v in vector_ids)
+            if not ids_sorted:
+                # 无可读向量，返回空结果
+                scores = np.full((1, top_k), -1.0, dtype="float32")
+                ids = np.full((1, top_k), -1, dtype="int64")
+                return scores, ids
+            expr = "id in [{}]".format(",".join(str(i) for i in ids_sorted))
+
         t = time.time()
         self._client.load_collection(self._collection_name)
 
@@ -277,17 +292,22 @@ class MilvusStore(BaseVectorStore):
         else:  # ivf
             search_params = {"metric_type": "IP", "params": {"nprobe": self.ivf_nprobe}}
 
-        results = self._client.search(
-            self._collection_name,
-            data=query_vector.tolist(),
-            anns_field="embedding",
-            search_params=search_params,
-            limit=top_k,
-        )
+        # pymilvus 3.x 将主键过滤参数由 expr 改名为 filter；
+        # 无过滤时不传该参数（避免 expr=None 与内部 search_requests_with_expr 冲突）
+        filter_kwarg = "filter" if _PYMILVUS_MAJOR >= 3 else "expr"
+        search_call = {
+            "data": query_vector.tolist(),
+            "anns_field": "embedding",
+            "search_params": search_params,
+            "limit": top_k,
+        }
+        if expr is not None:
+            search_call[filter_kwarg] = expr
+        results = self._client.search(self._collection_name, **search_call)
         logger.info(
-            "Milvus 检索: %.3fs, top_k=%d, 返回=%d, index_type=%s",
+            "Milvus 检索: %.3fs, top_k=%d, 返回=%d, index_type=%s, filter=%s",
             time.time() - t, top_k, len(results[0]) if results else 0,
-            self.index_type,
+            self.index_type, "id in [...]" if expr else "none",
         )
 
         # 转换为 FAISSStore 兼容格式: (scores_2d, ids_2d)

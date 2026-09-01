@@ -41,6 +41,17 @@ except ImportError:
     logger.warning("pymysql 或 dbutils 未安装，MySQL 存储层不可用")
 
 
+# document_acl → documents 外键（ON DELETE CASCADE）
+# 文档删除时级联清理授权记录，防止孤儿 ACL 在 document_id 复用（同名文件
+# 重新上传）时静默挂到新文档造成越权。约束名与 acl/repository.py 的 DDL 一致。
+_ACL_FK_NAME = "document_acl_documents_FK"
+_MIGRATE_ADD_ACL_FK = (
+    "ALTER TABLE document_acl ADD CONSTRAINT {fk} "
+    "FOREIGN KEY (document_id) REFERENCES documents(document_id) "
+    "ON DELETE CASCADE"
+).format(fk=_ACL_FK_NAME)
+
+
 _DDL_DOCUMENTS = """
 CREATE TABLE IF NOT EXISTS documents (
     document_id    VARCHAR(128)  NOT NULL,
@@ -221,7 +232,40 @@ class MySQLManager:
                     logger.info("文档级 ACL 表初始化完成: document_acl")
                 except Exception as e:
                     logger.warning("文档级 ACL 表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
+                # 迁移：存量 document_acl 补建 → documents 外键（ON DELETE CASCADE）
+                self._migrate_document_acl_fk(cur)
         logger.info("MySQL 表结构初始化完成: documents, chunks")
+
+    def _migrate_document_acl_fk(self, cur):
+        """为存量 document_acl 表补建 → documents 的外键（ON DELETE CASCADE）。
+
+        - 约束已存在则跳过（幂等，兼容手动已建外键的库）
+        - 先清理孤儿 ACL 记录（存在孤儿行时 ALTER 加外键会报 error 1452）
+        - 失败仅告警：代码级清理（ACLRepository.delete_by_document）仍兜底
+        """
+        try:
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM information_schema.TABLE_CONSTRAINTS "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'document_acl' "
+                "AND CONSTRAINT_TYPE = 'FOREIGN KEY' "
+                "AND CONSTRAINT_NAME = %s",
+                (_ACL_FK_NAME,),
+            )
+            if cur.fetchone()["c"]:
+                return
+            # 清理孤儿：document_acl 中引用不到 documents 的行
+            cur.execute(
+                "DELETE a FROM document_acl a LEFT JOIN documents d "
+                "ON a.document_id = d.document_id WHERE d.document_id IS NULL"
+            )
+            cur.execute(_MIGRATE_ADD_ACL_FK)
+            logger.info("document_acl 外键迁移完成: %s ON DELETE CASCADE", _ACL_FK_NAME)
+        except Exception as e:
+            logger.warning(
+                "document_acl 外键迁移失败（代码级清理仍生效）: %s",
+                e, exc_info=True,
+            )
 
     def _migrate_chunks_id(self, cur):
         """检测 chunks 表是否有 id 列，缺失则执行 ALTER TABLE 补加。"""

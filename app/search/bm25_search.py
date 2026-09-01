@@ -37,6 +37,14 @@ class BM25Search:
 
         self.bm25 = BM25Okapi(corpus_tokens)
 
+        # 先过滤后检索：document_id → 语料索引列表，
+        # search 时用 get_batch_scores 只对可读文档打分
+        self._doc_indexes = {}
+        for i, c in enumerate(self.chunks):
+            doc = c.get("document_id")
+            if doc:
+                self._doc_indexes.setdefault(doc, []).append(i)
+
         logger.info("BM25 初始化完成: %.3fs, 语料=%d", time.time() - t, len(corpus_tokens))
 
     def search(self, query: str, top_k: int = 10, document_ids=None) -> List[Dict]:
@@ -46,12 +54,24 @@ class BM25Search:
 
         query_tokens = list(jieba.cut(query))
 
-        scores = self.bm25.get_scores(query_tokens)
+        if document_ids is not None:
+            # 先过滤后检索：只对可读文档的 chunk 打分，
+            # 不可读文档不参与排序，不会占用 top_k 名额。
+            allowed_indexes = []
+            for doc_id in document_ids:
+                allowed_indexes.extend(self._doc_indexes.get(doc_id, ()))
+            logger.info(
+                "BM25 预过滤: 可读文档=%d, 可打分 chunk=%d",
+                len(document_ids), len(allowed_indexes),
+            )
+            scores = self.bm25.get_batch_scores(query_tokens, allowed_indexes)
+            scored = list(zip(allowed_indexes, scores))
+        else:
+            scores = self.bm25.get_scores(query_tokens)
+            scored = list(enumerate(scores))
 
         # 按分数降序取 top_k；vector_id 用 chunk 自带的稳定 ID（非列表下标）
-        ranked = sorted(
-            enumerate(scores), key=lambda x: x[1], reverse=True
-        )[:top_k]
+        ranked = sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
 
         results = []
 
@@ -62,12 +82,6 @@ class BM25Search:
                 continue
 
             document = self.chunks[local_idx]
-
-            # 文档级 ACL：跳过用户不可读文档的 chunk
-            if document_ids is not None:
-                doc_id = document.get("document_id")
-                if doc_id not in document_ids:
-                    continue
 
             results.append(
                 {

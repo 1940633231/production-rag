@@ -23,6 +23,7 @@ python-docx>=1.1.0            # Word(.docx) 文本抽取
 
 # ---- 摄入：分词 ----
 jieba>=0.42.1                 # BM25 中文分词
+rank-bm25>=0.2.2              # 本地 BM25 稀疏检索（bm25_search.py）
 
 # ---- 向量检索 ----
 faiss-cpu>=1.7.4              # FAISS 索引

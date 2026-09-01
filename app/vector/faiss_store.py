@@ -148,23 +148,81 @@ class FAISSStore(BaseVectorStore):
         )
         return removed
 
-    def search(self, query_vector, top_k):
-        """检索最相似的 top_k 个向量。"""
+    def search(self, query_vector, top_k, vector_ids=None):
+        """检索最相似的 top_k 个向量。
+
+        vector_ids 提供时只在集合内检索（先过滤后检索）:
+          - ivf/hnsw: 原生 IDSelectorBatch 预过滤（候选受 nprobe/efSearch 约束的近似过滤）
+          - flat:     暴力重算（reconstruct + numpy 内积），精确预过滤
+        """
         t = time.time()
         query_vector = np.asarray(query_vector, dtype="float32")
 
-        # HNSW: 设置搜索时的 ef（需要 >= top_k）
-        if self.index_type == "hnsw":
-            self.index.hnsw.efSearch = max(self.hnsw_ef_search, top_k)
+        if vector_ids is None:
+            # HNSW: 设置搜索时的 ef（需要 >= top_k）
+            if self.index_type == "hnsw":
+                self.index.hnsw.efSearch = max(self.hnsw_ef_search, top_k)
+            scores, ids = self.index.search(query_vector, top_k)
+            logger.info(
+                "FAISS 检索: %.3fs, top_k=%d, 返回=%d, index_type=%s",
+                time.time() - t, top_k, len(ids[0]) if len(ids) > 0 else 0,
+                self.index_type,
+            )
+            return scores, ids
 
-        scores, ids = self.index.search(query_vector, top_k)
+        return self._search_prefiltered(query_vector, top_k, vector_ids, t)
 
+    def _search_prefiltered(self, query_vector, top_k, vector_ids, t):
+        """先过滤后检索：只在允许的 vector_ids 集合内搜索。"""
+        allowed = np.asarray(sorted(int(v) for v in vector_ids), dtype="int64")
+
+        # 无可读向量：返回空结果（补 -1 与 FAISS 返回格式一致）
+        if allowed.size == 0:
+            scores = np.full((1, top_k), -1.0, dtype="float32")
+            ids = np.full((1, top_k), -1, dtype="int64")
+            logger.info(
+                "FAISS 预过滤检索: allowed=0, top_k=%d, %.3fs",
+                top_k, time.time() - t,
+            )
+            return scores, ids
+
+        # ivf / hnsw：原生 IDSelector 预过滤（近似，候选受 nprobe/efSearch 约束）
+        if self.index_type in ("ivf", "hnsw"):
+            sel = faiss.IDSelectorBatch(allowed)
+            if self.index_type == "hnsw":
+                params = faiss.SearchParametersHNSW(
+                    efSearch=max(self.hnsw_ef_search, top_k), sel=sel
+                )
+            else:
+                base = self.index.index
+                nprobe = getattr(base, "nprobe", self.ivf_nprobe)
+                params = faiss.SearchParametersIVF(nprobe=nprobe, sel=sel)
+            scores, ids = self.index.search(query_vector, top_k, params=params)
+            logger.info(
+                "FAISS 预过滤检索(selector): type=%s, allowed=%d, top_k=%d, %.3fs",
+                self.index_type, allowed.size, top_k, time.time() - t,
+            )
+            return scores, ids
+
+        # flat：暴力重算预过滤（精确，先过滤后检索）
+        vectors = self.index.reconstruct_batch(allowed)  # (n, dim)
+        q = query_vector.reshape(1, -1).astype("float32")
+        sims = (vectors @ q.T).flatten()
+        order = np.argsort(-sims)[:top_k]
+
+        n = order.size
+        ids_out = allowed[order]
+        scores_out = sims[order]
+        # 补 -1 到 top_k（与 FAISS 返回格式一致）
+        ids_full = np.full(top_k, -1, dtype="int64")
+        scores_full = np.full(top_k, -1.0, dtype="float32")
+        ids_full[:n] = ids_out
+        scores_full[:n] = scores_out
         logger.info(
-            "FAISS 检索: %.3fs, top_k=%d, 返回=%d, index_type=%s",
-            time.time() - t, top_k, len(ids[0]) if len(ids) > 0 else 0,
-            self.index_type,
+            "FAISS 预过滤检索(重算): type=flat, allowed=%d, top_k=%d, %.3fs",
+            allowed.size, top_k, time.time() - t,
         )
-        return scores, ids
+        return scores_full.reshape(1, -1), ids_full.reshape(1, -1)
 
     def save(self, path):
         faiss.write_index(self.index, path)

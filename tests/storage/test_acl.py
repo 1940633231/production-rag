@@ -62,8 +62,11 @@ def _user(user_id="u-1", roles=("editor",), is_superadmin=False):
 
 class TestACLRepository:
     def test_grant_revoke_list(self, manager):
+        doc_repo = DocumentRepository(manager)
         acl = ACLRepository(manager)
         doc = "_pytest_acl_gr_{}".format(uuid.uuid4().hex[:8])
+        # 外键约束下授权必须先存在文档记录
+        doc_repo.insert(doc, "gr.txt", 10, tenant_id="default", owner_user_id="u-alice")
         acl.grant(doc, "user", "u-alice", "read")
         acl.grant(doc, "user", "u-alice", "write")
         acl.grant(doc, "role", "viewer", "read")
@@ -135,6 +138,27 @@ class TestACLRepository:
 
         sa = _user("u-sa", is_superadmin=True)
         assert acl.has_permission(sa, doc, "delete", "acme") is True
+
+    def test_delete_by_document_removes_all_grants(self, manager):
+        """文档删除时 delete_by_document 必须清空该文档全部授权（防孤儿 ACL）。"""
+        doc_repo = DocumentRepository(manager)
+        acl = ACLRepository(manager)
+        doc = "_pytest_acl_del_{}".format(uuid.uuid4().hex[:8])
+        other = "_pytest_acl_del_{}".format(uuid.uuid4().hex[:8])
+        # 外键约束下授权必须先存在文档记录
+        doc_repo.insert(doc, "del.txt", 10, tenant_id="default", owner_user_id="u-alice")
+        doc_repo.insert(other, "other.txt", 10, tenant_id="default", owner_user_id="u-bob")
+        acl.grant(doc, "user", "u-alice", "read")
+        acl.grant(doc, "user", "u-alice", "write")
+        acl.grant(doc, "role", "viewer", "read")
+        assert len(acl.list_grants(doc)) == 3
+
+        removed = acl.delete_by_document(doc)
+        assert removed == 3
+        assert acl.list_grants(doc) == []
+        # 不影响其他文档的授权
+        acl.grant(other, "user", "u-bob", "read")
+        assert len(acl.list_grants(other)) == 1
 
     def test_get_readable_document_ids(self, manager):
         doc_repo = DocumentRepository(manager)

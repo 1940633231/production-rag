@@ -28,7 +28,12 @@ CREATE TABLE IF NOT EXISTS document_acl (
     created_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id, principal_type, principal_id, permission),
     KEY idx_acl_principal (principal_type, principal_id),
-    KEY idx_acl_document (document_id)
+    KEY idx_acl_document (document_id),
+    -- 文档删除时级联清理授权记录：防止孤儿 ACL 在 document_id 复用
+    -- （同名文件重新上传）时静默挂到新文档造成越权
+    CONSTRAINT document_acl_documents_FK
+        FOREIGN KEY (document_id) REFERENCES documents(document_id)
+        ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -80,6 +85,14 @@ class ACLRepository:
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 return cur.execute(sql, tuple(params))
+
+    def delete_by_document(self, document_id: str) -> int:
+        """删除某文档的全部授权记录（文档删除时级联清理）。
+
+        防止孤儿 ACL 残留：document_id 复用（同名文件重新上传）时，
+        旧授权若不清除会静默挂到新文档上造成越权。
+        """
+        return self.revoke(document_id)
 
     def list_grants(self, document_id: str) -> List[Dict]:
         """列出某文档的全部授权。"""

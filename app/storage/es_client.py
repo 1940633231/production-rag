@@ -129,22 +129,46 @@ class ESClient:
             logger.info("ES 批量写入: strategy=%s, chunks=%d", strategy, len(chunks))
 
     def search(self, strategy: str, query: str, top_k: int = 10,
-               sort_by_vector_id: bool = False) -> List[Dict]:
+               sort_by_vector_id: bool = False,
+               document_ids: Optional[List] = None) -> List[Dict]:
         """全文检索。
 
         - query 为 "*" 或空串时使用 match_all（用于全量列表/计数场景）
         - 否则对 content 字段做 match 查询
+        - document_ids 提供时用 terms 在 document_id 上先过滤后检索
+          （permission-aware：不可读文档不参与打分，不占用 top_k）
         - sort_by_vector_id=True 时按 vector_id 升序返回（用于 list_all 保证顺序）
         """
         idx = self._index_name(strategy)
+
+        # 无可读文档：直接返回空（避免查询后置过滤浪费 top_k）
+        if document_ids is not None and not document_ids:
+            return []
+
         if query in ("*", ""):
             query_clause: Dict = {"match_all": {}}
         else:
             query_clause = {"match": {"content": query}}
-        body: Dict = {
-            "query": query_clause,
-            "size": top_k,
-        }
+
+        if document_ids is not None:
+            # 先过滤后检索：bool must=词条匹配 + filter=terms 文档过滤
+            body: Dict = {
+                "query": {
+                    "bool": {
+                        "must": [query_clause],
+                        "filter": [
+                            {"terms": {"document_id": list(document_ids)}}
+                        ],
+                    }
+                },
+                "size": top_k,
+            }
+        else:
+            body: Dict = {
+                "query": query_clause,
+                "size": top_k,
+            }
+
         if sort_by_vector_id:
             body["sort"] = [{"vector_id": {"order": "asc"}}]
         result = self._client.search(index=idx, body=body)
