@@ -6,19 +6,21 @@
 
 - **多格式文档摄入**：支持 TXT / HTML / PDF / Word(.docx)，含清洗、分块（固定/递归）、embedding 向量化
 - **混合检索**：向量检索（FAISS）+ BM25 关键词检索 + RRF 融合，支持 Cross-Encoder 重排
+- **先过滤后检索（Permission-aware）**：向量（FAISS IDSelector / Milvus filter）/ BM25 / ES terms 均在可读文档集合内预过滤，不可读内容不参与打分、不占用 top-k 名额
 - **多路召回（Multi-Query）**：LLM 把查询扩展成多个角度子查询，各自检索后按 chunk 合并去重，弥补单查询召回不足
 - **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、**分数加权预算**（高分块保留更多内容）、超预算块跳过装填
 - **多轮对话**：`history` 透传 + Query 改写（LLM 指代消解，如"那价格呢"→"铁矿近期价格走势"），改写结果用于检索与生成
 - **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移；解析兼容 `[1,2]`、`【1】` 等多种格式
-- **流式生成**：基于 DashScope 的真流式 SSE 输出，首字延迟≈模型开始输出时间
-- **生成可靠性**：DashScope API 超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
+- **多 LLM 后端**：`stub`（零依赖）/ `qwen`（DashScope）/ `openai`（任意 OpenAI 兼容端点：OpenAI / DeepSeek / Kimi / 智谱 GLM / 百炼 compatible-mode / vLLM / Ollama…），仅需 base_url + api_key + model
+- **流式生成**：基于 LLM 后端的真流式 SSE 输出，首字延迟≈模型开始输出时间
+- **生成可靠性**：超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
 - **多后端持久化**：MySQL 存储文档/chunks（含连接池与 CASCADE 删除）+ Elasticsearch 全文检索 + Milvus 向量库（替代本地 FAISS），均可按开关启用
 - **缓存优化**：embedding/reranker 模型按名复用 + 索引版本号感知，上传/删除后自动刷新索引、不重载模型
 - **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
 - **认证与 RBAC**：JWT 登录（bcrypt 密码哈希 + PyJWT）、用户/角色/权限点三级模型、`require_permission` 路由门禁、种子账号脚本，业务 API 全部要求 Bearer token
 - **多租户隔离**：`tenant_id` 贯穿 MySQL/ES/Milvus/索引路径/缓存 key，租户间数据完全隔离
-- **文档级 ACL**：`documents.owner_user_id` + `document_acl` 授权表，按 用户/角色 授予 read/write/delete；检索/列表按可读文档过滤，删除按归属校验
-- **权限感知缓存**：RAG 结果缓存 key 含 租户+权限指纹+user_id+索引版本，不同租户/权限/用户不串缓存，权限变更或索引重建自动失效
+- **文档级 ACL**：`documents.owner_user_id` + `document_acl` 授权表，按 用户/角色 授予 read/write/delete；检索/列表按可读文档过滤，删除按归属校验；删文档/用户/角色时级联清理授权（document_acl 外键 + 代码级）
+- **权限感知缓存**：RAG 结果缓存 key 含 租户+权限指纹+user_id+索引版本，不同租户/权限/用户不串缓存，权限变更或索引重建自动失效；支持**内存（LRU）/ Redis** 双后端，Redis 不可用时自动降级内存
 - **审计日志**：401/403 越权自动记录 + 登录/用户/角色/文档操作显式记录（MySQL `audit_logs` 表），支持按租户/操作者/action 过滤查询
 - **稳定 ID 索引**：向量使用显式稳定 ID（chunk_id 哈希），删除按 ID 移除向量、无需全量重建；upload 追加写入不覆盖旧索引
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
@@ -47,7 +49,7 @@ production-rag/
 │   ├── auth/                 # 认证与 RBAC（JWT/密码哈希/权限点/登录 API）
 │   ├── acl/                  # 文档级 ACL（document_acl 表 + 授权判定）
 │   ├── audit/                # 审计日志（MySQL 落库 + 401/403 中间件）
-│   ├── cache/                # 权限感知查询缓存（TTL+LRU，key 含租户/权限/user_id）
+│   ├── cache/                # 权限感知查询缓存（内存 LRU / Redis 双后端，key 含租户/权限/user_id）
 │   ├── ingestion/            # 文档摄入
 │   │   ├── loader/           #   文档加载器（txt/html/pdf/word）
 │   │   ├── chunker/          #   分块器（fixed/recursive）
@@ -57,7 +59,7 @@ production-rag/
 │   ├── search/               # 检索引擎（vector/bm25/es_fulltext/hybrid + RRF）
 │   ├── rerank/               # Cross-Encoder 重排器
 │   ├── context/              # 上下文管理（builder/compressor/manager）
-│   ├── generation/           # LLM 生成（Stub/Qwen + 流式 + 超时重试 + Query 改写 + Multi-Query）
+│   ├── generation/           # LLM 生成（Stub/Qwen/OpenAI 兼容 + 流式 + 重试 + Query 改写 + Multi-Query）
 │   ├── citation/             # 引用提取（兼容多种括号/分隔符格式）
 │   ├── rag/                  # RAG 编排（pipeline/service）
 │   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document 仓储）
@@ -91,11 +93,13 @@ production-rag/
 
 ## 环境要求
 
-- Python 3.10+
+- Python 3.12+
 - MySQL 8.0+（可选，`storage.backends.mysql.enabled=false` 时不需要）
 - Elasticsearch 8.x（可选，`storage.backends.es.enabled=false` 时不需要）
 - Milvus 2.x（可选，`storage.backends.milvus.enabled=false` 时回退本地 FAISS 索引）
-- 阿里云 DashScope API Key（使用 Qwen LLM 时需要）
+- 阿里云 DashScope API Key（`generation.backend=qwen` 时需要）
+- 其他 LLM API Key（`generation.backend=openai` 时需要，如 OPENAI_API_KEY / DEEPSEEK_API_KEY）
+- Redis（可选，`cache.backend=redis` 时需要）
 - Docker + Docker Compose（可选，使用容器部署时需要；GPU 版另需 NVIDIA GPU + nvidia-container-toolkit）
 - 网络（C-MTEB 评测需下载数据集与模型，默认走 hf-mirror 国内镜像）
 
@@ -125,9 +129,15 @@ pip install -r requirements.txt
 # 认证 / RBAC（生产必须设置 JWT 密钥，未设置回退 config.yaml 的 auth.jwt_secret）
 JWT_SECRET=your-long-random-secret
 
-# DashScope（LLM 生成，不使用 Qwen 可不配）
+# DashScope（LLM 生成，backend=qwen 时使用，不使用 Qwen 可不配）
 DASHSCOPE_API_KEY=sk-your-api-key-here
 DASHSCOPE_MODEL=qwen-plus
+
+# OpenAI 兼容端点（LLM 生成，backend=openai 时使用；如 DEEPSEEK_API_KEY 等）
+OPENAI_API_KEY=sk-your-api-key-here
+
+# Redis（查询缓存，cache.backend=redis 时；无密码可不配）
+REDIS_PASSWORD=
 
 # MySQL（不使用 MySQL 可在 config.yaml 中设 storage.backends.mysql.enabled=false）
 MYSQL_HOST=127.0.0.1
@@ -260,14 +270,18 @@ context:
   budget_temperature: 1.0   # 预算加权温度：越小越向高分集中，越大越平均
 
 generation:
-  backend: qwen           # stub（占位）/ qwen（DashScope）
-  model_name: qwen-turbo  # Qwen 模型名
+  backend: qwen           # stub（占位）/ qwen（DashScope）/ openai（任意 OpenAI 兼容端点）
+  model_name: qwen-turbo  # 模型名（backend=openai 时留空则复用此值）
   temperature: 0.3
   max_tokens: 1024
-  timeout: 60             # DashScope API 超时（秒）
+  timeout: 60             # LLM API 超时（秒）
   retry_times: 2          # 网络异常/5xx/429 时的重试次数
   retry_backoff: 1.0      # 重试基础退避秒数（指数退避：1s → 2s → 4s）
   max_concurrency: 4      # 最大并发 LLM 调用数（0=不限制），防止占满线程池
+  openai:                 # backend=openai 时生效（OpenAI/DeepSeek/Kimi/GLM/百炼/vLLM/Ollama...）
+    base_url: https://api.openai.com/v1   # 端点 base_url（末尾不带 /）
+    api_key_env: OPENAI_API_KEY           # API key 环境变量名
+    model_name: ""                        # 模型名（留空复用顶层 generation.model_name）
 
 storage:
   pool_size: 5     # 连接池大小
@@ -289,7 +303,14 @@ auth:
 cache:
   enabled: true                 # 权限感知查询缓存开关
   ttl_seconds: 300              # 缓存有效期（秒）
-  max_entries: 2000             # 最大条目数（LRU 淘汰）
+  max_entries: 2000             # 最大条目数（内存后端 LRU 上限）
+  backend: redis                # 缓存后端：redis（优先）/ memory；Redis 不可用时自动降级内存
+  redis:
+    host: 172.23.97.35
+    port: 6379
+    db: 0
+    password_env: REDIS_PASSWORD   # 可选：从环境变量读 Redis 密码
+    prefix: "rag:qcache:"
 
 audit:
   enabled: true                 # 审计日志开关
@@ -509,10 +530,10 @@ MySQL / ES / Milvus 相关测试需要对应服务运行中，否则会自动跳
 | 混合检索 | 向量 + 全文双路召回 + RRF 融合 |
 | 向量存储 | FAISS（IndexIDMap2，显式稳定 ID）/ Milvus 双后端 |
 | 认证 / 权限 | PyJWT（JWT）+ bcrypt（密码哈希）+ RBAC/租户/文档级 ACL |
-| 审计 / 缓存 | MySQL audit_logs 表 + 权限感知内存缓存（TTL+LRU） |
+| 审计 / 缓存 | MySQL audit_logs 表 + 权限感知缓存（内存 LRU / Redis） |
 | Embedding | sentence-transformers (BGE) |
 | 重排 | Cross-Encoder (BGE-reranker)，可配置开关 |
-| LLM 生成 | DashScope (Qwen)，含超时重试 + Query 改写 + 并发限流 |
+| LLM 生成 | DashScope (Qwen) / OpenAI 兼容端点（OpenAI/DeepSeek/Kimi/GLM/vLLM/Ollama），含重试 + Query 改写 + 并发限流 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
 | 部署 | Docker（CPU/GPU 双镜像）+ docker-compose |
 | 评测 | C-MTEB T2Retrieval 基准 + LLM-as-Judge 生成质量评估 + 回归闭环门禁 |
