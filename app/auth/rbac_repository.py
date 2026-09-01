@@ -176,7 +176,13 @@ class RBACRepository:
                     )
 
     def delete_role(self, role_code: str) -> int:
-        """删除角色（级联清理 role_permissions / user_roles）。"""
+        """删除角色（级联清理 role_permissions / user_roles / 文档级 ACL 角色授权）。"""
+        # 角色删除时清理其全部文档授权（principal_id 多态无法用外键约束，代码级清理）
+        try:
+            from app.acl.repository import ACLRepository
+            ACLRepository(self.manager).delete_by_role(role_code)
+        except Exception as e:
+            logger.warning("清理角色文档 ACL 失败: %s", e)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 return cur.execute("DELETE FROM roles WHERE role_code = %s", (role_code,))
@@ -299,7 +305,13 @@ class RBACRepository:
                 return cur.execute(sql, tuple(params))
 
     def delete_user(self, user_id: str) -> int:
-        """删除用户（级联清理 user_roles）。"""
+        """删除用户（级联清理 user_roles 与文档级 ACL 授权）。"""
+        # 用户删除时清理其全部文档授权（principal_id 多态无法用外键约束，代码级清理）
+        try:
+            from app.acl.repository import ACLRepository
+            ACLRepository(self.manager).delete_by_user(user_id)
+        except Exception as e:
+            logger.warning("清理用户文档 ACL 失败: %s", e)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 return cur.execute("DELETE FROM users WHERE user_id = %s", (user_id,))

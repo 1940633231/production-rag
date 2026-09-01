@@ -241,24 +241,40 @@ class RAGService:
             self.config.context_order_strategy,
         )
 
-        # ---- Generator（从 config 切换 backend：stub 默认零依赖，qwen 需 API key）----
+        # ---- Generator（从 config 切换 backend：stub 零依赖 / qwen DashScope / openai 兼容）----
         from app.generation.generator import create_generator
         t = time.time()
         logger.info(
             "Generator 初始化开始: backend=%s, model=%s",
             self.config.generation_backend, self.config.generation_model,
         )
-        generator = create_generator(
-            self.config.generation_backend,
-            model=self.config.generation_model,
-            api_key_env=self.config.generation_api_key_env,
-            temperature=self.config.generation_temperature,
-            max_tokens=self.config.generation_max_tokens,
-            timeout=self.config.generation_timeout,
-            retry_times=self.config.generation_retry_times,
-            retry_backoff=self.config.generation_retry_backoff,
-            max_concurrency=self.config.generation_max_concurrency,
-        )
+        # 按后端传参：openai 用 generation.openai.*（base_url + 独立 api_key_env），
+        # 其余（qwen）沿用顶层 generation.*
+        if self.config.generation_backend == "openai":
+            generator = create_generator(
+                "openai",
+                model=self.config.generation_openai_model,
+                base_url=self.config.generation_openai_base_url,
+                api_key_env=self.config.generation_openai_api_key_env,
+                temperature=self.config.generation_temperature,
+                max_tokens=self.config.generation_max_tokens,
+                timeout=self.config.generation_timeout,
+                retry_times=self.config.generation_retry_times,
+                retry_backoff=self.config.generation_retry_backoff,
+                max_concurrency=self.config.generation_max_concurrency,
+            )
+        else:
+            generator = create_generator(
+                self.config.generation_backend,
+                model=self.config.generation_model,
+                api_key_env=self.config.generation_api_key_env,
+                temperature=self.config.generation_temperature,
+                max_tokens=self.config.generation_max_tokens,
+                timeout=self.config.generation_timeout,
+                retry_times=self.config.generation_retry_times,
+                retry_backoff=self.config.generation_retry_backoff,
+                max_concurrency=self.config.generation_max_concurrency,
+            )
         logger.info(
             "Generator 初始化完成: %.3fs, type=%s",
             time.time() - t, type(generator).__name__,

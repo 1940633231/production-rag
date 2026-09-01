@@ -160,6 +160,48 @@ class TestACLRepository:
         acl.grant(other, "user", "u-bob", "read")
         assert len(acl.list_grants(other)) == 1
 
+    def test_delete_by_user_removes_user_grants(self, manager):
+        """用户删除时 delete_by_user 必须清理该用户的全部授权，且不影响角色授权。"""
+        doc_repo = DocumentRepository(manager)
+        acl = ACLRepository(manager)
+        doc1 = "_pytest_acl_u1_{}".format(uuid.uuid4().hex[:8])
+        doc2 = "_pytest_acl_u2_{}".format(uuid.uuid4().hex[:8])
+        doc_repo.insert(doc1, "u1.txt", 10, tenant_id="default", owner_user_id="u-owner")
+        doc_repo.insert(doc2, "u2.txt", 10, tenant_id="default", owner_user_id="u-owner")
+        # 用户 u-bob 在多个文档上的授权 + 一个角色授权
+        acl.grant(doc1, "user", "u-bob", "read")
+        acl.grant(doc2, "user", "u-bob", "read")
+        acl.grant(doc1, "role", "editor", "read")
+        assert len(acl.list_grants(doc1)) == 2
+
+        removed = acl.delete_by_user("u-bob")
+        assert removed == 2  # 只清 u-bob 的 user 授权
+        assert acl.list_grants(doc1) == [g for g in acl.list_grants(doc1)
+                                         if g["principal_type"] != "user"]
+        # 角色授权仍在（principal_id 多态，不能被用户 FK 误删）
+        remaining = {g["principal_type"] for g in acl.list_grants(doc1)}
+        assert remaining == {"role"}
+
+    def test_delete_by_role_removes_role_grants(self, manager):
+        """角色删除时 delete_by_role 必须清理该角色的全部授权，且不影响用户授权。"""
+        doc_repo = DocumentRepository(manager)
+        acl = ACLRepository(manager)
+        doc1 = "_pytest_acl_r1_{}".format(uuid.uuid4().hex[:8])
+        doc2 = "_pytest_acl_r2_{}".format(uuid.uuid4().hex[:8])
+        doc_repo.insert(doc1, "r1.txt", 10, tenant_id="default", owner_user_id="u-owner")
+        doc_repo.insert(doc2, "r2.txt", 10, tenant_id="default", owner_user_id="u-owner")
+        # 角色 editor 在多个文档上的授权 + 一个用户授权
+        acl.grant(doc1, "role", "editor", "read")
+        acl.grant(doc2, "role", "editor", "read")
+        acl.grant(doc1, "user", "u-bob", "read")
+        assert len(acl.list_grants(doc1)) == 2
+
+        removed = acl.delete_by_role("editor")
+        assert removed == 2  # 只清 editor 的 role 授权
+        # 用户授权仍在
+        remaining = {g["principal_type"] for g in acl.list_grants(doc1)}
+        assert remaining == {"user"}
+
     def test_get_readable_document_ids(self, manager):
         doc_repo = DocumentRepository(manager)
         acl = ACLRepository(manager)

@@ -15,7 +15,7 @@ def test_health_structure(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] in ("ok", "degraded")
-    assert data["llm_backend"] in ("stub", "qwen")
+    assert data["llm_backend"] in ("stub", "qwen", "openai")
     # indexes 覆盖两个策略
     assert "fixed" in data["indexes"] and "recursive" in data["indexes"]
     # 各组件都有 status 字段

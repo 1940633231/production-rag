@@ -241,9 +241,25 @@ class MySQLManager:
 
         - 约束已存在则跳过（幂等，兼容手动已建外键的库）
         - 先清理孤儿 ACL 记录（存在孤儿行时 ALTER 加外键会报 error 1452）
+        - 修复：删除 document_acl_users_FK（principal_id 多态 user/role，
+          无法用外键约束到 users.user_id，会静默丢弃角色授权）
         - 失败仅告警：代码级清理（ACLRepository.delete_by_document）仍兜底
         """
         try:
+            # 修复：移除错误的手工外键 document_acl_users_FK（若存在）
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM information_schema.TABLE_CONSTRAINTS "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'document_acl' "
+                "AND CONSTRAINT_TYPE = 'FOREIGN KEY' "
+                "AND CONSTRAINT_NAME = 'document_acl_users_FK'",
+            )
+            if cur.fetchone()["c"]:
+                cur.execute("ALTER TABLE document_acl DROP FOREIGN KEY document_acl_users_FK")
+                logger.warning(
+                    "已移除损坏的外键 document_acl_users_FK（principal_id 多态无法约束到 users）"
+                )
+
             cur.execute(
                 "SELECT COUNT(*) AS c FROM information_schema.TABLE_CONSTRAINTS "
                 "WHERE CONSTRAINT_SCHEMA = DATABASE() "

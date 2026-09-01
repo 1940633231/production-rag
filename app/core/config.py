@@ -164,6 +164,30 @@ class Config:
         """最大并发 LLM 调用数（0=不限制）。"""
         return self.generation_config.get("max_concurrency", 4)
 
+    @property
+    def generation_openai_config(self):
+        """generation.openai 段（OpenAI 兼容后端），缺失时返回空 dict。"""
+        return self.generation_config.get("openai", {})
+
+    @property
+    def generation_openai_base_url(self):
+        """OpenAI 兼容端点 base_url（OpenAI / DeepSeek / Kimi / GLM / 百炼等）。"""
+        return self.generation_openai_config.get(
+            "base_url", "https://api.openai.com/v1"
+        )
+
+    @property
+    def generation_openai_api_key_env(self):
+        """OpenAI 兼容后端 API key 的环境变量名。"""
+        return self.generation_openai_config.get("api_key_env", "OPENAI_API_KEY")
+
+    @property
+    def generation_openai_model(self):
+        """OpenAI 兼容后端模型名；未单独配置时复用 generation.model_name。"""
+        return self.generation_openai_config.get(
+            "model_name"
+        ) or self.generation_model
+
     # ---- storage 段（MySQL / ES / Milvus 持久化配置）----
 
     @property

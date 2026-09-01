@@ -97,21 +97,37 @@ def _check_milvus() -> ComponentStatus:
 
 
 
-def _check_dashscope() -> ComponentStatus:
-    """检查 DashScope API key 是否配置。"""
+def _check_llm() -> ComponentStatus:
+    """按 generation.backend 检查 LLM 后端配置（qwen → DashScope key；openai → base_url + key）。"""
     from app.core.config import Config
     config = Config()
-    if config.generation_backend != "qwen":
+    backend = config.generation_backend
+    if backend == "qwen":
+        api_key = os.getenv(config.generation_api_key_env, "")
+        if not api_key:
+            return ComponentStatus(
+                status="error", detail="{} 未配置".format(config.generation_api_key_env)
+            )
+        if not api_key.startswith("sk-"):
+            return ComponentStatus(status="degraded", detail="API key 格式异常")
+        return ComponentStatus(status="ok", detail="DashScope API key 已配置")
+    if backend == "openai":
+        api_key = os.getenv(config.generation_openai_api_key_env, "")
+        if not api_key:
+            return ComponentStatus(
+                status="error",
+                detail="{} 未配置".format(config.generation_openai_api_key_env),
+            )
         return ComponentStatus(
-            status="disabled",
-            detail="generation.backend != qwen (当前: {})".format(config.generation_backend),
+            status="ok",
+            detail="OpenAI 兼容端点: {}（模型 {}）".format(
+                config.generation_openai_base_url, config.generation_openai_model
+            ),
         )
-    api_key = os.getenv("DASHSCOPE_API_KEY", "")
-    if not api_key:
-        return ComponentStatus(status="error", detail="DASHSCOPE_API_KEY 未配置")
-    if not api_key.startswith("sk-"):
-        return ComponentStatus(status="degraded", detail="API key 格式异常")
-    return ComponentStatus(status="ok", detail="API key 已配置")
+    return ComponentStatus(
+        status="disabled",
+        detail="generation.backend={}（未接入外部 LLM）".format(backend),
+    )
 
 
 def _check_embedding_model() -> ComponentStatus:
@@ -176,7 +192,7 @@ async def health():
         "mysql": _check_mysql,
         "elasticsearch": _check_elasticsearch,
         "milvus": _check_milvus,
-        "dashscope": _check_dashscope,
+        "llm": _check_llm,
         "embedding": _check_embedding_model,
         "reranker": _check_reranker,
     }

@@ -94,6 +94,34 @@ class ACLRepository:
         """
         return self.revoke(document_id)
 
+    def delete_by_user(self, user_id: str) -> int:
+        """删除某用户的全部文档授权（用户删除时级联清理）。
+
+        principal_id 多态（user_id 或 role_code），无法用外键约束到 users.user_id，
+        改为用户删除时在代码层清理其所有 user 类型授权。
+        """
+        sql = (
+            "DELETE FROM document_acl "
+            "WHERE principal_type = 'user' AND principal_id = %s"
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                return cur.execute(sql, (user_id,))
+
+    def delete_by_role(self, role_code: str) -> int:
+        """删除某角色的全部文档授权（角色删除时级联清理）。
+
+        同 delete_by_user：principal_id 多态无法用外键约束到 roles.role_code，
+        角色删除时在代码层清理其所有 role 类型授权。
+        """
+        sql = (
+            "DELETE FROM document_acl "
+            "WHERE principal_type = 'role' AND principal_id = %s"
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                return cur.execute(sql, (role_code,))
+
     def list_grants(self, document_id: str) -> List[Dict]:
         """列出某文档的全部授权。"""
         sql = (
