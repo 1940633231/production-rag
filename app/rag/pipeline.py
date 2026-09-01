@@ -177,8 +177,10 @@ class RAGPipeline:
             stats["rewritten_query"] = effective_query
 
         # 3. 生成：有 generator 则构建 prompt 并调用 LLM，填充 answer
+        #    检索无上下文（chunks 为空）时跳过 LLM——避免无中生有编答案、
+        #    产生 [1][2] 等无法映射到 chunk 的假引用
         answer = None
-        if self.generator is not None:
+        if self.generator is not None and chunks:
             t = time.time()
             generator_name = type(self.generator).__name__
             logger.info(
@@ -202,6 +204,14 @@ class RAGPipeline:
             logger.info(
                 "LLM 生成完成: %.3fs, answer_len=%d",
                 time.time() - t, len(answer or ""),
+            )
+        elif self.generator is not None:
+            # 检索无上下文：标注 no_context，调用方可据此提示"未检索到相关内容"
+            stats = dict(stats)
+            stats["no_context"] = True
+            logger.info(
+                "检索无上下文，跳过 LLM 生成: query=%r, chunks=0",
+                effective_query,
             )
 
         logger.info(
@@ -259,11 +269,21 @@ class RAGPipeline:
             if rewritten:
                 stats = dict(stats)
                 stats["rewritten_query"] = effective_query
+            # 检索无上下文：标注 no_context，并跳过 LLM 生成（避免假引用）
+            no_context = not chunks
+            if no_context:
+                stats = dict(stats)
+                stats["no_context"] = True
             yield {"type": "meta", "chunks": chunks, "stats": stats}
 
-            # 3. 流式生成
-            if self.generator is None:
-                logger.info("未配置 generator，跳过流式生成")
+            # 3. 流式生成：无 generator 或检索无上下文时跳过
+            if self.generator is None or no_context:
+                if no_context:
+                    logger.info(
+                        "检索无上下文，跳过流式生成: query=%r", effective_query,
+                    )
+                else:
+                    logger.info("未配置 generator，跳过流式生成")
                 yield {"type": "done", "answer_length": 0}
                 return
 

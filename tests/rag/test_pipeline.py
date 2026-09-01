@@ -168,6 +168,69 @@ class TestPipelineRun:
 
 
 # ============================================================
+# 检索无上下文：不得调用 LLM（避免无中生有编答案 + 假引用）
+# ============================================================
+
+class _TrackingGenerator(MockGenerator):
+    """记录 generate/stream_generate 调用次数。"""
+
+    def __init__(self):
+        self.generate_calls = 0
+        self.stream_calls = 0
+
+    def generate(self, messages):
+        self.generate_calls += 1
+        return "不应被调用"
+
+    def stream_generate(self, messages):
+        self.stream_calls += 1
+        yield "不应被调用"
+
+
+class TestPipelineNoContext:
+    def _empty_pipeline(self):
+        class EmptyRetriever:
+            def search(self, query, top_k=5, document_ids=None):
+                return []
+        gen = _TrackingGenerator()
+        pipeline = RAGPipeline(
+            retriever=EmptyRetriever(), generator=gen, top_k=2,
+        )
+        return pipeline, gen
+
+    def test_run_skips_generation_when_no_context(self):
+        """检索为空时不得调 LLM，answer 为空、无假引用、stats.no_context=True。"""
+        pipeline, gen = self._empty_pipeline()
+        resp = pipeline.run("铁矿")
+        assert gen.generate_calls == 0
+        assert resp.answer is None
+        assert resp.chunks == []
+        assert resp.citations == []
+        assert resp.stats.get("no_context") is True
+
+    def test_stream_skips_generation_when_no_context(self):
+        """流式：检索为空时只发 meta(done)，无 delta，标注 no_context。"""
+        pipeline, gen = self._empty_pipeline()
+        events = list(pipeline.run_stream("铁矿"))
+        types = [e["type"] for e in events]
+        assert types == ["meta", "done"]
+        assert "delta" not in types
+        assert gen.stream_calls == 0
+        assert events[0]["stats"].get("no_context") is True
+
+    def test_run_generates_when_context_exists(self):
+        """有上下文时仍正常生成（回归保护：不误伤正常链路）。"""
+        gen = _TrackingGenerator()
+        pipeline = RAGPipeline(
+            retriever=MockRetriever(_mock_chunks()), generator=gen, top_k=2,
+        )
+        resp = pipeline.run("铁矿")
+        assert gen.generate_calls == 1
+        assert resp.answer is not None
+        assert "no_context" not in resp.stats
+
+
+# ============================================================
 # RAGPipeline.run_stream
 # ============================================================
 

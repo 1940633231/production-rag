@@ -156,27 +156,71 @@ class PermissionAwareQueryCache:
 
 
 # ---- 模块级单例 ----
-_query_cache: Optional[PermissionAwareQueryCache] = None
+_query_cache = None
 _singleton_lock = threading.Lock()
 
 
-def get_query_cache(config=None) -> PermissionAwareQueryCache:
-    """获取（并首次按 config 初始化）全局查询缓存单例。"""
+def get_query_cache(config=None):
+    """获取（并首次按 config 初始化）全局查询缓存单例。
+
+    后端选择（cache.backend）:
+      - redis: 优先使用 RedisQueryCache；redis-py 未安装或 Redis 不可达时
+              自动降级为内存缓存（告警不中断）
+      - memory（默认）: 进程内 LRU + TTL
+    """
     global _query_cache
     with _singleton_lock:
         if _query_cache is None:
             if config is None:
                 from app.core.config import Config
                 config = Config()
+
+            # 选择后端：redis 优先，失败降级 memory
+            if config.cache_backend == "redis":
+                cache = _try_build_redis_cache(config)
+                if cache is not None:
+                    _query_cache = cache
+                    return _query_cache
+
             _query_cache = PermissionAwareQueryCache(
                 ttl_seconds=config.cache_ttl_seconds,
                 max_entries=config.cache_max_entries,
             )
             logger.info(
-                "查询缓存初始化: ttl=%ss, max_entries=%d",
+                "查询缓存初始化（内存）: ttl=%ss, max_entries=%d",
                 _query_cache.ttl_seconds, _query_cache.max_entries,
             )
         return _query_cache
+
+
+def _try_build_redis_cache(config):
+    """按 config 构建 Redis 缓存；不可用返回 None（由调用方降级内存）。"""
+    try:
+        from app.cache.redis_cache import RedisQueryCache
+
+        cache = RedisQueryCache(
+            host=config.cache_redis_host,
+            port=config.cache_redis_port,
+            db=config.cache_redis_db,
+            password=config.cache_redis_password,
+            ttl_seconds=config.cache_ttl_seconds,
+            prefix=config.cache_redis_prefix,
+        )
+        if not cache.ping():
+            logger.warning(
+                "Redis 缓存不可达（%s:%s），降级为内存缓存",
+                config.cache_redis_host, config.cache_redis_port,
+            )
+            return None
+        logger.info(
+            "查询缓存初始化（Redis）: %s:%s/%d, ttl=%ss, prefix=%s",
+            config.cache_redis_host, config.cache_redis_port,
+            config.cache_redis_db, cache.ttl_seconds, cache.prefix,
+        )
+        return cache
+    except Exception as e:
+        logger.warning("Redis 缓存初始化失败，降级为内存缓存: %s", e)
+        return None
 
 
 def reset_query_cache() -> None:

@@ -398,6 +398,41 @@ class Config:
         """最大缓存条目数（超出按 LRU 淘汰）。"""
         return int(self.cache_config.get("max_entries", 2000))
 
+    @property
+    def cache_backend(self):
+        """查询缓存后端：redis / memory（默认 memory，Redis 不可用时自动降级）。"""
+        return str(self.cache_config.get("backend", "memory")).lower()
+
+    @property
+    def cache_redis_config(self):
+        """cache.redis 段整体，缺失时返回空 dict。"""
+        return self.cache_config.get("redis", {})
+
+    @property
+    def cache_redis_host(self):
+        return self.cache_redis_config.get("host", "127.0.0.1")
+
+    @property
+    def cache_redis_port(self):
+        return int(self.cache_redis_config.get("port", 6379))
+
+    @property
+    def cache_redis_db(self):
+        return int(self.cache_redis_config.get("db", 0))
+
+    @property
+    def cache_redis_prefix(self):
+        return self.cache_redis_config.get("prefix", "rag:qcache:")
+
+    @property
+    def cache_redis_password(self):
+        """Redis 密码：从 cache.redis.password_env 指定的环境变量读取，未设置则无密码。"""
+        import os
+        env_name = self.cache_redis_config.get("password_env")
+        if not env_name:
+            return None
+        return os.getenv(env_name) or None
+
     # ---- audit 段（审计日志）----
 
     @property

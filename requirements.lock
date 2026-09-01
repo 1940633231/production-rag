@@ -77,6 +77,7 @@ python-dotenv==1.2.3
 python-multipart==0.0.32
 PyYAML==6.0.3
 rank-bm25==0.2.2
+redis==5.3.1
 regex==2026.7.19
 requests==2.34.2
 rich==15.0.0

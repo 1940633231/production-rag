@@ -22,7 +22,14 @@ auth:
 cache:
   enabled: true               # 总开关：false 时每次问答都实时检索
   ttl_seconds: 300            # 缓存有效期（秒），0 表示立即过期（调试用）
-  max_entries: 2000           # 最大缓存条目数，超出按 LRU 淘汰
+  max_entries: 2000           # 最大缓存条目数（内存后端 LRU 上限；Redis 依赖 TTL/服务端淘汰）
+  backend: redis              # 缓存后端：redis（优先）/ memory；Redis 不可用时自动降级 memory
+  redis:
+    host: 172.23.97.35        # Redis 地址
+    port: 6379                # Redis 端口
+    db: 0                     # Redis 逻辑库
+    password_env: REDIS_PASSWORD  # 可选：从环境变量读 Redis 密码（未设置视为无密码）
+    prefix: "rag:qcache:"     # key 前缀（命名空间，便于清理/统计）
 
 
 # ============================================================
