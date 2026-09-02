@@ -54,6 +54,8 @@ class BM25Search:
 
         query_tokens = list(jieba.cut(query))
 
+        # BM25 打分排序阶段计时
+        st = time.time()
         if document_ids is not None:
             # 先过滤后检索：只对可读文档的 chunk 打分，
             # 不可读文档不参与排序，不会占用 top_k 名额。
@@ -72,6 +74,11 @@ class BM25Search:
 
         # 按分数降序取 top_k；vector_id 用 chunk 自带的稳定 ID（非列表下标）
         ranked = sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
+
+        from app.core.metrics import metrics
+        metrics.record_bm25(
+            getattr(self, "strategy", "unknown"), time.time() - st
+        )
 
         results = []
 

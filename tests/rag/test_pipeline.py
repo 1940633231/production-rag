@@ -290,6 +290,21 @@ class TestPipelineRunStream:
         assert len(cit_events) == 1
         assert len(cit_events[0]["citations"]) == 2
 
+    def test_stream_records_ttft_metric(self):
+        from app.core.metrics import metrics
+        retriever = MockRetriever(_mock_chunks())
+        pipeline = RAGPipeline(
+            retriever=retriever,
+            generator=MockGenerator(),
+            top_k=2,
+        )
+        events = list(pipeline.run_stream("query"))
+        assert events[-1]["type"] == "done"
+        # 流式生成应记录 LLM 首 token 延迟（TTFT）指标
+        text = metrics.export()[0].decode("utf-8")
+        assert "rag_llm_ttft_seconds" in text
+        assert 'backend="MockGenerator"' in text
+
     def test_stream_generator_failure_yields_error(self):
         retriever = MockRetriever(_mock_chunks())
         pipeline = RAGPipeline(

@@ -159,6 +159,7 @@ class RAGService:
                 index_label = str(faiss_index_path)
 
             dense = Retriever(embedding_model, vector_store, chunk_repo)
+            dense.strategy = self.strategy  # 供分阶段指标打标签
             logger.info(
                 "Vector 检索器初始化完成: %.3fs, dim=%d, index=%s",
                 time.time() - t, embedding_model.dimension, index_label,
@@ -196,9 +197,12 @@ class RAGService:
             retriever = dense
         elif self.mode == "bm25":
             retriever = sparse
+            sparse.strategy = self.strategy  # 供 BM25/ES 打分阶段打标签
         else:  # hybrid
             from app.search.hybrid_search import HybridSearch
             retriever = HybridSearch(dense, sparse)
+            sparse.strategy = self.strategy  # 供 BM25/ES 打分阶段打标签
+        retriever.strategy = self.strategy
         logger.info("检索器已就绪: mode=%s, type=%s", self.mode, type(retriever).__name__)
 
         # ---- Reranker（可选）----
@@ -326,6 +330,9 @@ class RAGService:
                 "查询失败: %.3fs, error=%s", time.time() - start, e, exc_info=True
             )
             raise
+        # 查询总耗时（P50/P95/P99）
+        from app.core.metrics import metrics
+        metrics.record_query_latency(self.strategy, self.mode, time.time() - start)
         logger.info(
             "查询返回: %.3fs, chunks=%d, answer_len=%d",
             time.time() - start,
@@ -354,6 +361,12 @@ class RAGService:
             for event in self._pipeline.run_stream(
                 query, history=history, document_ids=document_ids
             ):
+                # 流式查询总耗时在 done/error 事件处记录（P50/P95/P99）
+                if event.get("type") in ("done", "error"):
+                    from app.core.metrics import metrics
+                    metrics.record_query_latency(
+                        self.strategy, self.mode, time.time() - start
+                    )
                 yield event
         except Exception as e:
             logger.error(

@@ -290,9 +290,17 @@ class RAGPipeline:
             messages = self.prompt_builder.build(
                 effective_query, context, history=history
             )
+            from app.core.metrics import metrics
+            generator_name = type(self.generator).__name__
+            stream_start = time.time()
+            ttft = None
             answer_parts = []
             try:
                 for delta in self.generator.stream_generate(messages):
+                    # 首 token 延迟（TTFT）：从发起流式调用到首个非空增量
+                    if ttft is None and delta:
+                        ttft = time.time() - stream_start
+                        metrics.record_llm_ttft(generator_name, ttft)
                     if delta:
                         answer_parts.append(delta)
                         yield {"type": "delta", "content": delta}
@@ -302,9 +310,13 @@ class RAGPipeline:
                 return
 
             answer = "".join(answer_parts)
+            # LLM 生成总耗时（流式场景同样记录，与同步链路共用同一条指标）
+            metrics.record_generation(
+                generator_name, time.time() - stream_start
+            )
             logger.info(
-                "LLM 流式生成完成: answer_len=%d, 总耗时=%.3fs",
-                len(answer), time.time() - pipeline_start,
+                "LLM 流式生成完成: answer_len=%d, ttft=%.3fs, 总耗时=%.3fs",
+                len(answer), ttft or 0.0, time.time() - pipeline_start,
             )
 
             # 4. Citation 提取

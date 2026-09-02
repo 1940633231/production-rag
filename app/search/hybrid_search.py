@@ -40,7 +40,14 @@ class HybridSearch:
             len(dense_results), len(sparse_results),
         )
 
+        # RRF 融合阶段计时
+        t = time.time()
         fused = rrf_fuse([dense_results, sparse_results], k=self.rrf_k)
+
+        from app.core.metrics import metrics
+        metrics.record_rrf(
+            getattr(self, "strategy", "unknown"), time.time() - t
+        )
 
         result = fused[:top_k]
 

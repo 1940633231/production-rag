@@ -6,21 +6,35 @@
   - rag_http_requests_total: Counter (method, path, status)
   - rag_http_request_duration_seconds: Histogram (method, path)
   - rag_query_total: Counter (strategy, mode, use_rerank)
+  - rag_query_latency_seconds: Histogram (strategy, mode)
+  - rag_query_latency_p50/p95/p99_seconds: Gauge (strategy, mode) 有界窗口分位数
   - rag_retrieval_duration_seconds: Histogram (strategy)
+  - rag_embedding_duration_seconds: Histogram (strategy)  # query embedding
+  - rag_vector_duration_seconds: Histogram (strategy)     # 向量库检索
+  - rag_bm25_duration_seconds: Histogram (strategy)       # BM25 打分排序
+  - rag_rrf_duration_seconds: Histogram (strategy)        # RRF 融合
   - rag_rerank_duration_seconds: Histogram
-  - rag_generation_duration_seconds: Histogram (backend)
+  - rag_generation_duration_seconds: Histogram (backend)  # LLM 总耗时
+  - rag_llm_ttft_seconds: Histogram (backend)             # LLM 首 token 延迟
 
 使用方式:
   # 在 API 端点中记录
   from app.core.metrics import metrics
   metrics.record_http_request("GET", "/api/health", 200, 0.012)
   metrics.record_query("recursive", "vector", True)
+  metrics.record_query_latency("recursive", "vector", 1.5)
   metrics.record_retrieval("recursive", 0.15)
+  metrics.record_embedding("recursive", 0.02)
+  metrics.record_vector("recursive", 0.03)
+  metrics.record_bm25("recursive", 0.004)
+  metrics.record_rrf("recursive", 0.0001)
+  metrics.record_llm_ttft("qwen", 0.4)
   metrics.record_generation("qwen", 1.2)
 
   # /metrics 端点直接用 prometheus_client.generate_latest
 """
 import time
+from collections import deque
 from typing import Optional
 
 from app.core.logger import get_logger
@@ -48,6 +62,52 @@ class _NoopMetric:
         pass
 
 
+class _NoopPercentile:
+    """prometheus_client 不可用时的空分位数实现。"""
+    def observe(self, *args, **kwargs):
+        pass
+
+
+class _PercentileWindow:
+    """有界滑动窗口的 P50/P95/P99 分位数，以三个 Gauge 暴露。
+
+    当前 prometheus-client 构建的 Summary 不支持 quantiles 参数，
+    故自行实现：维护最近 N 个样本（deque，超窗自动淘汰），
+    每次 observe 重算 P50/P95/P99 并写入对应 Gauge（nearest-rank）。
+    另配同名 Histogram 保留 _count/_sum/bucket，供 PromQL histogram_quantile 使用。
+    """
+
+    def __init__(self, name: str, documentation: str, labelnames, window: int = 1000):
+        self._window = window
+        self._labelnames = list(labelnames)
+        self._buf = {}
+        self._gauges = {}
+        for q in (0.5, 0.95, 0.99):
+            self._gauges[q] = Gauge(
+                "{}_p{:02d}_seconds".format(name, int(q * 100)),
+                "{}（P{:.0f}）".format(documentation, q * 100),
+                self._labelnames,
+            )
+
+    def _samples(self, labelvalues):
+        key = tuple(labelvalues)
+        if key not in self._buf:
+            self._buf[key] = deque(maxlen=self._window)
+        return self._buf[key]
+
+    def observe(self, value: float, **labels):
+        labelvalues = [labels.get(l) for l in self._labelnames]
+        buf = self._samples(labelvalues)
+        buf.append(value)
+        n = len(buf)
+        if n == 0:
+            return
+        sorted_samples = sorted(buf)
+        for q, g in self._gauges.items():
+            idx = min(n - 1, int(q * (n - 1)))
+            g.labels(*labelvalues).set(sorted_samples[idx])
+
+
 class MetricsRegistry:
     """指标注册中心：统一管理所有 Prometheus 指标。"""
 
@@ -69,11 +129,46 @@ class MetricsRegistry:
                 "RAG 查询总数",
                 ["strategy", "mode", "use_rerank"],
             )
+            self._query_latency = Histogram(
+                "rag_query_latency_seconds",
+                "RAG 查询总耗时",
+                ["strategy", "mode"],
+                buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+            )
+            self._query_latency_pct = _PercentileWindow(
+                "rag_query_latency",
+                "RAG 查询总耗时",
+                ["strategy", "mode"],
+            )
             self._retrieval_duration = Histogram(
                 "rag_retrieval_duration_seconds",
                 "检索阶段耗时",
                 ["strategy"],
                 buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+            )
+            self._embedding_duration = Histogram(
+                "rag_embedding_duration_seconds",
+                "Query Embedding 阶段耗时",
+                ["strategy"],
+                buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0),
+            )
+            self._vector_duration = Histogram(
+                "rag_vector_duration_seconds",
+                "向量库检索阶段耗时",
+                ["strategy"],
+                buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0),
+            )
+            self._bm25_duration = Histogram(
+                "rag_bm25_duration_seconds",
+                "BM25 打分排序阶段耗时",
+                ["strategy"],
+                buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0),
+            )
+            self._rrf_duration = Histogram(
+                "rag_rrf_duration_seconds",
+                "RRF 融合阶段耗时",
+                ["strategy"],
+                buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1),
             )
             self._rerank_duration = Histogram(
                 "rag_rerank_duration_seconds",
@@ -82,9 +177,15 @@ class MetricsRegistry:
             )
             self._generation_duration = Histogram(
                 "rag_generation_duration_seconds",
-                "LLM 生成耗时",
+                "LLM 生成总耗时",
                 ["backend"],
                 buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0),
+            )
+            self._llm_ttft = Histogram(
+                "rag_llm_ttft_seconds",
+                "LLM 首 token 延迟（TTFT）",
+                ["backend"],
+                buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
             )
             self._index_chunks = Gauge(
                 "rag_index_chunks",
@@ -112,9 +213,16 @@ class MetricsRegistry:
             self._http_requests = noop
             self._http_duration = noop
             self._query_total = noop
+            self._query_latency = noop
+            self._query_latency_pct = _NoopPercentile()
             self._retrieval_duration = noop
+            self._embedding_duration = noop
+            self._vector_duration = noop
+            self._bm25_duration = noop
+            self._rrf_duration = noop
             self._rerank_duration = noop
             self._generation_duration = noop
+            self._llm_ttft = noop
             self._index_chunks = noop
             self._active_tasks = noop
             self._cache_hits = noop
@@ -134,16 +242,41 @@ class MetricsRegistry:
             strategy=strategy, mode=mode, use_rerank=str(use_rerank),
         ).inc()
 
+    def record_query_latency(self, strategy: str, mode: str, duration: float):
+        """记录查询总耗时（Histogram + P50/P95/P99 Gauge 窗口）。"""
+        self._query_latency.labels(strategy=strategy, mode=mode).observe(duration)
+        self._query_latency_pct.observe(duration, strategy=strategy, mode=mode)
+
     def record_retrieval(self, strategy: str, duration: float):
         """记录检索阶段耗时。"""
         self._retrieval_duration.labels(strategy=strategy).observe(duration)
+
+    def record_embedding(self, strategy: str, duration: float):
+        """记录 query embedding 阶段耗时。"""
+        self._embedding_duration.labels(strategy=strategy).observe(duration)
+
+    def record_vector(self, strategy: str, duration: float):
+        """记录向量库检索阶段耗时。"""
+        self._vector_duration.labels(strategy=strategy).observe(duration)
+
+    def record_bm25(self, strategy: str, duration: float):
+        """记录 BM25 打分排序阶段耗时。"""
+        self._bm25_duration.labels(strategy=strategy).observe(duration)
+
+    def record_rrf(self, strategy: str, duration: float):
+        """记录 RRF 融合阶段耗时。"""
+        self._rrf_duration.labels(strategy=strategy).observe(duration)
 
     def record_rerank(self, duration: float):
         """记录重排阶段耗时。"""
         self._rerank_duration.observe(duration)
 
+    def record_llm_ttft(self, backend: str, duration: float):
+        """记录 LLM 首 token 延迟（TTFT）。"""
+        self._llm_ttft.labels(backend=backend).observe(duration)
+
     def record_generation(self, backend: str, duration: float):
-        """记录 LLM 生成耗时。"""
+        """记录 LLM 生成总耗时。"""
         self._generation_duration.labels(backend=backend).observe(duration)
 
     # ---- 资源指标 ----

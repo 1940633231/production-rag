@@ -57,6 +57,6 @@ pyarrow>=14.0.0               # parquet 文件格式支持（pandas 读取 C-MTE
 pytest>=7.4.0
 pytest-cov>=4.1.0
 
-# ---- 可观测性（可选，后续接入） ----
-# prometheus-client>=0.17.0
+# ---- 可观测性 ----
+prometheus-client>=0.17.0
 # opentelemetry-sdk>=1.20.0

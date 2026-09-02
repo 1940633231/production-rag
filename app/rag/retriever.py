@@ -46,10 +46,16 @@ class Retriever:
 
     def search(self, query, top_k=10, document_ids=None):
 
+        from app.core.metrics import metrics
         t = time.time()
         logger.info("向量检索开始: query=%r, top_k=%d", query, top_k)
 
+        # query embedding 阶段（单独计时）
+        et = time.time()
         query_vector = self.embedding_model.encode([query])
+        metrics.record_embedding(
+            getattr(self, "strategy", "unknown"), time.time() - et
+        )
 
         # 先过滤后检索：可读文档 → 允许的 vector_id 集合 → 向量后端按 id 预过滤
         vector_ids = None
@@ -60,8 +66,13 @@ class Retriever:
                 len(document_ids), len(vector_ids),
             )
 
+        # 向量库检索阶段（单独计时）
+        vt = time.time()
         scores, ids = self.vector_store.search(
             query_vector, top_k, vector_ids=vector_ids
+        )
+        metrics.record_vector(
+            getattr(self, "strategy", "unknown"), time.time() - vt
         )
 
         results = []
