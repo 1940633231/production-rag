@@ -92,6 +92,60 @@ def _get_config():
     return Config()
 
 
+# 缓存条目数指标刷新节流（Redis 后端统计需 scan，不宜每次请求执行）
+_cache_entries_last = [0.0]
+
+
+def _refresh_cache_entries_metric(cache, force: bool = False) -> None:
+    """刷新缓存条目数 Gauge（覆盖内存/Redis 双后端）。
+
+    - 读取路径每 30s 节流一次（Redis 统计需 scan，不宜每次请求执行）
+    - 写入路径 force=True：条目刚变化，立即刷新（写频次低，可接受）
+    """
+    now = time.time()
+    if not force and now - _cache_entries_last[0] < 30.0:
+        return
+    _cache_entries_last[0] = now
+    try:
+        from app.core.metrics import metrics
+        metrics.set_cache_entries(int(cache.stats().get("entries", 0)))
+    except Exception:
+        pass
+
+
+async def _stream_events_from_cached(cached: Dict):
+    """把权限感知缓存中的完整响应重放为 SSE 事件流（流式命中时使用）。
+
+    事件序列与真实流式一致：meta → delta(整段答案) → citations → done。
+    """
+    elapsed = float(cached.get("elapsed", 0) or 0)
+    yield {
+        "event": "meta",
+        "data": json.dumps({
+            "chunks": cached.get("chunks", []),
+            "stats": cached.get("stats", {}),
+            "elapsed": elapsed,
+        }, ensure_ascii=False),
+    }
+    answer = cached.get("answer") or ""
+    if answer:
+        yield {
+            "event": "delta",
+            "data": json.dumps({"content": answer}, ensure_ascii=False),
+        }
+    yield {
+        "event": "citations",
+        "data": json.dumps(cached.get("citations", []), ensure_ascii=False),
+    }
+    yield {
+        "event": "done",
+        "data": json.dumps({
+            "answer_length": len(answer),
+            "elapsed": elapsed,
+        }, ensure_ascii=False),
+    }
+
+
 @router.post(
     "/chat",
     response_model=ChatResponse,
@@ -135,6 +189,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     cache = None
     if cache_enabled:
         cache = get_query_cache(config)
+        _refresh_cache_entries_metric(cache)
         permissions = sorted(user.permissions) if user else []
         cache_key = build_query_cache_key(
             tenant_id=tenant_id,
@@ -198,7 +253,8 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     # 写入权限感知缓存（key 已含 tenant + 权限 + 索引版本）
     if cache_enabled and cache_key is not None and cache is not None:
         cache.set(cache_key, result.model_dump())
-        logger.info("API /chat 写入缓存: tenant=%s, query=%r", tenant_id, req.query[:60])
+        _refresh_cache_entries_metric(cache, force=True)
+        logger.info("API /chat 写入缓存: tenant=%s, query=%r", tenant_id, req.query[:80])
 
     return result
 
@@ -241,6 +297,35 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
             logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
             document_ids = None
 
+    # ---- 权限感知查询缓存：流式与同步共用同一套 key（命中重放 / 未命中写入）----
+    cache_enabled = config.cache_enabled
+    cache_key = None
+    cache = None
+    if cache_enabled:
+        from app.core.metrics import metrics
+        cache = get_query_cache(config)
+        _refresh_cache_entries_metric(cache)
+        permissions = sorted(user.permissions) if user else []
+        cache_key = build_query_cache_key(
+            tenant_id=tenant_id,
+            user_id=user.user_id if user else None,
+            permissions=permissions,
+            query=req.query,
+            strategy=req.strategy,
+            mode=req.mode,
+            use_rerank=req.use_rerank,
+            index_version=_index_version(req.strategy, tenant_id),
+            history=req.history,
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            metrics.record_cache_hit()
+            logger.info(
+                "API /chat/stream 缓存命中: tenant=%s, query=%r",
+                tenant_id, req.query[:60],
+            )
+            return EventSourceResponse(_stream_events_from_cached(cached))
+
     service = get_service(
         config=config,
         strategy=req.strategy,
@@ -251,23 +336,34 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
 
     async def event_generator():
         """生成 SSE 事件流，消费 service.query_stream() 的同步事件流。"""
+        from app.core.metrics import metrics
         t = time.time()
+        chunks: List[Dict] = []
+        stats: Dict = {}
+        context = ""
+        answer_parts: List[str] = []
+        citations: List[Dict] = []
+        errored = False
         # 用线程池迭代同步生成器，避免阻塞事件循环
         async for event in iterate_in_threadpool(
             service.query_stream(req.query, req.history, document_ids)
         ):
             evt_type = event.get("type")
             if evt_type == "meta":
+                chunks = event.get("chunks", [])
+                stats = event.get("stats", {})
+                context = event.get("context", "")
                 elapsed = round(time.time() - t, 3)
                 yield {
                     "event": "meta",
                     "data": json.dumps({
-                        "chunks": event.get("chunks", []),
-                        "stats": event.get("stats", {}),
+                        "chunks": chunks,
+                        "stats": stats,
                         "elapsed": elapsed,
                     }, ensure_ascii=False),
                 }
             elif evt_type == "delta":
+                answer_parts.append(event.get("content", ""))
                 yield {
                     "event": "delta",
                     "data": json.dumps(
@@ -275,10 +371,11 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
                     ),
                 }
             elif evt_type == "citations":
+                citations = event.get("citations", [])
                 yield {
                     "event": "citations",
                     "data": json.dumps(
-                        event.get("citations", []), ensure_ascii=False
+                        citations, ensure_ascii=False
                     ),
                 }
             elif evt_type == "done":
@@ -290,6 +387,7 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
                     }, ensure_ascii=False),
                 }
             elif evt_type == "error":
+                errored = True
                 yield {
                     "event": "error",
                     "data": json.dumps(
@@ -297,5 +395,25 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
                     ),
                 }
                 return
+
+        # 流式正常结束 → 写入权限感知缓存（与同步共用 key，后续同步/流式均可命中）
+        if not errored and cache_enabled and cache_key is not None and cache is not None:
+            try:
+                cache.set(cache_key, {
+                    "query": req.query,
+                    "answer": "".join(answer_parts),
+                    "context": context,
+                    "chunks": chunks,
+                    "citations": citations,
+                    "stats": stats,
+                    "elapsed": round(time.time() - t, 3),
+                })
+                _refresh_cache_entries_metric(cache, force=True)
+                logger.info(
+                    "API /chat/stream 写入缓存: tenant=%s, query=%r",
+                    tenant_id, req.query[:60],
+                )
+            except Exception as e:
+                logger.warning("流式写入缓存失败: %s", e)
 
     return EventSourceResponse(event_generator())

@@ -37,11 +37,21 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 _require_users = Depends(require_permission("admin:users"))
 _require_roles = Depends(require_permission("admin:roles"))
 _require_audit = Depends(require_permission("admin:audit"))
+_require_metrics = Depends(require_permission("metrics:read"))
 
 
 def _repo():
     from app.auth.rbac_repository import RBACRepository
     return RBACRepository()
+
+
+# ---------------- 监控指标 ----------------
+
+@router.get("/metrics", dependencies=[_require_metrics])
+async def get_metrics_snapshot():
+    """返回当前指标结构化快照（后台监控页使用，需 metrics:read 权限）。"""
+    from app.core.metrics import metrics
+    return metrics.snapshot()
 
 
 # ---------------- 权限点 ----------------

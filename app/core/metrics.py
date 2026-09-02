@@ -12,6 +12,7 @@
   - rag_embedding_duration_seconds: Histogram (strategy)  # query embedding
   - rag_vector_duration_seconds: Histogram (strategy)     # 向量库检索
   - rag_bm25_duration_seconds: Histogram (strategy)       # BM25 打分排序
+  - rag_sparse_duration_seconds: Histogram (strategy)     # 稀疏检索（BM25 / ES 共用）
   - rag_rrf_duration_seconds: Histogram (strategy)        # RRF 融合
   - rag_rerank_duration_seconds: Histogram
   - rag_generation_duration_seconds: Histogram (backend)  # LLM 总耗时
@@ -27,6 +28,7 @@
   metrics.record_embedding("recursive", 0.02)
   metrics.record_vector("recursive", 0.03)
   metrics.record_bm25("recursive", 0.004)
+  metrics.record_sparse("recursive", 0.004)
   metrics.record_rrf("recursive", 0.0001)
   metrics.record_llm_ttft("qwen", 0.4)
   metrics.record_generation("qwen", 1.2)
@@ -164,6 +166,12 @@ class MetricsRegistry:
                 ["strategy"],
                 buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0),
             )
+            self._sparse_duration = Histogram(
+                "rag_sparse_duration_seconds",
+                "稀疏检索耗时（BM25 / ES 共用）",
+                ["strategy"],
+                buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0),
+            )
             self._rrf_duration = Histogram(
                 "rag_rrf_duration_seconds",
                 "RRF 融合阶段耗时",
@@ -219,6 +227,7 @@ class MetricsRegistry:
             self._embedding_duration = noop
             self._vector_duration = noop
             self._bm25_duration = noop
+            self._sparse_duration = noop
             self._rrf_duration = noop
             self._rerank_duration = noop
             self._generation_duration = noop
@@ -262,6 +271,10 @@ class MetricsRegistry:
     def record_bm25(self, strategy: str, duration: float):
         """记录 BM25 打分排序阶段耗时。"""
         self._bm25_duration.labels(strategy=strategy).observe(duration)
+
+    def record_sparse(self, strategy: str, duration: float):
+        """记录稀疏检索耗时（BM25 / ES 后端共用，与具体后端无关）。"""
+        self._sparse_duration.labels(strategy=strategy).observe(duration)
 
     def record_rrf(self, strategy: str, duration: float):
         """记录 RRF 融合阶段耗时。"""
@@ -310,6 +323,57 @@ class MetricsRegistry:
         if not _PROMETHEUS_AVAILABLE:
             return (b"# prometheus_client not installed\n", "text/plain")
         return (generate_latest(), CONTENT_TYPE_LATEST)
+
+    # ---- 结构化快照（后台监控页） ----
+    def snapshot(self) -> dict:
+        """返回当前指标的结构化快照（供后台监控页 JSON 渲染）。
+
+        结构:
+          {"available": true,
+           "histograms": {metric_name: [{"labels": {...}, "count": n, "sum": s, "avg": a}]},
+           "scalars": {metric_name: [{"labels": {...}, "value": v}]}}
+        仅收集 rag_ 前缀指标；直方图省略 bucket 明细（保留 count/sum/avg）。
+        """
+        if not _PROMETHEUS_AVAILABLE:
+            return {"available": False}
+        from prometheus_client import REGISTRY
+        histograms: dict = {}
+        scalars: dict = {}
+        for metric in REGISTRY.collect():
+            name = metric.name
+            if not name.startswith("rag_"):
+                continue
+            if metric.type == "histogram":
+                groups = {}
+                for s in metric.samples:
+                    # 跳过 bucket 明细（count/sum 样本不带 le 标签，自成一组）
+                    if s.name.endswith("_bucket"):
+                        continue
+                    labels = dict(s.labels or {})
+                    key = tuple(sorted(labels.items()))
+                    g = groups.setdefault(key, {"labels": labels, "count": 0, "sum": 0.0})
+                    if s.name.endswith("_count"):
+                        g["count"] = s.value
+                    elif s.name.endswith("_sum"):
+                        g["sum"] = s.value
+                items = []
+                for g in groups.values():
+                    avg = g["sum"] / g["count"] if g["count"] else 0.0
+                    items.append({
+                        "labels": g["labels"],
+                        "count": int(g["count"]),
+                        "sum": round(g["sum"], 4),
+                        "avg": round(avg, 4),
+                    })
+                if items:
+                    histograms[name] = items
+            else:
+                vals = []
+                for s in metric.samples:
+                    vals.append({"labels": dict(s.labels or {}), "value": s.value})
+                if vals:
+                    scalars[name] = vals
+        return {"available": True, "histograms": histograms, "scalars": scalars}
 
 
 # 模块级单例

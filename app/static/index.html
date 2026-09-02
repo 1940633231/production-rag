@@ -99,6 +99,7 @@
   <button data-panel="users">👥 用户</button>
   <button data-panel="roles">🎭 角色</button>
   <button data-panel="audit">🛡 审计日志</button>
+  <button data-panel="metrics">📊 监控</button>
 </nav>
 
 <main id="main" class="hidden">
@@ -231,6 +232,17 @@
     </div>
   </div>
 
+  <!-- ============ 监控 ============ -->
+  <div class="panel" id="panel-metrics">
+    <div class="card">
+      <h3>监控指标 <span class="muted" id="metrics-ts"></span>
+        <button class="btn-sm btn-primary" onclick="loadMetrics()">刷新</button>
+        <label class="muted"><input type="checkbox" id="metrics-auto" checked> 自动刷新（5s）</label>
+      </h3>
+      <div id="metrics-body"><span class="muted">加载中…</span></div>
+    </div>
+  </div>
+
 </main>
 
 <!-- 文档 ACL 弹窗 -->
@@ -336,6 +348,7 @@ async function init() {
 }
 
 /* ---------- 导航 ---------- */
+let metricsTimer = null;
 function switchPanel(name) {
   document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("active", b.dataset.panel === name));
   document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
@@ -346,6 +359,8 @@ function switchPanel(name) {
   if (name === "users") loadUsers();
   if (name === "roles") loadRoles();
   if (name === "audit") loadAudit();
+  if (name === "metrics") { loadMetrics(); if (metricsTimer) clearInterval(metricsTimer); metricsTimer = setInterval(() => { if ($("metrics-auto").checked) loadMetrics(); }, 5000); }
+  else if (metricsTimer) { clearInterval(metricsTimer); metricsTimer = null; }
 }
 document.querySelectorAll("#nav button").forEach(btn => btn.onclick = () => switchPanel(btn.dataset.panel));
 
@@ -693,6 +708,81 @@ async function loadAudit() {
       tb.appendChild(tr);
     });
   } catch (e) { alert("加载审计日志失败: " + e); }
+}
+
+/* ---------- 监控指标 ---------- */
+const METRIC_STAGES = [
+  ["rag_embedding_duration_seconds", "Embedding", ""],
+  ["rag_vector_duration_seconds", "向量检索", ""],
+  ["rag_sparse_duration_seconds", "稀疏检索（BM25/ES）", "当前后端未命中时无数据"],
+  ["rag_rrf_duration_seconds", "RRF 融合", ""],
+  ["rag_rerank_duration_seconds", "Rerank", ""],
+  ["rag_llm_ttft_seconds", "LLM TTFT", "仅流式问答记录"],
+  ["rag_generation_duration_seconds", "LLM 总耗时", ""],
+];
+function fmtDur(v) {
+  if (v == null || isNaN(v)) return "-";
+  return v < 1 ? (v * 1000).toFixed(1) + "ms" : v.toFixed(2) + "s";
+}
+async function loadMetrics() {
+  const body = $("metrics-body");
+  const r = await api("/api/admin/metrics");
+  if (r.status === 403) { body.innerHTML = `<span class="muted">无权限查看监控指标（需 metrics:read，请让管理员授权后重试）</span>`; return; }
+  if (r.status !== 200) { body.innerHTML = `<span class="muted">加载失败: ${esc((r.data && r.data.detail) || r.status)}</span>`; return; }
+  const d = r.data;
+  $("metrics-ts").textContent = "更新于 " + new Date().toLocaleTimeString();
+  const H = d.histograms || {}, S = d.scalars || {};
+  const first = (arr) => (arr && arr.length ? arr[0] : null);
+  const scalar = (name) => { const x = first(S[name]); return x ? x.value : null; };
+
+  // 查询总耗时：P50/P95/P99 + 平均/次数
+  const qh = first(H.rag_query_latency_seconds);
+  const qCount = qh ? qh.count : 0, qAvg = qh ? qh.avg : null;
+  const p50 = scalar("rag_query_latency_p50_seconds");
+  const p95 = scalar("rag_query_latency_p95_seconds");
+  const p99 = scalar("rag_query_latency_p99_seconds");
+  const badge = (v, cls) => `<span class="badge ${cls}">${v == null ? "-" : fmtDur(v)}</span>`;
+
+  const html = [];
+  html.push(`<div class="row" style="gap:8px;flex-wrap:wrap">
+    <div class="badge info">查询次数: ${qCount}</div>
+    <div class="badge ok">平均: ${fmtDur(qAvg)}</div>
+    <div class="badge ok">P50: ${badge(p50, "ok")}</div>
+    <div class="badge err">P95: ${badge(p95, "err")}</div>
+    <div class="badge err">P99: ${badge(p99, "err")}</div>
+  </div>`);
+
+  // 分阶段耗时
+  const stageRows = METRIC_STAGES.map(([name, label, hint]) => {
+    const h = first(H[name]);
+    const v = h ? fmtDur(h.avg) : `<span class="muted" title="${esc(hint || "")}">-</span>`;
+    return `<tr><td>${label}</td><td>${h ? h.count : 0}</td><td>${v}</td></tr>`;
+  }).join("");
+  html.push(`<h4>分阶段耗时（本次启动以来，平均值）</h4>
+    <table><thead><tr><th>阶段</th><th>次数</th><th>平均耗时</th></tr></thead>
+    <tbody>${stageRows}</tbody></table>`);
+
+  // 缓存 / 资源（Counter 的 _total 后缀在采集时被剥掉，key 不带 _total）
+  const cacheHits = scalar("rag_query_cache_hits") || 0;
+  const cacheMisses = scalar("rag_query_cache_misses") || 0;
+  const cacheEntries = scalar("rag_query_cache_entries") || 0;
+  const cacheRate = (cacheHits + cacheMisses) ? (100 * cacheHits / (cacheHits + cacheMisses)).toFixed(1) + "%" : "-";
+  const activeTasks = scalar("rag_active_tasks") || 0;
+  const idxChunks = S.rag_index_chunks || [];
+  const idxRows = idxChunks.map(x => `<tr><td>${esc(x.labels.strategy)}</td><td>${x.value}</td></tr>`).join("")
+    || `<tr><td colspan="2" class="muted">暂无索引数据</td></tr>`;
+  html.push(`<h4>缓存 / 资源</h4>
+    <table><thead><tr><th>项</th><th>值</th></tr></thead><tbody>
+      <tr><td>查询缓存命中</td><td>${cacheHits}</td></tr>
+      <tr><td>查询缓存未命中</td><td>${cacheMisses}</td></tr>
+      <tr><td>缓存命中率</td><td>${cacheRate}</td></tr>
+      <tr><td>缓存条目数</td><td>${cacheEntries}</td></tr>
+      <tr><td>活跃后台任务</td><td>${activeTasks}</td></tr>
+    </tbody></table>
+    <h4>索引 chunk 数</h4>
+    <table><thead><tr><th>策略</th><th>chunk 数</th></tr></thead><tbody>${idxRows}</tbody></table>`);
+
+  body.innerHTML = html.join("");
 }
 
 /* ---------- 初始化 ---------- */

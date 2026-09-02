@@ -25,7 +25,8 @@
 - **稳定 ID 索引**：向量使用显式稳定 ID（chunk_id 哈希），删除按 ID 移除向量、无需全量重建；upload 追加写入不覆盖旧索引
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
-- **管理台 Web UI**：登录鉴权 + 8 面板（问答/上传/文档/索引/任务/用户/角色/审计日志），支持文档 ACL 授权、用户/角色管理、审计查询（`/admin` 或 `/` 跳转）
+- **管理台 Web UI**：登录鉴权 + 9 面板（问答/上传/文档/索引/任务/用户/角色/审计日志/监控），支持文档 ACL 授权、用户/角色管理、审计查询、指标可视化（`/admin` 或 `/` 跳转）
+- **监控指标**：查询总耗时 P50/P95/P99 + 分阶段耗时（Embedding/向量/BM25/RRF/Rerank/LLM TTFT/总耗时）+ 缓存命中率；后台「监控」面板实时快照（`metrics:read` 权限），或 Prometheus + Grafana 监控栈（历史趋势）
 - **Docker 部署**：CPU/GPU 双版本镜像 + docker-compose 一键编排（RAG + MySQL，可选 ES/Milvus）
 - **评估体系**：检索指标（Recall/Precision/MRR/NDCG）+ 生成质量评估（Faithfulness/Relevance，LLM-as-Judge）
 - **评估回归闭环**：基线存档（`--save-baseline`）/ 对比门禁（`--compare`，指标跌破阈值退出码 1）/ 趋势沉淀（trend.csv）
@@ -65,12 +66,12 @@ production-rag/
 │   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document 仓储）
 │   ├── evaluation/           # 评估（检索指标 / 生成质量 / 回归闭环基线门禁趋势）
 │   ├── vector/               # 向量存储（FAISS IndexIDMap2 / Milvus 双后端，显式稳定 ID）
-│   ├── static/               # 管理台 Web UI（登录鉴权 + 8 面板）
+│   ├── static/               # 管理台 Web UI（登录鉴权 + 9 面板）
 │   └── core/                 # 基础设施（config/env/logger/metrics/tracing/task_queue）
 ├── configs/
 │   └── config.yaml           # 主配置文件（含 auth/cache/audit 段）
 ├── .github/workflows/        # CI 门禁（test + eval 检索门禁 + full-eval 全量评测）
-├── docker/                   # Docker 部署（CPU/GPU 双 Dockerfile + docker-compose）
+├── docker/                   # Docker 部署（CPU/GPU 双 Dockerfile + 主编排 + Prometheus/Grafana 监控栈）
 ├── scripts/                  # 命令行脚本
 │   ├── seed_users.py         #   初始化 RBAC/审计/ACL 表 + 创建种子管理员
 │   ├── verify_all.py         #   一键验证脚本（覆盖 5 阶段 19 项检查）
@@ -235,6 +236,17 @@ docker compose -f docker/docker-compose.yml --profile gpu up --build
 - 模型权重缓存（`hf_cache` 卷）与数据（`./data` 挂载）持久化，容器重建不丢失
 - 启用 ES/Milvus：取消 `docker/docker-compose.yml` 中对应服务注释，并在 `configs/config.yaml` 打开对应 `enabled: true`
 
+#### 方式四：Prometheus + Grafana 监控栈（可选）
+
+```bash
+# 前提：RAG 服务已在本机 8001 端口运行（Prometheus 抓 host.docker.internal:8001/metrics）
+docker compose -f docker/docker-compose.monitoring.yml up -d
+```
+
+- Prometheus：http://localhost:9090
+- Grafana：http://localhost:3000（默认 `admin / admin`，已自动导入「RAG 服务监控」面板：查询 P50/P95/P99、各阶段耗时、QPS、缓存命中率、索引 chunk 数）
+- 若 RAG 与监控栈同处一个 compose 网络，改 `docker/prometheus/prometheus.yml` 的 target 为 `rag:8000` 并去掉监控栈 `extra_hosts`
+
 ## 配置说明
 
 主配置文件 `configs/config.yaml`：
@@ -346,6 +358,7 @@ audit:
 | GET/POST | `/api/admin/users` | 用户列表/创建（含租户） | `admin:users` |
 | PATCH/DELETE | `/api/admin/users/{user_id}` | 更新/删除用户 | `admin:users` |
 | GET | `/api/admin/audit-logs` | 审计日志查询（按 action/actor/result 过滤） | `admin:audit` |
+| GET | `/api/admin/metrics` | 指标结构化快照（后台监控页） | `metrics:read` |
 | GET | `/metrics` | Prometheus 指标 | - |
 
 ### 示例：登录并携带 token 调用

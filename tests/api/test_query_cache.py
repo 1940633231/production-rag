@@ -129,6 +129,14 @@ def chat_env(monkeypatch):
             state["calls"] += 1
             return _make_rag_response(query, "答案{}".format(state["calls"]))
 
+        def query_stream(self, query, history=None, document_ids=None):
+            state["calls"] += 1
+            yield {"type": "meta", "chunks": [{"chunk_id": "c1"}],
+                   "stats": {}, "context": "[1] 测试上下文"}
+            yield {"type": "delta", "content": "答案{}".format(state["calls"])}
+            yield {"type": "citations", "citations": [{"number": 1, "chunk_id": "c1"}]}
+            yield {"type": "done", "answer_length": 3}
+
     monkeypatch.setattr(chat, "get_service", lambda **kw: FakeService())
     monkeypatch.setattr(chat, "get_query_cache", lambda config=None: state["cache"])
     return state
@@ -221,3 +229,53 @@ class TestChatCacheIntegration:
 
         assert anon_client.post("/api/chat", headers=headers, json=body).status_code == 200
         assert chat_env["calls"] == 2  # v2 失效 → 重新调用
+
+
+class TestStreamCacheIntegration:
+    def test_stream_miss_then_hit(self, anon_client, make_token, chat_env):
+        """流式未命中 → 正常流式并写缓存；第二次命中 → 从缓存重放，不调 service。"""
+        token = make_token(roles=["viewer"], permissions=["chat:query"])
+        headers = {"Authorization": "Bearer {}".format(token)}
+        body = {"query": "流式缓存问题"}
+
+        r1 = anon_client.post("/api/chat/stream", headers=headers, json=body)
+        assert r1.status_code == 200
+        assert chat_env["calls"] == 1
+        assert "答案1" in r1.text
+
+        r2 = anon_client.post("/api/chat/stream", headers=headers, json=body)
+        assert r2.status_code == 200
+        # 命中缓存：service 未再次调用，答案从缓存重放
+        assert chat_env["calls"] == 1
+        assert "答案1" in r2.text
+
+    def test_stream_shares_cache_with_sync(self, anon_client, make_token, chat_env):
+        """同步写入的缓存，流式可直接命中（同一 key，传输方式无关）。"""
+        token = make_token(roles=["viewer"], permissions=["chat:query"])
+        headers = {"Authorization": "Bearer {}".format(token)}
+        body = {"query": "同步流式共用"}
+
+        r1 = anon_client.post("/api/chat", headers=headers, json=body)
+        assert r1.status_code == 200
+        assert chat_env["calls"] == 1
+
+        # 流式命中同步写入的缓存 → 不再调 service
+        r2 = anon_client.post("/api/chat/stream", headers=headers, json=body)
+        assert r2.status_code == 200
+        assert chat_env["calls"] == 1
+        assert "答案1" in r2.text
+
+    def test_stream_writes_cache_used_by_sync(self, anon_client, make_token, chat_env):
+        """流式写入的缓存，同步可直接命中。"""
+        token = make_token(roles=["viewer"], permissions=["chat:query"])
+        headers = {"Authorization": "Bearer {}".format(token)}
+        body = {"query": "流式写同步读"}
+
+        r1 = anon_client.post("/api/chat/stream", headers=headers, json=body)
+        assert r1.status_code == 200
+        assert chat_env["calls"] == 1
+
+        r2 = anon_client.post("/api/chat", headers=headers, json=body)
+        assert r2.status_code == 200
+        assert chat_env["calls"] == 1
+        assert r2.json()["answer"] == "答案1"

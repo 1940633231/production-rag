@@ -79,6 +79,9 @@ class BM25Search:
         metrics.record_bm25(
             getattr(self, "strategy", "unknown"), time.time() - st
         )
+        metrics.record_sparse(
+            getattr(self, "strategy", "unknown"), time.time() - st
+        )
 
         results = []
 

@@ -84,6 +84,7 @@ class ESFulltextSearch:
         )
 
         try:
+            st = time.time()
             hits = self._es.search(
                 strategy=self.strategy,
                 query=query,
@@ -91,6 +92,8 @@ class ESFulltextSearch:
                 sort_by_vector_id=False,  # 默认按 score 降序
                 document_ids=document_ids,  # 先过滤后检索：ES 端 terms 预过滤
             )
+            from app.core.metrics import metrics
+            metrics.record_sparse(self.strategy, time.time() - st)
         except Exception as e:
             logger.warning(
                 "ES 全文检索异常（返回空结果）: strategy=%s, query=%r, error=%s: %s",

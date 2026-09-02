@@ -1,0 +1,13 @@
+# Grafana 面板预置（自动加载 /var/lib/grafana/dashboards 下的 JSON）
+apiVersion: 1
+
+providers:
+  - name: RAG
+    orgId: 1
+    folder: RAG
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

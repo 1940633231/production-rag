@@ -1,0 +1,16 @@
+# Prometheus 抓取配置：抓取 RAG 服务的 /metrics
+#
+# 默认从 host.docker.internal:8001 抓取（RAG 服务运行在宿主机 8001 端口）。
+# 若 RAG 与 Prometheus 同在一个 compose 网络，把 target 改为服务名，如 rag:8000。
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: rag
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "10.25.241.38:8001"
+        labels:
+          service: production-rag

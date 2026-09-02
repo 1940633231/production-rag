@@ -274,7 +274,8 @@ class RAGPipeline:
             if no_context:
                 stats = dict(stats)
                 stats["no_context"] = True
-            yield {"type": "meta", "chunks": chunks, "stats": stats}
+            # meta 事件带 context：供流式路径写权限感知缓存（与同步响应对齐）
+            yield {"type": "meta", "chunks": chunks, "stats": stats, "context": context}
 
             # 3. 流式生成：无 generator 或检索无上下文时跳过
             if self.generator is None or no_context:

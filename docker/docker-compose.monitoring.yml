@@ -1,0 +1,43 @@
+# 监控栈：Prometheus（抓取 RAG /metrics）+ Grafana（预置 RAG 面板）
+#
+# 前提：RAG 服务已在本机运行（Prometheus 默认抓 host.docker.internal:8001）。
+#   docker compose -f docker/docker-compose.monitoring.yml up -d
+# 访问：
+#   Prometheus  http://localhost:9090
+#   Grafana     http://localhost:3000  （默认 admin / admin，面板已自动导入）
+#
+# 若 RAG 与监控栈同处一个 compose 网络，修改
+# docker/prometheus/prometheus.yml 的 target 为 rag:8000 并去掉本文件的 extra_hosts。
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    container_name: rag-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: rag-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/rag-dashboard.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

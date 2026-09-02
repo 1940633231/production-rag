@@ -1,0 +1,184 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom", "showLegend": true }
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum(rate(rag_query_latency_seconds_bucket[1m])) by (le))", "legendFormat": "P50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(rag_query_latency_seconds_bucket[1m])) by (le))", "legendFormat": "P95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum(rate(rag_query_latency_seconds_bucket[1m])) by (le))", "legendFormat": "P99", "refId": "C" }
+      ],
+      "title": "查询总耗时 P50 / P95 / P99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never" },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "options": {
+        "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom", "showLegend": true }
+      },
+      "targets": [
+        { "expr": "sum(rate(rag_embedding_duration_seconds_sum[1m])) / sum(rate(rag_embedding_duration_seconds_count[1m]))", "legendFormat": "Embedding", "refId": "A" },
+        { "expr": "sum(rate(rag_vector_duration_seconds_sum[1m])) / sum(rate(rag_vector_duration_seconds_count[1m]))", "legendFormat": "向量检索", "refId": "B" },
+        { "expr": "sum(rate(rag_bm25_duration_seconds_sum[1m])) / sum(rate(rag_bm25_duration_seconds_count[1m]))", "legendFormat": "BM25", "refId": "C" },
+        { "expr": "sum(rate(rag_rrf_duration_seconds_sum[1m])) / sum(rate(rag_rrf_duration_seconds_count[1m]))", "legendFormat": "RRF", "refId": "D" },
+        { "expr": "sum(rate(rag_rerank_duration_seconds_sum[1m])) / sum(rate(rag_rerank_duration_seconds_count[1m]))", "legendFormat": "Rerank", "refId": "E" },
+        { "expr": "sum(rate(rag_llm_ttft_seconds_sum[1m])) / sum(rate(rag_llm_ttft_seconds_count[1m]))", "legendFormat": "LLM TTFT", "refId": "F" },
+        { "expr": "sum(rate(rag_generation_duration_seconds_sum[1m])) / sum(rate(rag_generation_duration_seconds_count[1m]))", "legendFormat": "LLM 总耗时", "refId": "G" }
+      ],
+      "title": "各阶段平均耗时",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "text", "value": null },
+              { "color": "#73BF69", "value": 1 }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 8 },
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(rate(rag_query_latency_seconds_count[1m]))", "legendFormat": "QPS", "refId": "A" }
+      ],
+      "title": "查询 QPS",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "#F2CC0C", "value": 0.9 },
+              { "color": "#73BF69", "value": 0.95 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 8 },
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(rag_query_cache_hits_total[1m])) / (sum(rate(rag_query_cache_hits_total[1m])) + sum(rate(rag_query_cache_misses_total[1m])))",
+          "legendFormat": "命中率",
+          "refId": "A"
+        }
+      ],
+      "title": "查询缓存命中率",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 8 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["last"], "displayMode": "list", "placement": "bottom", "showLegend": true }
+      },
+      "targets": [
+        { "expr": "sum(rag_index_chunks) by (strategy)", "legendFormat": "{{strategy}}", "refId": "A" }
+      ],
+      "title": "索引 chunk 数",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineInterpolation": "smooth", "lineWidth": 2, "showPoints": "never" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 15 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom", "showLegend": true }
+      },
+      "targets": [
+        { "expr": "sum(rate(rag_http_requests_total[1m])) by (status)", "legendFormat": "{{status}}", "refId": "A" }
+      ],
+      "title": "HTTP 请求量（按状态码）",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["rag", "production-rag"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "RAG 服务监控",
+  "uid": "rag-overview",
+  "version": 1,
+  "weekStart": ""
+}

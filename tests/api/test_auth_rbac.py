@@ -198,6 +198,27 @@ class TestApiAuthz:
         assert resp.status_code == 200
         assert resp.json() == {"users": [], "total": 0}
 
+    def test_metrics_endpoint_requires_metrics_read(self, anon_client,
+                                                    viewer_token, admin_token):
+        # viewer 无 metrics:read → 403
+        resp = anon_client.get(
+            "/api/admin/metrics",
+            headers={"Authorization": "Bearer {}".format(viewer_token)},
+        )
+        assert resp.status_code == 403
+        assert "权限不足" in resp.json()["detail"]
+
+        # superadmin（全权限）→ 200，返回结构化快照
+        resp = anon_client.get(
+            "/api/admin/metrics",
+            headers={"Authorization": "Bearer {}".format(admin_token)},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["available"] is True
+        assert isinstance(data.get("histograms"), dict)
+        assert isinstance(data.get("scalars"), dict)
+
 
 # ---------------- 登录 ----------------
 

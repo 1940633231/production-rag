@@ -14,6 +14,7 @@ ALL_PERMISSIONS = {
     "admin:users": "用户管理",
     "admin:roles": "角色管理",
     "admin:audit": "审计日志",
+    "metrics:read": "查看监控指标",
 }
 
 # 内置角色（code -> (名称, 权限列表)）。"*" 表示全部权限（superadmin 专用）。
@@ -29,6 +30,7 @@ BUILTIN_ROLES = {
         "admin:users",
         "admin:roles",
         "admin:audit",
+        "metrics:read",
     ]),
     "editor": ("内容编辑", [
         "chat:query",
