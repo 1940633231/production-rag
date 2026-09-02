@@ -97,6 +97,39 @@ def _check_milvus() -> ComponentStatus:
 
 
 
+def _check_redis() -> ComponentStatus:
+    """检查 Redis 连通性（查询缓存后端为 redis 时）。"""
+    from app.core.config import Config
+    config = Config()
+    if config.cache_backend != "redis":
+        return ComponentStatus(status="disabled", detail="cache.backend != redis")
+    try:
+        from app.cache.redis_cache import _REDIS_AVAILABLE
+        if not _REDIS_AVAILABLE:
+            return ComponentStatus(status="error", detail="redis-py 未安装")
+        from app.cache.redis_cache import RedisQueryCache
+        cache = RedisQueryCache(
+            host=config.cache_redis_host,
+            port=config.cache_redis_port,
+            db=config.cache_redis_db,
+            password=config.cache_redis_password,
+            ttl_seconds=config.cache_ttl_seconds,
+            prefix=config.cache_redis_prefix,
+        )
+        if cache.ping():
+            return ComponentStatus(
+                status="ok",
+                detail="redis ping 正常 ({}:{}/{})".format(
+                    config.cache_redis_host,
+                    config.cache_redis_port,
+                    config.cache_redis_db,
+                ),
+            )
+        return ComponentStatus(status="error", detail="redis ping 返回 False")
+    except Exception as e:
+        return ComponentStatus(status="error", detail=str(e))
+
+
 def _check_llm() -> ComponentStatus:
     """按 generation.backend 检查 LLM 后端配置（qwen → DashScope key；openai → base_url + key）。"""
     from app.core.config import Config
@@ -192,6 +225,7 @@ async def health():
         "mysql": _check_mysql,
         "elasticsearch": _check_elasticsearch,
         "milvus": _check_milvus,
+        "redis": _check_redis,
         "llm": _check_llm,
         "embedding": _check_embedding_model,
         "reranker": _check_reranker,

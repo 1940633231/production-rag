@@ -25,9 +25,11 @@ cache:
   max_entries: 2000           # 最大缓存条目数（内存后端 LRU 上限；Redis 依赖 TTL/服务端淘汰）
   backend: redis              # 缓存后端：redis（优先）/ memory；Redis 不可用时自动降级 memory
   redis:
-    host: 172.23.97.35        # Redis 地址
-    port: 6379                # Redis 端口
-    db: 0                     # Redis 逻辑库
+    # Redis 连接地址从环境变量读取（优先级高于下方默认值）：
+    #   REDIS_HOST / REDIS_PORT / REDIS_DB / REDIS_PREFIX
+    host: 172.23.97.35        # 默认地址（可被 REDIS_HOST 覆盖）
+    port: 6379                # 默认端口（可被 REDIS_PORT 覆盖）
+    db: 0                     # 默认逻辑库（可被 REDIS_DB 覆盖）
     password_env: REDIS_PASSWORD  # 可选：从环境变量读 Redis 密码（未设置视为无密码）
     prefix: "rag:qcache:"     # key 前缀（命名空间，便于清理/统计）
 

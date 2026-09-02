@@ -434,19 +434,27 @@ class Config:
 
     @property
     def cache_redis_host(self):
-        return self.cache_redis_config.get("host", "127.0.0.1")
+        """Redis 地址：优先环境变量 REDIS_HOST，回退 config.yaml cache.redis.host。"""
+        import os
+        return os.getenv("REDIS_HOST") or self.cache_redis_config.get("host", "127.0.0.1")
 
     @property
     def cache_redis_port(self):
-        return int(self.cache_redis_config.get("port", 6379))
+        """Redis 端口：优先环境变量 REDIS_PORT，回退 config.yaml cache.redis.port。"""
+        import os
+        return int(os.getenv("REDIS_PORT") or self.cache_redis_config.get("port", 6379))
 
     @property
     def cache_redis_db(self):
-        return int(self.cache_redis_config.get("db", 0))
+        """Redis 逻辑库：优先环境变量 REDIS_DB，回退 config.yaml cache.redis.db。"""
+        import os
+        return int(os.getenv("REDIS_DB") or self.cache_redis_config.get("db", 0))
 
     @property
     def cache_redis_prefix(self):
-        return self.cache_redis_config.get("prefix", "rag:qcache:")
+        """Redis key 前缀：优先环境变量 REDIS_PREFIX，回退 config.yaml cache.redis.prefix。"""
+        import os
+        return os.getenv("REDIS_PREFIX") or self.cache_redis_config.get("prefix", "rag:qcache:")
 
     @property
     def cache_redis_password(self):
