@@ -201,6 +201,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
             use_rerank=req.use_rerank,
             index_version=_index_version(req.strategy, tenant_id),
             history=req.history,
+            document_ids=document_ids,
         )
         cached = cache.get(cache_key)
         if cached is not None:
@@ -316,6 +317,7 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
             use_rerank=req.use_rerank,
             index_version=_index_version(req.strategy, tenant_id),
             history=req.history,
+            document_ids=document_ids,
         )
         cached = cache.get(cache_key)
         if cached is not None:

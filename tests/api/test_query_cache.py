@@ -113,6 +113,17 @@ class TestCacheKey:
         b = self._key(permissions=["knowledge:read", "chat:query"])
         assert a == b
 
+    def test_document_ids_change_key(self):
+        """文档级 ACL 授权变更（可读集合变化）应使缓存 key 变化。"""
+        assert self._key() != self._key(document_ids=set())
+        assert self._key(document_ids=set()) != self._key(document_ids={"doc-a"})
+        assert self._key(document_ids={"doc-a"}) != self._key(
+            document_ids={"doc-a", "doc-b"}
+        )
+
+    def test_document_ids_order_insensitive(self):
+        assert self._key(document_ids={"a", "b"}) == self._key(document_ids=["b", "a"])
+
 
 # ---------------- API 集成 ----------------
 

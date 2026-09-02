@@ -23,7 +23,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from app.core.logger import get_logger
 
@@ -41,6 +41,21 @@ def build_permission_fingerprint(permissions: Optional[List[str]]) -> str:
     return ",".join(sorted(set(permissions)))
 
 
+def build_document_ids_fingerprint(document_ids: Optional[Iterable[str]]) -> str:
+    """可读文档集合指纹：None=不过滤(all)、空集=none、否则排序哈希。
+
+    文档级 ACL 授权变更（grant/revoke）→ 可读文档集合变化 → 指纹变化
+    → 缓存 key 变化 → 旧缓存失效，避免把「无权限时未召回的答案」返回
+    给新授权用户（场景：先无权限查询进缓存，后授予文档权限）。
+    """
+    if document_ids is None:
+        return "all"
+    if not document_ids:
+        return "none"
+    joined = ",".join(sorted(set(document_ids)))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
 def build_query_cache_key(
     *,
     tenant_id: str,
@@ -52,6 +67,7 @@ def build_query_cache_key(
     use_rerank: bool,
     index_version: str,
     history: Optional[List[Dict]] = None,
+    document_ids: Optional[Iterable[str]] = None,
 ) -> str:
     """构造权限感知的查询缓存 key（sha256）。
 
@@ -59,12 +75,16 @@ def build_query_cache_key(
     history 参与哈希（json 归一化），不同对话上下文视为不同请求。
     user_id 参与哈希：文档级 ACL 下不同用户的可读文档集合可能不同，
     避免跨用户共享缓存（permission-aware cache 的用户级隔离）。
+    document_ids 参与哈希：文档级授权变更（ACL grant/revoke）使
+    可读文档集合变化 → key 变化 → 旧缓存失效，防止无权限时的答案
+    被新授权用户命中。
     """
     parts = [
-        "v1",
+        "v2",
         tenant_id or "default",
         user_id or "",
         build_permission_fingerprint(permissions),
+        build_document_ids_fingerprint(document_ids),
         strategy,
         mode,
         str(bool(use_rerank)),
