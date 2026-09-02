@@ -33,13 +33,13 @@ def test_health_checks_run_in_parallel(client, monkeypatch):
         time.sleep(0.3)
         return ComponentStatus(status="disabled", detail="mock-slow")
 
-    # 三个网络组件检查都变慢
-    for name in ("_check_mysql", "_check_elasticsearch", "_check_milvus"):
+    # 四个网络组件检查都变慢（redis 也在其列，避免真实探测拖慢测试）
+    for name in ("_check_mysql", "_check_elasticsearch", "_check_milvus", "_check_redis"):
         monkeypatch.setattr(health, name, slow_check)
 
     start = time.time()
     resp = client.get("/api/health")
     elapsed = time.time() - start
     assert resp.status_code == 200
-    # 串行执行需 3×0.3=0.9s，线程池并行 ≈0.3s；0.7s 足以区分
+    # 串行执行需 4×0.3=1.2s，线程池并行 ≈0.3s；0.7s 足以区分
     assert elapsed < 0.7, "健康检查未并行执行（耗时 {:.2f}s）".format(elapsed)

@@ -60,7 +60,8 @@
         { "expr": "sum(rate(rag_rrf_duration_seconds_sum[1m])) / sum(rate(rag_rrf_duration_seconds_count[1m]))", "legendFormat": "RRF", "refId": "D" },
         { "expr": "sum(rate(rag_rerank_duration_seconds_sum[1m])) / sum(rate(rag_rerank_duration_seconds_count[1m]))", "legendFormat": "Rerank", "refId": "E" },
         { "expr": "sum(rate(rag_llm_ttft_seconds_sum[1m])) / sum(rate(rag_llm_ttft_seconds_count[1m]))", "legendFormat": "LLM TTFT", "refId": "F" },
-        { "expr": "sum(rate(rag_generation_duration_seconds_sum[1m])) / sum(rate(rag_generation_duration_seconds_count[1m]))", "legendFormat": "LLM 总耗时", "refId": "G" }
+        { "expr": "sum(rate(rag_generation_duration_seconds_sum[1m])) / sum(rate(rag_generation_duration_seconds_count[1m]))", "legendFormat": "LLM 总耗时", "refId": "G" },
+        { "expr": "sum(rate(rag_sparse_duration_seconds_sum[1m])) / sum(rate(rag_sparse_duration_seconds_count[1m]))", "legendFormat": "ES 稀疏检索", "refId": "H" }
       ],
       "title": "各阶段平均耗时",
       "type": "timeseries"
