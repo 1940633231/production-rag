@@ -46,7 +46,8 @@ production-rag/
 │   │   ├── chat.py           #   聊天/问答 API（含 SSE 流式）
 │   │   ├── health.py         #   深度健康检查
 │   │   ├── knowledge.py      #   知识库管理（上传/删除/重建/任务/文档 ACL）
-│   │   └── admin.py          #   用户/角色管理 + 审计查询
+│   │   ├── admin.py          #   用户/角色管理 + 审计查询
+│   │   └── __main__.py       #   启动入口（python -m app.api）
 │   ├── auth/                 # 认证与 RBAC（JWT/密码哈希/权限点/登录 API）
 │   ├── acl/                  # 文档级 ACL（document_acl 表 + 授权判定）
 │   ├── audit/                # 审计日志（MySQL 落库 + 401/403 中间件）
@@ -82,14 +83,19 @@ production-rag/
 │   ├── download_cmteb.py     #   下载 C-MTEB T2Retrieval 数据（hf-mirror 国内镜像）
 │   ├── eval_cmteb.py         #   C-MTEB 检索评测（含 embedding 缓存）
 │   ├── cmteb_rerank_diag.py  #   rerank 消融诊断（候选池截断对比）
+│   ├── evaluate_retrieval.py #   检索评测脚本（供 CI 门禁）
 │   ├── query.py              #   命令行查询
-│   └── context_demo.py       #   上下文管理演示
-├── tests/                    # 单元测试（api/auth/tenant/cache/audit/acl/context/rag/...）
+│   ├── context_demo.py       #   上下文管理演示
+│   └── rag_mock_demo.py      #   无外部依赖的 RAG 流程演示（stub 生成器）
+├── tests/                    # 单元测试（api/cache/citation/context/evaluation/generation/ingestion/rag/search/storage）
 ├── data/                     # 运行时数据（索引/原始文件/评测数据集）
 ├── reports/                  # 评估报告输出（baseline/trend/CSV 明细）
 ├── main.py                   # CLI 交互式入口
-├── requirements.txt          # 依赖清单（含 PyJWT/bcrypt 等认证依赖）
-└── .env                      # 环境变量（需自建，参考 .env.example）
+├── setup.py                  # 包安装配置
+├── requirements.txt          # 依赖清单（含 PyJWT/bcrypt/redis/prometheus-client 等）
+├── requirements.lock         # 依赖锁定（精确版本）
+├── .env                      # 环境变量（需自建，参考 .env.example）
+└── .env.example              # 环境变量示例（含 REDIS_*/MYSQL_*/ES_*/MILVUS_*）
 ```
 
 ## 环境要求
@@ -249,23 +255,25 @@ docker compose -f docker/docker-compose.monitoring.yml up -d
 
 ## 配置说明
 
-主配置文件 `configs/config.yaml`：
+主配置文件 `configs/config.yaml`。连接类参数（MySQL / ES / Milvus / Redis / LLM key / JWT 密钥）均可用环境变量覆盖，完整清单见 `.env.example`：
 
 ```yaml
 embedding:
   model_name: BAAI/bge-small-zh-v1.5  # embedding 模型
-  batch_size: 32
+  normalize: true               # 向量归一化（内积 = 余弦相似度）
+  batch_size: 32                # 批量编码大小
 
 vector:
   index_type: ivf        # flat（暴力）/ ivf / hnsw
   ivf_nlist: 128         # IVF 聚类中心数
   ivf_nprobe: 16         # 检索探测聚类数（越大越准越慢）
   hnsw_m: 16             # HNSW 邻居数
+  hnsw_ef_construction: 200  # HNSW 建图候选池
   hnsw_ef_search: 64     # HNSW 检索候选池
 
 chunk:
-  chunk_size: 100   # 每块字符数
-  overlap: 20       # 重叠字符数
+  chunk_size: 800   # 每块字符数
+  overlap: 120      # 重叠字符数
 
 retrieval:
   top_k: 5          # 检索返回数
@@ -278,12 +286,17 @@ rerank:
 context:
   max_context_tokens: 4096  # 上下文 token 预算
   reserved_tokens: 1024     # 给 query+prompt+answer 预留
+  tokenizer_backend: char   # token 计数：char（零依赖）/ tiktoken
   order_strategy: score     # 排序策略：score/document/interleaved
   budget_temperature: 1.0   # 预算加权温度：越小越向高分集中，越大越平均
+  dedup_span_overlap: 0.5   # 同文档 span 重叠 >= 此值判重
+  dedup_jaccard: 0.85       # 跨文档 Jaccard >= 此值判重
+  merge_span_gap: 5         # span 端点 gap <= 此值判为邻接可合并
 
 generation:
   backend: qwen           # stub（占位）/ qwen（DashScope）/ openai（任意 OpenAI 兼容端点）
   model_name: qwen-turbo  # 模型名（backend=openai 时留空则复用此值）
+  api_key_env: DASHSCOPE_API_KEY  # 从环境变量读 API key
   temperature: 0.3
   max_tokens: 1024
   timeout: 60             # LLM API 超时（秒）
@@ -304,11 +317,15 @@ storage:
       enabled: true       # Elasticsearch 全文检索（BM25 后端的生产版）
     milvus:
       enabled: true       # Milvus 向量库（false 时回退本地 FAISS）
+  # 连接参数优先从环境变量读取：
+  #   MYSQL_HOST/PORT/USER/PASSWORD/DATABASE、MILVUS_HOST/PORT/COLLECTION_PREFIX
 
 auth:
   enabled: true                 # 鉴权总开关：false 时跳过 JWT 校验（本地调试）
   jwt_secret: dev-secret-change-me  # JWT 签名密钥（生产用环境变量 JWT_SECRET 覆盖）
+  jwt_secret_env: JWT_SECRET    # 从环境变量读密钥（优先级 > jwt_secret）
   token_expire_hours: 24        # token 有效期（小时）
+  algorithm: HS256              # JWT 签名算法
   seed_username: admin          # 种子账号（scripts/seed_users.py 使用）
   seed_password: admin123
 
@@ -318,11 +335,13 @@ cache:
   max_entries: 2000             # 最大条目数（内存后端 LRU 上限）
   backend: redis                # 缓存后端：redis（优先）/ memory；Redis 不可用时自动降级内存
   redis:
-    host: 172.23.97.35
-    port: 6379
-    db: 0
-    password_env: REDIS_PASSWORD   # 可选：从环境变量读 Redis 密码
-    prefix: "rag:qcache:"
+    # Redis 连接参数从环境变量读取（优先级高于下方默认值）：
+    #   REDIS_HOST / REDIS_PORT / REDIS_DB / REDIS_PREFIX
+    host: 172.23.97.35          # 默认地址（可被 REDIS_HOST 覆盖）
+    port: 6379                  # 默认端口（可被 REDIS_PORT 覆盖）
+    db: 0                       # 默认逻辑库（可被 REDIS_DB 覆盖）
+    password_env: REDIS_PASSWORD   # 可选：从环境变量读 Redis 密码（未设置视为无密码）
+    prefix: "rag:qcache:"       # key 前缀（命名空间，便于清理/统计）
 
 audit:
   enabled: true                 # 审计日志开关
