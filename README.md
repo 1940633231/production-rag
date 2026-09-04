@@ -83,7 +83,6 @@ production-rag/
 │   ├── download_cmteb.py     #   下载 C-MTEB T2Retrieval 数据（hf-mirror 国内镜像）
 │   ├── eval_cmteb.py         #   C-MTEB 检索评测（含 embedding 缓存）
 │   ├── cmteb_rerank_diag.py  #   rerank 消融诊断（候选池截断对比）
-│   ├── evaluate_retrieval.py #   检索评测脚本（供 CI 门禁）
 │   ├── query.py              #   命令行查询
 │   ├── context_demo.py       #   上下文管理演示
 │   └── rag_mock_demo.py      #   无外部依赖的 RAG 流程演示（stub 生成器）
@@ -552,8 +551,7 @@ python -m pytest tests/rag/test_pipeline.py -v           # RAG 编排（多轮/�
 python -m pytest tests/generation/ -v                    # 生成（Multi-Query/并发限流/OpenAI 兼容）
 python -m pytest tests/citation/ -v                      # 引用提取
 # -- 评估 --
-python -m pytest tests/evaluation/test_eval.py -v        # 评估指标
-python -m pytest tests/evaluation/test_recall.py -v      # 检索指标（Recall/MRR/NDCG）
+python -m pytest tests/evaluation/test_eval.py -v        # 评估指标（Precision/MRR/NDCG/生成质量）
 python -m pytest tests/evaluation/test_regression.py -v  # 回归闭环（基线/对比/门禁）
 # -- 存储 --
 python -m pytest tests/storage/test_mysql_crud.py -v     # MySQL CRUD（含稳定 vector_id）
