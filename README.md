@@ -529,22 +529,38 @@ eval/full-eval 均通过 **actions/cache** 复用 corpus embedding（缓存 key 
 python -m pytest tests/ -v
 
 # 运行指定模块测试
+# -- API 层 --
 python -m pytest tests/api/test_auth_rbac.py -v          # 认证/RBAC（JWT/权限门禁）
 python -m pytest tests/api/test_tenant_isolation.py -v   # 租户隔离
-python -m pytest tests/api/test_query_cache.py -v        # 权限感知缓存
-python -m pytest tests/api/test_audit_log.py -v          # 审计日志（401/403/操作记录）
+python -m pytest tests/api/test_query_cache.py -v        # 权限感知缓存（key 含租户/权限/文档指纹）
+python -m pytest tests/api/test_api_audit_log.py -v      # 审计日志（401/403/操作记录）
 python -m pytest tests/api/test_document_acl.py -v       # 文档级 ACL（授权/可见性/删除权限）
 python -m pytest tests/api/test_upload_security.py -v    # 上传安全（路径穿越/大小限制）
+python -m pytest tests/api/test_knowledge_api.py -v      # 知识库 API（上传/删除/重建/任务）
+python -m pytest tests/api/test_health.py -v             # 健康检查（结构 + 并行）
 python -m pytest tests/api/test_e2e.py -v                # 端到端闭环（upload→chat→delete）
-python -m pytest tests/ingestion/test_chunker.py -v     # 分块器
-python -m pytest tests/context/test_context.py -v       # 上下文管理（含加权预算）
-python -m pytest tests/rag/test_pipeline.py -v          # RAG 编排（多轮/改写/多路召回）
-python -m pytest tests/generation/ -v                   # 生成（Multi-Query/并发限流）
-python -m pytest tests/citation/ -v                     # 引用提取
-python -m pytest tests/evaluation/test_eval.py -v       # 评估指标
-python -m pytest tests/storage/test_mysql_crud.py -v    # MySQL CRUD（含稳定 vector_id）
-python -m pytest tests/storage/test_es_crud.py -v       # ES CRUD（稳定 ID 语义）
-python -m pytest tests/storage/test_acl.py -v           # 文档 ACL 仓储（真实 MySQL）
+# -- 缓存 / 核心 --
+python -m pytest tests/cache/test_redis_cache.py -v      # Redis 缓存后端（TTL/降级/统计）
+python -m pytest tests/core/test_metrics.py -v           # Prometheus 指标采集
+# -- 检索链路 --
+python -m pytest tests/search/test_prefilter.py -v       # 先过滤后检索（向量/BM25/ES 预过滤）
+# -- 摄入 / 上下文 / 编排 --
+python -m pytest tests/ingestion/test_chunker.py -v      # 分块器
+python -m pytest tests/context/test_context.py -v        # 上下文管理（含加权预算）
+python -m pytest tests/rag/test_pipeline.py -v           # RAG 编排（多轮/改写/多路召回）
+# -- 生成 / 引用 --
+python -m pytest tests/generation/ -v                    # 生成（Multi-Query/并发限流/OpenAI 兼容）
+python -m pytest tests/citation/ -v                      # 引用提取
+# -- 评估 --
+python -m pytest tests/evaluation/test_eval.py -v        # 评估指标
+python -m pytest tests/evaluation/test_recall.py -v      # 检索指标（Recall/MRR/NDCG）
+python -m pytest tests/evaluation/test_regression.py -v  # 回归闭环（基线/对比/门禁）
+# -- 存储 --
+python -m pytest tests/storage/test_mysql_crud.py -v     # MySQL CRUD（含稳定 vector_id）
+python -m pytest tests/storage/test_es_crud.py -v        # ES CRUD（稳定 ID 语义）
+python -m pytest tests/storage/test_milvus_crud.py -v    # Milvus CRUD（显式 ID 过滤）
+python -m pytest tests/storage/test_acl.py -v            # 文档 ACL 仓储（真实 MySQL）
+python -m pytest tests/storage/test_storage_audit_log.py -v  # 存储层审计日志
 
 # 一键验证脚本（覆盖 5 阶段 19 项检查，先启动服务）
 python scripts/verify_all.py
