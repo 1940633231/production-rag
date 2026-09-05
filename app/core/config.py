@@ -73,6 +73,33 @@ class Config:
         """多路召回总路数（含原始 query），1 或缺失表示关闭。"""
         return self.data.get("retrieval", {}).get("multi_query", 1)
 
+    # ---- Query Scope（可选能力：业务驱动 RAG 过滤）----
+
+    @property
+    def retrieval_scope_config(self):
+        """retrieval.scope 段整体，缺失时返回空 dict。"""
+        return self.data.get("retrieval", {}).get("scope", {})
+
+    @property
+    def scope_enabled(self):
+        """Query Scope 可选能力开关（默认 false：检索不做业务范围过滤）。"""
+        return bool(self.retrieval_scope_config.get("enabled", False))
+
+    @property
+    def scope_mode(self):
+        """scope 实体来源：auto（LLM 从 query 提取）/ explicit（仅显式传入）。"""
+        return str(self.retrieval_scope_config.get("mode", "auto")).lower()
+
+    @property
+    def scope_require_entity(self):
+        """提取不到实体时：true 拒绝 / false 降级为不过滤（默认 false）。"""
+        return bool(self.retrieval_scope_config.get("require_entity", False))
+
+    @property
+    def scope_match_top_k(self):
+        """content 匹配时生成过滤集的文档召回数。"""
+        return int(self.retrieval_scope_config.get("match_top_k", 10))
+
     @property
     def rerank_model(self):
         return self.data["rerank"]["model_name"]

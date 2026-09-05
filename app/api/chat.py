@@ -48,6 +48,9 @@ class ChatRequest(BaseModel):
     mode: str = Field("hybrid", description="检索模式: vector/bm25/hybrid")
     use_rerank: bool = Field(True, description="是否启用 rerank")
     stream: bool = Field(False, description="是否流式返回（SSE）")
+    scope: Optional[str] = Field(
+        None, description="业务范围过滤（Query Scope，可选）：如'公司A'，检索限定到该实体的文档",
+    )
     history: List[Dict] = Field(
         default_factory=list,
         description="多轮对话历史：[{role: user/assistant, content}, ...]，默认空",
@@ -90,6 +93,42 @@ def _get_config():
     """延迟加载 Config，避免 import 时读文件。"""
     from app.core.config import Config
     return Config()
+
+
+def _intersect_ids(acl_ids, scope_ids):
+    """有效过滤集 = ACL 可读集 ∩ scope 过滤集（任一侧 None 表示不设限）。"""
+    if scope_ids is None:
+        return acl_ids
+    if acl_ids is None:
+        return scope_ids
+    return acl_ids & scope_ids
+
+
+def _resolve_scope(config, req, tenant_id):
+    """Query Scope（可选能力）：解析业务范围过滤集。
+
+    返回 (scope_ids, scope_entity)。scope 未启用 → (None, None)。
+    scope_ids 为 None 表示本次不设业务范围过滤（未启用/降级）。
+    """
+    if not config.scope_enabled:
+        return None, None
+    from app.rag.scope import QueryScopeResolver
+
+    resolver = QueryScopeResolver(config)
+    scope_ids = resolver.resolve(
+        req.query, req.scope, req.strategy, tenant_id
+    )
+    return scope_ids, resolver.last_entity
+
+
+def _annotate_scope_stats(stats, config, scope_ids, scope_entity):
+    """提醒作用：在 stats 标注业务范围过滤状态（是否启用/是否实际过滤/实体）。"""
+    stats = dict(stats or {})
+    enabled = bool(config.scope_enabled)
+    stats["scope_enabled"] = enabled
+    stats["scope_used"] = bool(enabled and scope_ids is not None)
+    stats["scope_entity"] = scope_entity or ""
+    return stats
 
 
 # 缓存条目数指标刷新节流（Redis 后端统计需 scan，不宜每次请求执行）
@@ -183,6 +222,10 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
             logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
             document_ids = None
 
+    # ---- Query Scope（可选能力）：业务范围过滤集 ∩ ACL 可读集 ----
+    scope_ids, scope_entity = _resolve_scope(config, req, tenant_id)
+    effective_ids = _intersect_ids(document_ids, scope_ids)
+
     # ---- 权限感知查询缓存：命中直接返回，未命中再实时检索 ----
     cache_enabled = config.cache_enabled
     cache_key = None
@@ -209,7 +252,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
                 use_rerank=req.use_rerank,
                 index_version=index_version,
                 history=req.history,
-                document_ids=document_ids,
+                document_ids=effective_ids,
             )
             cached = cache.get(cache_key)
             if cached is not None:
@@ -238,7 +281,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     t = time.time()
     try:
         response = await run_in_threadpool(
-            service.query, req.query, req.history, document_ids
+            service.query, req.query, req.history, effective_ids
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail="索引文件不存在: {}".format(e))
@@ -255,7 +298,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
         context=response.context,
         chunks=response.chunks,
         citations=response.citations,
-        stats=response.stats,
+        stats=_annotate_scope_stats(response.stats, config, scope_ids, scope_entity),
         elapsed=round(elapsed, 3),
     )
 
@@ -306,6 +349,10 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
             logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
             document_ids = None
 
+    # ---- Query Scope（可选能力）：业务范围过滤集 ∩ ACL 可读集 ----
+    scope_ids, scope_entity = _resolve_scope(config, req, tenant_id)
+    effective_ids = _intersect_ids(document_ids, scope_ids)
+
     # ---- 权限感知查询缓存：流式与同步共用同一套 key（命中重放 / 未命中写入）----
     cache_enabled = config.cache_enabled
     cache_key = None
@@ -333,7 +380,7 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
                 use_rerank=req.use_rerank,
                 index_version=index_version,
                 history=req.history,
-                document_ids=document_ids,
+                document_ids=effective_ids,
             )
             cached = cache.get(cache_key)
             if cached is not None:
@@ -364,12 +411,14 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
         errored = False
         # 用线程池迭代同步生成器，避免阻塞事件循环
         async for event in iterate_in_threadpool(
-            service.query_stream(req.query, req.history, document_ids)
+            service.query_stream(req.query, req.history, effective_ids)
         ):
             evt_type = event.get("type")
             if evt_type == "meta":
                 chunks = event.get("chunks", [])
-                stats = event.get("stats", {})
+                stats = _annotate_scope_stats(
+                    event.get("stats", {}), config, scope_ids, scope_entity
+                )
                 context = event.get("context", "")
                 elapsed = round(time.time() - t, 3)
                 yield {

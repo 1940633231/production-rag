@@ -72,6 +72,10 @@ def mock_deps(monkeypatch):
         storage_es_enabled = False
         storage_milvus_enabled = False
         cache_enabled = False  # e2e 流程关闭查询缓存
+        scope_enabled = False  # Query Scope 关闭（默认）
+        scope_mode = "auto"
+        scope_require_entity = False
+        scope_match_top_k = 10
 
         @staticmethod
         def raw_dir_for(tenant_id="default"):
