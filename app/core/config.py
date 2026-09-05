@@ -73,6 +73,12 @@ class Config:
         """多路召回总路数（含原始 query），1 或缺失表示关闭。"""
         return self.data.get("retrieval", {}).get("multi_query", 1)
 
+    @property
+    def retrieval_multi_query_auto(self):
+        """多路召回按需启用：true 时由 LLM 判断该 query 是否需要多路
+        （需要才扩展，省 LLM 调用/减噪音路；默认 false 保持固定路数）。"""
+        return bool(self.data.get("retrieval", {}).get("multi_query_auto", False))
+
     # ---- Query Scope（可选能力：业务驱动 RAG 过滤）----
 
     @property

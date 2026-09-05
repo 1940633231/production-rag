@@ -295,7 +295,9 @@ class RAGService:
         if generator is not None and self.config.retrieval_multi_query > 1:
             from app.generation.multi_query import MultiQueryExpander
             multi_query_expander = MultiQueryExpander(
-                generator, num_queries=self.config.retrieval_multi_query
+                generator,
+                num_queries=self.config.retrieval_multi_query,
+                auto=self.config.retrieval_multi_query_auto,
             )
 
         logger.info("pipeline 构建完成: 总耗时=%.3fs", time.time() - build_start)

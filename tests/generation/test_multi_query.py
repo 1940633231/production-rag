@@ -77,3 +77,53 @@ class TestMultiQueryExpand:
     def test_num_queries_one_disabled(self):
         exp = MultiQueryExpander(_MockGenerator("a\nb"), num_queries=1)
         assert exp.expand("原问题") == ["原问题"]
+
+
+class TestMultiQueryAuto:
+    """按需启用（auto=true）：LLM 判定是否需要多路召回。"""
+
+    def test_auto_needed_expands(self):
+        exp = MultiQueryExpander(
+            _MockGenerator("近期供需\n价格走势"), num_queries=3, auto=True,
+        )
+        # mock 判定为"需要"
+        exp._judge = lambda q: True
+        result = exp.expand("铁矿供需")
+        assert result == ["铁矿供需", "近期供需", "价格走势"]
+
+    def test_auto_not_needed_single(self):
+        exp = MultiQueryExpander(
+            _MockGenerator("不应被调用的输出"), num_queries=3, auto=True,
+        )
+        exp._judge = lambda q: False
+        assert exp.expand("宝钢股份是哪个公司") == ["宝钢股份是哪个公司"]
+
+    def test_auto_judge_failure_single(self):
+        """判定阶段 LLM 异常 → 回退单路（不再尝试扩展）。"""
+        exp = MultiQueryExpander(_FailingGenerator(), num_queries=3, auto=True)
+        assert exp.expand("复杂对比问题") == ["复杂对比问题"]
+
+    def test_auto_default_off_keeps_behavior(self):
+        """auto 默认 False：不做判定，直接按固定路数扩展（向后兼容）。"""
+        exp = MultiQueryExpander(_MockGenerator("a\nb"), num_queries=3)
+        assert exp.auto is False
+        assert len(exp.expand("原问题")) == 3
+
+
+class TestJudge:
+    def test_judge_parses_need(self):
+        exp = MultiQueryExpander(_MockGenerator("需要"), num_queries=3)
+        assert exp._judge("钢铁行业和煤炭行业对比") is True
+
+    def test_judge_parses_not_need(self):
+        """'不需要' 必须先于 '需要' 匹配（中文子串陷阱）。"""
+        exp = MultiQueryExpander(_MockGenerator("不需要"), num_queries=3)
+        assert exp._judge("宝钢股份总部在哪") is False
+
+    def test_judge_unclear_returns_false(self):
+        exp = MultiQueryExpander(_MockGenerator("也许吧"), num_queries=3)
+        assert exp._judge("随便问问") is False
+
+    def test_judge_exception_returns_false(self):
+        exp = MultiQueryExpander(_FailingGenerator(), num_queries=3)
+        assert exp._judge("对比两家公司财报") is False
