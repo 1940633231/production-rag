@@ -7,7 +7,8 @@
 - **多格式文档摄入**：支持 TXT / HTML / PDF / Word(.docx)，含清洗、分块（固定/递归）、embedding 向量化
 - **混合检索**：向量检索（FAISS）+ BM25 关键词检索 + RRF 融合，支持 Cross-Encoder 重排
 - **先过滤后检索（Permission-aware）**：向量（FAISS IDSelector / Milvus filter）/ BM25 / ES terms 均在可读文档集合内预过滤，不可读内容不参与打分、不占用 top-k 名额
-- **多路召回（Multi-Query）**：LLM 把查询扩展成多个角度子查询，各自检索后按 chunk 合并去重，弥补单查询召回不足
+- **Query Scope（业务驱动 RAG 过滤，可选）**：`retrieval.scope.enabled` 默认关闭；存在“实体竞争”（不同公司/品牌语义相近内容互相污染检索）时启用，显式 scope 或 LLM 提取目标实体 → content 匹配生成文档过滤集，与 ACL 可读集取交集后预过滤；响应 stats 标注业务范围状态，提醒业务驱动
+- **多路召回（Multi-Query）**：LLM 把查询扩展成多个角度子查询，各自检索后按 chunk 合并去重，弥补单查询召回不足；支持**按需启用**（`multi_query_auto`：LLM 先判定该 query 是否需要多路，单实体简单问题直接单路，省调用/减噪音）
 - **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、**分数加权预算**（高分块保留更多内容）、超预算块跳过装填
 - **多轮对话**：`history` 透传 + Query 改写（LLM 指代消解，如"那价格呢"→"铁矿近期价格走势"），改写结果用于检索与生成
 - **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移；解析兼容 `[1,2]`、`【1】` 等多种格式
@@ -15,7 +16,7 @@
 - **流式生成**：基于 LLM 后端的真流式 SSE 输出，首字延迟≈模型开始输出时间
 - **生成可靠性**：超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
 - **多后端持久化**：MySQL 存储文档/chunks（含连接池与 CASCADE 删除）+ Elasticsearch 全文检索 + Milvus 向量库（替代本地 FAISS），均可按开关启用
-- **缓存优化**：embedding/reranker 模型按名复用 + 索引版本号感知，上传/删除后自动刷新索引、不重载模型
+- **缓存优化**：embedding/reranker 模型按名复用 + **索引版本以数据库为唯一权威源**（`index_versions` 表，多活部署各实例全局一致），上传/删除后自动失效缓存、不重载模型
 - **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
 - **认证与 RBAC**：JWT 登录（bcrypt 密码哈希 + PyJWT）、用户/角色/权限点三级模型、`require_permission` 路由门禁、种子账号脚本，业务 API 全部要求 Bearer token
 - **多租户隔离**：`tenant_id` 贯穿 MySQL/ES/Milvus/索引路径/缓存 key，租户间数据完全隔离
@@ -63,8 +64,8 @@ production-rag/
 │   ├── context/              # 上下文管理（builder/compressor/manager）
 │   ├── generation/           # LLM 生成（Stub/Qwen/OpenAI 兼容 + 流式 + 重试 + Query 改写 + Multi-Query）
 │   ├── citation/             # 引用提取（兼容多种括号/分隔符格式）
-│   ├── rag/                  # RAG 编排（pipeline/service）
-│   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document 仓储）
+│   ├── rag/                  # RAG 编排（pipeline/service/scope 业务范围过滤）
+│   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document/索引版本仓储）
 │   ├── evaluation/           # 评估（检索指标 / 生成质量 / 回归闭环基线门禁趋势）
 │   ├── vector/               # 向量存储（FAISS IndexIDMap2 / Milvus 双后端，显式稳定 ID）
 │   ├── static/               # 管理台 Web UI（登录鉴权 + 9 面板）
@@ -277,6 +278,12 @@ chunk:
 retrieval:
   top_k: 5          # 检索返回数
   multi_query: 3    # 多路召回总路数（含原始 query，如 3 = 原始 + 2 个 LLM 扩展），1 表示关闭
+  multi_query_auto: false  # 按需启用多路召回：true 时 LLM 先判定该 query 是否需要多路（需要才扩展）
+  scope:            # Query Scope（可选能力，默认关闭）：业务驱动 RAG 范围过滤
+    enabled: false        # false：检索不做业务范围过滤（纯语义检索）
+    mode: auto            # auto（LLM 从 query 提取实体）/ explicit（仅接收显式传入）
+    require_entity: false # 提取不到实体：false 降级为不过滤 / true 明确报错
+    match_top_k: 10       # 实体→文档集：content 匹配的文档召回数
 
 rerank:
   model_name: BAAI/bge-reranker-base
@@ -357,7 +364,7 @@ audit:
 |------|------|------|--------|
 | POST | `/api/auth/login` | 登录，返回 JWT（内嵌角色+权限） | - |
 | GET | `/api/auth/me` | 当前用户信息（租户/角色/权限） | 登录态 |
-| POST | `/api/chat` | RAG 问答（同步，支持多轮 `history`） | `chat:query` |
+| POST | `/api/chat` | RAG 问答（同步，支持多轮 `history`、可选 `scope` 业务范围过滤） | `chat:query` |
 | POST | `/api/chat/stream` | RAG 问答（SSE 流式） | `chat:query` |
 | GET | `/api/health` | 深度健康检查 | - |
 | POST | `/api/knowledge/upload` | 上传文档并构建索引（限 50MB） | `knowledge:upload` |
@@ -401,6 +408,11 @@ curl -X POST http://localhost:8000/api/chat \
 curl -X POST http://localhost:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"query": "铁矿供需如何？", "strategy": "recursive", "mode": "hybrid", "use_rerank": true}'
+
+# 同步问答（Query Scope：限定业务范围，如只看公司A）
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "铁矿供需如何？", "scope": "公司A"}'
 
 # 流式问答（SSE）
 curl -X POST http://localhost:8000/api/chat/stream \
