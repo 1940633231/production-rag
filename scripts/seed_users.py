@@ -41,6 +41,13 @@ def main():
     MySQLManager().init_schema()
     logger.info("MySQL 表结构初始化完成")
 
+    # 1.5 索引版本迁移：为存量索引初始化版本记录（数据库为唯一权威源）
+    try:
+        from app.storage.index_version_repository import IndexVersionRepository
+        IndexVersionRepository().init_from_disk()
+    except Exception as e:
+        logger.warning("存量索引版本初始化失败（可稍后重跑）: %s", e)
+
     # 2. 内置权限点 + 内置角色（幂等）
     repo = RBACRepository()
     repo.ensure_builtin_roles()

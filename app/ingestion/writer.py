@@ -309,6 +309,7 @@ class IndexWriter:
             len(cleaned_documents), len(chunks),
             mysql_persisted, es_persisted, milvus_persisted,
         )
+        self._bump_version(strategy, tenant_id)
         return result
 
     # ---- 幂等重建 ----
@@ -502,6 +503,8 @@ class IndexWriter:
                 "es_persisted": False,
                 "milvus_persisted": False,
             }
+            # 全文档删除也属于索引变更：登记版本（未走 write 的 bump）
+            self._bump_version(strategy, tenant_id)
 
         result["mysql_deleted"] = mysql_deleted
         result["es_deleted_incremental"] = es_deleted
@@ -617,6 +620,20 @@ class IndexWriter:
                 logger.warning(
                     "ES 删除文档 chunks 失败（可稍后重建索引修复）: %s", e,
                 )
+
+        # 4. 索引版本 +1（数据库唯一权威源；strict：登记失败则删除操作失败）
+        self._bump_version(strategy, tenant_id)
+
+    def _bump_version(self, strategy: str, tenant_id: str) -> None:
+        """索引版本 +1（数据库为唯一权威源；strict：失败抛异常）。
+
+        仅 MySQL 后端启用时登记；未启用（本地纯文件模式）时跳过——
+        此时版本恒为 unknown，查询缓存自动禁用，不影响功能正确性。
+        """
+        if not self.config.storage_mysql_enabled:
+            return
+        from app.storage.index_version_repository import IndexVersionRepository
+        IndexVersionRepository().bump(tenant_id, strategy)
 
     def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str],
                                 tenant_id: str = "default") -> bool:

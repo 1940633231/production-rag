@@ -386,18 +386,27 @@ _cache_lock = threading.Lock()
 
 
 def _index_version(strategy: str, tenant_id: str = "default") -> str:
-    """计算指定 (tenant, strategy) 的索引版本号（metadata.json 的 mtime + size）。
+    """计算指定 (tenant, strategy) 的索引版本号。
 
-    上传/删除/重建都会重写 metadata.json，版本随之变化，
-    使 get_service 能自动感知索引更新，无需清空整个缓存。
+    版本以数据库 index_versions 表为**唯一权威源**（多活部署下各实例
+    全局一致）：上传/删除/重建时 writer bump +1，版本随之变化，
+    使 get_service / 查询缓存能自动感知索引更新。
+
+    strict 模式：DB 未启用 / 无记录 / 查询异常 → 返回 "unknown"，
+    调用方据此禁用查询缓存（宁可慢、不可错，避免命中过期缓存）。
     """
     config = Config()
-    metadata_path = config.index_dir_for(strategy, tenant_id) / "metadata.json"
+    if not config.storage_mysql_enabled:
+        return "unknown"
     try:
-        stat = metadata_path.stat()
-        return "{}:{}".format(stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        return "missing"
+        from app.storage.index_version_repository import IndexVersionRepository
+        version = IndexVersionRepository().get_version(tenant_id, strategy)
+    except Exception as e:
+        logger.warning("索引版本读取失败，标记 unknown: %s", e)
+        return "unknown"
+    if version is None:
+        return "unknown"
+    return str(version)
 
 
 def get_service(

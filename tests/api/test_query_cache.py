@@ -150,6 +150,11 @@ def chat_env(monkeypatch):
 
     monkeypatch.setattr(chat, "get_service", lambda **kw: FakeService())
     monkeypatch.setattr(chat, "get_query_cache", lambda config=None: state["cache"])
+    # 索引版本固定（DB 权威源在测试环境不可用 → 用稳定值保证缓存生效）
+    monkeypatch.setattr(
+        chat, "_index_version",
+        lambda strategy, tenant_id="default": "v1",
+    )
     return state
 
 
@@ -209,6 +214,10 @@ class TestChatCacheIntegration:
         monkeypatch.setattr(
             chat, "get_query_cache",
             lambda config=None: PermissionAwareQueryCache(ttl_seconds=0, max_entries=10),
+        )
+        monkeypatch.setattr(
+            chat, "_index_version",
+            lambda strategy, tenant_id="default": "v1",
         )
 
         token = make_token(roles=["viewer"], permissions=["chat:query"])

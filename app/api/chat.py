@@ -188,30 +188,38 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     cache_key = None
     cache = None
     if cache_enabled:
-        cache = get_query_cache(config)
-        _refresh_cache_entries_metric(cache)
-        permissions = sorted(user.permissions) if user else []
-        cache_key = build_query_cache_key(
-            tenant_id=tenant_id,
-            user_id=user.user_id if user else None,
-            permissions=permissions,
-            query=req.query,
-            strategy=req.strategy,
-            mode=req.mode,
-            use_rerank=req.use_rerank,
-            index_version=_index_version(req.strategy, tenant_id),
-            history=req.history,
-            document_ids=document_ids,
-        )
-        cached = cache.get(cache_key)
-        if cached is not None:
-            from app.core.metrics import metrics
-            metrics.record_cache_hit()
-            logger.info(
-                "API /chat 缓存命中: tenant=%s, query=%r",
+        index_version = _index_version(req.strategy, tenant_id)
+        if index_version == "unknown":
+            # strict：版本权威源（DB）不可用 → 本次禁用缓存，实时检索兜底
+            logger.warning(
+                "索引版本未知（DB 不可用），本次禁用查询缓存: tenant=%s, query=%r",
                 tenant_id, req.query[:60],
             )
-            return ChatResponse(**cached)
+        else:
+            cache = get_query_cache(config)
+            _refresh_cache_entries_metric(cache)
+            permissions = sorted(user.permissions) if user else []
+            cache_key = build_query_cache_key(
+                tenant_id=tenant_id,
+                user_id=user.user_id if user else None,
+                permissions=permissions,
+                query=req.query,
+                strategy=req.strategy,
+                mode=req.mode,
+                use_rerank=req.use_rerank,
+                index_version=index_version,
+                history=req.history,
+                document_ids=document_ids,
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                from app.core.metrics import metrics
+                metrics.record_cache_hit()
+                logger.info(
+                    "API /chat 缓存命中: tenant=%s, query=%r",
+                    tenant_id, req.query[:60],
+                )
+                return ChatResponse(**cached)
 
     from app.core.metrics import metrics
     metrics.record_cache_miss()
@@ -304,29 +312,37 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
     cache = None
     if cache_enabled:
         from app.core.metrics import metrics
-        cache = get_query_cache(config)
-        _refresh_cache_entries_metric(cache)
-        permissions = sorted(user.permissions) if user else []
-        cache_key = build_query_cache_key(
-            tenant_id=tenant_id,
-            user_id=user.user_id if user else None,
-            permissions=permissions,
-            query=req.query,
-            strategy=req.strategy,
-            mode=req.mode,
-            use_rerank=req.use_rerank,
-            index_version=_index_version(req.strategy, tenant_id),
-            history=req.history,
-            document_ids=document_ids,
-        )
-        cached = cache.get(cache_key)
-        if cached is not None:
-            metrics.record_cache_hit()
-            logger.info(
-                "API /chat/stream 缓存命中: tenant=%s, query=%r",
+        index_version = _index_version(req.strategy, tenant_id)
+        if index_version == "unknown":
+            # strict：版本权威源（DB）不可用 → 本次禁用缓存，实时检索兜底
+            logger.warning(
+                "索引版本未知（DB 不可用），本次禁用查询缓存: tenant=%s, query=%r",
                 tenant_id, req.query[:60],
             )
-            return EventSourceResponse(_stream_events_from_cached(cached))
+        else:
+            cache = get_query_cache(config)
+            _refresh_cache_entries_metric(cache)
+            permissions = sorted(user.permissions) if user else []
+            cache_key = build_query_cache_key(
+                tenant_id=tenant_id,
+                user_id=user.user_id if user else None,
+                permissions=permissions,
+                query=req.query,
+                strategy=req.strategy,
+                mode=req.mode,
+                use_rerank=req.use_rerank,
+                index_version=index_version,
+                history=req.history,
+                document_ids=document_ids,
+            )
+            cached = cache.get(cache_key)
+            if cached is not None:
+                metrics.record_cache_hit()
+                logger.info(
+                    "API /chat/stream 缓存命中: tenant=%s, query=%r",
+                    tenant_id, req.query[:60],
+                )
+                return EventSourceResponse(_stream_events_from_cached(cached))
 
     service = get_service(
         config=config,

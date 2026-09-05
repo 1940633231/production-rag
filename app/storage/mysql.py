@@ -232,6 +232,14 @@ class MySQLManager:
                     logger.info("文档级 ACL 表初始化完成: document_acl")
                 except Exception as e:
                     logger.warning("文档级 ACL 表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
+                # 索引版本表（软失败：不影响文档表；数据库为索引版本唯一权威源）
+                try:
+                    from app.storage.index_version_repository import DDL_STATEMENTS as VER_DDL
+                    for ddl in VER_DDL:
+                        cur.execute(ddl)
+                    logger.info("索引版本表初始化完成: index_versions")
+                except Exception as e:
+                    logger.warning("索引版本表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
                 # 迁移：存量 document_acl 补建 → documents 外键（ON DELETE CASCADE）
                 self._migrate_document_acl_fk(cur)
         logger.info("MySQL 表结构初始化完成: documents, chunks")
