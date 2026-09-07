@@ -299,7 +299,7 @@ rerank:
 context:
   max_context_tokens: 4096  # 上下文 token 预算
   reserved_tokens: 1024     # 给 query+prompt+answer 预留
-  tokenizer_backend: char   # token 计数：char（零依赖）/ tiktoken
+  tokenizer_backend: tiktoken   # token 计数：tiktoken（cl100k_base BPE，中英混合更准）/ char（零依赖）
   order_strategy: score     # 排序策略：score/document/interleaved
   budget_temperature: 1.0   # 预算加权温度：越小越向高分集中，越大越平均
   dedup_span_overlap: 0.5   # 同文档 span 重叠 >= 此值判重

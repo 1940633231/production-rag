@@ -73,7 +73,7 @@ chunk:
 # 检索只命中活跃版本；retention=latest 感知为"同名即更新"（P1 仅支持 latest）。
 ingestion:
   document_versioning:
-    enabled: false            # false：同名上传保持现状（行为零变化）
+    enabled: true          # false：同名上传保持现状（行为零变化）
     retention: latest         # latest=只留最新（P1）/ N=保留N版可回溯（P2）
 
 
@@ -102,7 +102,7 @@ rerank:
 context:
   max_context_tokens: 4096      # 模型 context window 总预算
   reserved_tokens: 1024         # 给 query + prompt + answer 预留
-  tokenizer_backend: char       # char（默认零依赖）/ tiktoken（需 pip install tiktoken）
+  tokenizer_backend: tiktoken   # tiktoken（cl100k_base BPE，中英混合更准）/ char（零依赖字符近似）
   order_strategy: score         # score / document / interleaved
   budget_temperature: 1.0       # 预算加权温度：越小越向高分集中，越大越平均
   dedup_span_overlap: 0.5       # 同文档 span 重叠 >= 此值判为重复
