@@ -43,8 +43,13 @@ def create_access_token(
     secret: str,
     expires_hours: int,
     algorithm: str = "HS256",
+    token_version: int = 0,
 ) -> str:
-    """签发 JWT。权限/角色内嵌 token，校验阶段无需查库。"""
+    """签发 JWT。权限/角色内嵌 token，校验阶段无需查库。
+
+    token_version: 用户的吊销版本（users.token_version）。内嵌为 `uv` 声明，
+    鉴权时与 DB 当前版本比对：不一致即拒绝（权限变更后旧 token 即时失效）。
+    """
     now = int(time.time())
     payload = {
         "sub": user_id,
@@ -53,6 +58,7 @@ def create_access_token(
         "tenant_id": tenant_id,
         "roles": list(roles),
         "permissions": sorted(set(permissions)),
+        "uv": int(token_version or 0),
         "iat": now,
         "exp": now + int(expires_hours * 3600),
         "jti": uuid.uuid4().hex,

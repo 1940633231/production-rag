@@ -6,7 +6,7 @@
   - auth.enabled=false 时 get_current_user 返回 None，require_permission 放行（本地调试）
 """
 from dataclasses import dataclass, field
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -31,6 +31,7 @@ class AuthUser:
     roles: list = field(default_factory=list)
     permissions: Set[str] = field(default_factory=set)
     is_superadmin: bool = False
+    token_version: int = 0
 
 
 def _get_config() -> Config:
@@ -70,6 +71,12 @@ def get_current_user(
     roles = list(payload.get("roles") or [])
     perms = set(payload.get("permissions") or [])
     is_superadmin = "superadmin" in roles
+
+    # 吊销版本校验（fail-closed）：token 内嵌 uv 必须等于用户当前 token_version，
+    # 否则说明该用户权限/角色/租户/账号状态已被变更，强制 401 重新登录
+    if getattr(config, "auth_token_version_check", True):
+        _reject_stale_token(payload, payload.get("sub", ""))
+
     return AuthUser(
         user_id=payload.get("sub", ""),
         username=payload.get("username", ""),
@@ -78,7 +85,36 @@ def get_current_user(
         roles=roles,
         permissions=perms,
         is_superadmin=is_superadmin,
+        token_version=int(payload.get("uv", 0) or 0),
     )
+
+
+def _reject_stale_token(payload: Dict, user_id: str) -> None:
+    """比对 token 内嵌 uv 与当前吊销版本；不一致/查无用户一律 401。
+
+    - 无 uv 声明的旧 token → 拒绝（要求重新登录，升级后即时收紧）
+    - 版本不一致 → 拒绝（权限等已变更）
+    - 用户已删除/无效 → 拒绝
+    """
+    expected = payload.get("uv")
+    if expected is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="token 已失效，请重新登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        from app.auth.revocation import get_user_token_version
+        current = get_user_token_version(user_id)
+    except Exception as e:
+        logger.error("吊销版本读取失败，fail-closed 拒绝: %s", e, exc_info=True)
+        current = None
+    if current is None or int(expected) != int(current):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="账户权限已变更，请重新登录",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def require_permission(permission: str):

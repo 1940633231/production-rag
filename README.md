@@ -20,7 +20,7 @@
 - **安全加固（fail-closed）**：文档级 ACL 判定异常时一律**拒绝/查无**（可读文档返回空集、删除授权 deny），杜绝 fail-open 造成的越权读取与越权删除；上传路径穿越防护 + 50MB 流式写盘（边读边写，不整包聚合进内存）
 - **LLM 信任边界（防注入）**：检索上下文与对话历史均按**不可信输入**处理——系统提示词显式声明不执行其中夹带的任何指令（缓解 indirect prompt injection 与伪造历史）；历史清洗（仅最近回合、角色过滤、单条 2000 字 + 总量 8000 字限长）约束注入载荷进入信任层
 - **写入一致性 / 并发**：索引写入持 (strategy, tenant) 级**跨进程写锁**（并发 upload/rebuild 串行，防 FAISS/metadata 竞态）；文档删除按稳定 ID 清理并联调**孤儿可观测**（清理失败 5xx 提示，不静默）；同名覆盖更新失败自动**回滚旧源**（不丢重上传前的源文件）
-- **认证与 RBAC**：JWT 登录（bcrypt 密码哈希 + PyJWT）、用户/角色/权限点三级模型、`require_permission` 路由门禁、种子账号脚本，业务 API 全部要求 Bearer token
+- **认证与 RBAC**：JWT 登录（bcrypt 密码哈希 + PyJWT）、用户/角色/权限点三级模型、`require_permission` 路由门禁、种子账号脚本，业务 API 全部要求 Bearer token；**权限/角色/租户/禁号变更后旧 token 即时失效**（`users.token_version` 吊销版本，鉴权 fail-closed 比对 `uv`，默认 24h 有效期不再「空窗」）
 - **多租户隔离**：`tenant_id` 贯穿 MySQL/ES/Milvus/索引路径/缓存 key，租户间数据完全隔离
 - **文档级 ACL**：`documents.owner_user_id` + `document_acl` 授权表，按 用户/角色 授予 read/write/delete；检索/列表按可读文档过滤，删除按归属校验；删文档/用户/角色时级联清理授权（document_acl 外键 + 代码级）
 - **权限感知缓存**：RAG 结果缓存 key 含 租户+权限指纹+user_id+索引版本，不同租户/权限/用户不串缓存，权限变更或索引重建自动失效；支持**内存（LRU）/ Redis** 双后端，Redis 不可用时自动降级内存
@@ -340,6 +340,7 @@ auth:
   jwt_secret: dev-secret-change-me  # JWT 签名密钥（生产用环境变量 JWT_SECRET 覆盖）
   jwt_secret_env: JWT_SECRET    # 从环境变量读密钥（优先级 > jwt_secret）
   token_expire_hours: 24        # token 有效期（小时）
+  token_version_check: true    # 权限变更即时吊销：旧 token 下次请求 401（需 MySQL 可用）
   algorithm: HS256              # JWT 签名算法
   seed_username: admin          # 种子账号（scripts/seed_users.py 使用）
   seed_password: admin123

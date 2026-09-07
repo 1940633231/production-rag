@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
     display_name  VARCHAR(128)  NOT NULL DEFAULT '',
     tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'default',
     is_active     TINYINT(1)    NOT NULL DEFAULT 1,
+    token_version INT           NOT NULL DEFAULT 0 COMMENT '权限变更吊销版本：token 内嵌 uv 需一致，负责下次请求强制重登',
     created_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id),
@@ -163,7 +164,11 @@ class RBACRepository:
                 return self._get_role_permission_codes(cur, role_code)
 
     def set_role_permissions(self, role_code: str, permission_codes: List[str]) -> None:
-        """整体替换角色权限。"""
+        """整体替换角色权限，并递增所有持有该角色用户的吊销版本。
+
+        角色权限变更会波及所有持有者，因此对持有者整体 bump token_version，
+        使这些用户的旧 token 即时失效。
+        """
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -174,9 +179,14 @@ class RBACRepository:
                         "INSERT IGNORE INTO role_permissions (role_code, permission_code) VALUES (%s, %s)",
                         [(role_code, p) for p in permission_codes],
                     )
+        self.bump_token_version_for_role(role_code)
 
     def delete_role(self, role_code: str) -> int:
-        """删除角色（级联清理 role_permissions / user_roles / 文档级 ACL 角色授权）。"""
+        """删除角色（级联清理 role_permissions / user_roles / 文档级 ACL 角色授权）。
+
+        删除前先对所有持有者递增吊销版本，使其旧 token 即时失效。
+        """
+        self.bump_token_version_for_role(role_code)
         # 角色删除时清理其全部文档授权（principal_id 多态无法用外键约束，代码级清理）
         try:
             from app.acl.repository import ACLRepository
@@ -253,7 +263,11 @@ class RBACRepository:
                 return self._get_user_role_codes(cur, user_id)
 
     def set_user_roles(self, user_id: str, role_codes: List[str]) -> None:
-        """整体替换用户的角色绑定。"""
+        """整体替换用户的角色绑定，并递增该用户的吊销版本（token_version）。
+
+        角色（进而权限）变更后，旧 token 内嵌的 uv 与 DB 不一致，
+        下一次请求即被鉴权层拒绝 → 强制重新登录，权限变更即时生效。
+        """
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM user_roles WHERE user_id = %s", (user_id,))
@@ -262,6 +276,7 @@ class RBACRepository:
                         "INSERT IGNORE INTO user_roles (user_id, role_code) VALUES (%s, %s)",
                         [(user_id, r) for r in role_codes],
                     )
+        self.bump_token_version(user_id)
 
     def get_user_permissions(self, user_id: str) -> Set[str]:
         """用户权限集合。superadmin 拥有全部权限点。"""
@@ -285,7 +300,10 @@ class RBACRepository:
         self, user_id: str, password_hash: Optional[str] = None,
         display_name: Optional[str] = None, is_active: Optional[bool] = None,
     ) -> int:
-        """更新用户字段（仅更新非 None 字段）。"""
+        """更新用户字段（仅更新非 None 字段）。
+
+        禁用账号或改密码属于安全敏感变更，会递增吊销版本使旧 token 即时失效。
+        """
         updates, params = [], []
         if password_hash is not None:
             updates.append("password_hash = %s")
@@ -302,7 +320,53 @@ class RBACRepository:
         params.append(user_id)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
-                return cur.execute(sql, tuple(params))
+                cur.execute(sql, tuple(params))
+        if password_hash is not None or is_active is not None:
+            self.bump_token_version(user_id)
+        return cur.rowcount
+
+    # ---------------- token 吊销版本 ----------------
+
+    def get_user_token_version(self, user_id: str) -> Optional[int]:
+        """读取用户当前 token_version；用户不存在返回 None。"""
+        sql = "SELECT token_version FROM users WHERE user_id = %s"
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (user_id,))
+                row = cur.fetchone()
+        return int(row["token_version"]) if row else None
+
+    def bump_token_version(self, user_id: str) -> int:
+        """递增单个用户的吊销版本（token_version+1），返回新版本。"""
+        sql = "UPDATE users SET token_version = token_version + 1 WHERE user_id = %s"
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (user_id,))
+                cur.execute(
+                    "SELECT token_version FROM users WHERE user_id = %s", (user_id,)
+                )
+                row = cur.fetchone()
+        return int(row["token_version"]) if row else 0
+
+    def bump_token_version_for_role(self, role_code: str) -> int:
+        """递增所有持有某角色的用户的吊销版本，返回受影响行数。
+
+        角色权限变更时调用，使该类用户的旧 token 全部即时失效。
+        """
+        sql = (
+            "UPDATE users u "
+            "JOIN user_roles ur ON ur.user_id = u.user_id "
+            "SET u.token_version = u.token_version + 1 "
+            "WHERE ur.role_code = %s"
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                rows = cur.execute(sql, (role_code,))
+        if rows:
+            logger.info(
+                "角色权限变更，已递增 %d 个用户的吊销版本: role=%s", rows, role_code
+            )
+        return rows
 
     def delete_user(self, user_id: str) -> int:
         """删除用户（级联清理 user_roles 与文档级 ACL 授权）。"""

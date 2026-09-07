@@ -88,6 +88,7 @@ async def login(req: LoginRequest, config: Config = Depends(_get_config),
         secret=config.auth_jwt_secret,
         expires_hours=config.auth_token_expire_hours,
         algorithm=config.auth_algorithm,
+        token_version=int(user.get("token_version", 0) or 0),
     )
     return TokenResponse(
         token=token,

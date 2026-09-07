@@ -456,6 +456,11 @@ class Config:
         return int(self.auth_config.get("token_expire_hours", 24))
 
     @property
+    def auth_token_version_check(self):
+        """是否启用 token 吊销版本校验（权限变更后旧 token 即时失效，fail-closed）。"""
+        return bool(self.auth_config.get("token_version_check", True))
+
+    @property
     def auth_algorithm(self):
         return self.auth_config.get("algorithm", "HS256")
 

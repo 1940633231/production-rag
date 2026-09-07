@@ -123,6 +123,13 @@ _MIGRATE_ADD_STRATEGY = [
     "ALTER TABLE chunks ADD PRIMARY KEY (chunk_id, strategy)",
 ]
 
+# 旧表迁移：为已存在的 users 表补加 token_version 列（权限变更即时吊销 token）
+_MIGRATE_ADD_USER_TOKEN_VERSION = """
+ALTER TABLE users
+    ADD COLUMN token_version INT NOT NULL DEFAULT 0
+    COMMENT '权限变更吊销版本：token 内嵌 uv 需一致，否则强制重登';
+"""
+
 
 class MySQLManager:
     """MySQL 连接管理器：封装连接池和建表逻辑。
@@ -229,6 +236,7 @@ class MySQLManager:
                     for ddl in AUTH_DDL:
                         cur.execute(ddl)
                     logger.info("认证/RBAC 表初始化完成: users, roles, permissions, user_roles, role_permissions")
+                    self._migrate_users_token_version(cur)
                 except Exception as e:
                     logger.warning("认证/RBAC 表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
                 # 审计日志表（软失败：不影响文档表）
@@ -271,6 +279,18 @@ class MySQLManager:
             logger.info("documents 表缺少 current_version 列，执行迁移")
             cur.execute(_MIGRATE_ADD_DOC_VERSION)
             logger.info("documents.current_version 列迁移完成")
+
+    def _migrate_users_token_version(self, cur):
+        """检测 users 表是否有 token_version 列，缺失则 ALTER 补加。
+
+        老库升级为「权限变更即时吊销」时执行；存量用户默认版本 0。
+        """
+        try:
+            cur.execute("SELECT token_version FROM users LIMIT 1")
+        except Exception:
+            logger.info("users 表缺少 token_version 列，执行迁移")
+            cur.execute(_MIGRATE_ADD_USER_TOKEN_VERSION)
+            logger.info("users.token_version 列迁移完成")
 
     def _migrate_chunks_version(self, cur):
         """检测 chunks 表是否有 version 列，缺失则 ALTER 补加。"""

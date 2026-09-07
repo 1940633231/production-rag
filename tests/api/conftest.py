@@ -88,6 +88,17 @@ def raw_dir():
 
 
 @pytest.fixture(autouse=True)
+def _revocation_version_zero(monkeypatch):
+    """单测无 MySQL：将 token 吊销版本读取桩为 0，匹配测试所签 token 的 uv=0。
+
+    真实环境的吊销校验（_reject_stale_token）在 tests/api/test_token_revocation.py
+    单测中显式覆盖；此处仅保证存量 stateless 鉴权测试不依赖数据库。
+    """
+    import app.auth.revocation as rev_mod
+    monkeypatch.setattr(rev_mod, "get_user_token_version", lambda user_id: 0)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_query_cache():
     """每个测试前重置权限感知查询缓存单例，避免跨测试串缓存。"""
     from app.cache.query_cache import reset_query_cache
