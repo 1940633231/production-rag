@@ -106,6 +106,56 @@ class DocumentRepository:
         )
         return rows
 
+    # ---- 文档版本化（活跃版本指针）----
+
+    def get_current_version(self, document_id: str,
+                            tenant_id: Optional[str] = None) -> Optional[int]:
+        """读取文档活跃版本号。无记录返回 None（文档不存在）。"""
+        clause, params = self._tenant_clause(tenant_id)
+        sql = "SELECT current_version FROM {} WHERE document_id = %s{}".format(
+            self.TABLE, clause
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (document_id, *params))
+                row = cur.fetchone()
+        return int(row["current_version"]) if row else None
+
+    def set_current_version(self, document_id: str, new_version: int,
+                            expected_version: Optional[int] = None,
+                            tenant_id: Optional[str] = None) -> bool:
+        """原子切换活跃版本（乐观锁）。
+
+        expected_version 提供时要求当前版本等于该值（并发冲突返回 False）；
+        未提供（首次创建）时直接无条件更新为 new_version。
+        """
+        clause, params = self._tenant_clause(tenant_id)
+        if expected_version is None:
+            sql = "UPDATE {} SET current_version = %s WHERE document_id = %s{}".format(
+                self.TABLE, clause
+            )
+            exec_params = (new_version, document_id, *params)
+        else:
+            sql = (
+                "UPDATE {} SET current_version = %s "
+                "WHERE document_id = %s AND current_version = %s{}"
+            ).format(self.TABLE, clause)
+            exec_params = (new_version, document_id, expected_version, *params)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                rows = cur.execute(sql, exec_params)
+        if rows == 0:
+            logger.warning(
+                "版本切换冲突: doc=%s, expect=%s, new=%s（可能并发上传）",
+                document_id, expected_version, new_version,
+            )
+            return False
+        logger.info(
+            "版本切换成功: doc=%s, %s → %s",
+            document_id, expected_version, new_version,
+        )
+        return True
+
     def count(self, tenant_id: Optional[str] = None) -> int:
         """文档总数。tenant_id 提供时仅统计该租户。"""
         clause, params = self._tenant_clause(tenant_id)

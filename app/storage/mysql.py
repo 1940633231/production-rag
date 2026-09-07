@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS documents (
     file_name      VARCHAR(512)  NOT NULL,
     content_length INT           NOT NULL DEFAULT 0,
     source         VARCHAR(512)  DEFAULT NULL,
+    current_version INT          NOT NULL DEFAULT 1 COMMENT '活跃版本指针（同名文档每次上传=新版本）',
     created_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id),
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     tenant_id     VARCHAR(64)   NOT NULL DEFAULT 'default',
     strategy      VARCHAR(32)   NOT NULL DEFAULT 'recursive',
     vector_id     BIGINT        NOT NULL DEFAULT 0,
+    version       INT           NOT NULL DEFAULT 1 COMMENT '所属文档版本（版本化后 chunk_id 含版本）',
     chunk_index   INT           NOT NULL,
     content       MEDIUMTEXT    NOT NULL,
     start_offset  INT           NOT NULL DEFAULT 0,
@@ -88,9 +90,22 @@ CREATE TABLE IF NOT EXISTS chunks (
     KEY idx_strategy (strategy),
     KEY idx_chunks_tenant (tenant_id, strategy),
     KEY idx_chunks_vector (vector_id),
+    KEY idx_chunks_version (document_id, version),
     CONSTRAINT fk_chunk_document FOREIGN KEY (document_id)
         REFERENCES documents(document_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+# 旧表迁移：为已存在的 documents 表补加 current_version 列（文档版本化）
+_MIGRATE_ADD_DOC_VERSION = """
+ALTER TABLE documents
+    ADD COLUMN current_version INT NOT NULL DEFAULT 1 COMMENT '活跃版本指针';
+"""
+
+# 旧表迁移：为已存在的 chunks 表补加 version 列（文档版本化）
+_MIGRATE_ADD_CHUNK_VERSION = """
+ALTER TABLE chunks
+    ADD COLUMN version INT NOT NULL DEFAULT 1 COMMENT '所属文档版本';
 """
 
 # 旧表迁移：为已存在的 chunks 表补加 id 自增列（保证向量位置顺序可回溯）
@@ -240,9 +255,31 @@ class MySQLManager:
                     logger.info("索引版本表初始化完成: index_versions")
                 except Exception as e:
                     logger.warning("索引版本表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
+                # 迁移：旧表无 current_version 列时补加（文档版本化）
+                self._migrate_documents_version(cur)
+                # 迁移：旧表无 version 列时补加（文档版本化）
+                self._migrate_chunks_version(cur)
                 # 迁移：存量 document_acl 补建 → documents 外键（ON DELETE CASCADE）
                 self._migrate_document_acl_fk(cur)
         logger.info("MySQL 表结构初始化完成: documents, chunks")
+
+    def _migrate_documents_version(self, cur):
+        """检测 documents 表是否有 current_version 列，缺失则 ALTER 补加。"""
+        try:
+            cur.execute("SELECT current_version FROM documents LIMIT 1")
+        except Exception:
+            logger.info("documents 表缺少 current_version 列，执行迁移")
+            cur.execute(_MIGRATE_ADD_DOC_VERSION)
+            logger.info("documents.current_version 列迁移完成")
+
+    def _migrate_chunks_version(self, cur):
+        """检测 chunks 表是否有 version 列，缺失则 ALTER 补加。"""
+        try:
+            cur.execute("SELECT version FROM chunks LIMIT 1")
+        except Exception:
+            logger.info("chunks 表缺少 version 列，执行迁移")
+            cur.execute(_MIGRATE_ADD_CHUNK_VERSION)
+            logger.info("chunks.version 列迁移完成")
 
     def _migrate_document_acl_fk(self, cur):
         """为存量 document_acl 表补建 → documents 的外键（ON DELETE CASCADE）。

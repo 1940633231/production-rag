@@ -63,7 +63,8 @@ class ChunkRepository(BaseChunkRepository):
         t_load = time.time()
         tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
         sql = (
-            "SELECT chunk_id, document_id, vector_id, content, start_offset, end_offset, metadata "
+            "SELECT chunk_id, document_id, vector_id, version, content, "
+            "start_offset, end_offset, metadata "
             "FROM {} WHERE strategy = %s{} ORDER BY id ASC"
         ).format(self.TABLE, tenant_clause)
         rows = []
@@ -122,27 +123,30 @@ class ChunkRepository(BaseChunkRepository):
                metadata: Optional[Dict] = None,
                strategy: Optional[str] = None,
                tenant_id: Optional[str] = None,
-               vector_id: int = 0) -> int:
+               vector_id: int = 0,
+               version: int = 1) -> int:
         """插入单个 chunk（INSERT IGNORE 避免重复）。
 
         strategy 默认取构造函数的 self.strategy；
         tenant_id 默认取 self.tenant_id（None 时写入 'default'）；
-        vector_id 为稳定向量 ID（FAISS/Milvus 显式主键），默认 0。
+        vector_id 为稳定向量 ID（FAISS/Milvus 显式主键），默认 0；
+        version 为所属文档版本（文档版本化），默认 1。
         """
         strat = strategy or self.strategy
         tnt = tenant_id or self.tenant_id or "default"
         sql = (
             "INSERT IGNORE INTO {} "
-            "(chunk_id, document_id, tenant_id, strategy, vector_id, chunk_index, content, "
-            "start_offset, end_offset, metadata) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "(chunk_id, document_id, tenant_id, strategy, vector_id, version, "
+            "chunk_index, content, start_offset, end_offset, metadata) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         ).format(self.TABLE)
         meta_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 rows = cur.execute(
                     sql, (chunk_id, document_id, tnt, strat, int(vector_id),
-                          chunk_index, content, start_offset, end_offset, meta_json)
+                          int(version), chunk_index, content, start_offset,
+                          end_offset, meta_json)
                 )
         return rows
 
@@ -154,7 +158,8 @@ class ChunkRepository(BaseChunkRepository):
         参数 chunks 是 app.ingestion.chunk.Chunk 对象列表。
         strategy 默认取构造函数的 self.strategy；
         tenant_id 默认取 self.tenant_id（None 时写入 'default'）；
-        vector_id 取各 chunk 的 vector_id（稳定 ID）。
+        vector_id 取各 chunk 的 vector_id（稳定 ID）；
+        version 取各 chunk 的 version（文档版本化）。
         """
         if not chunks:
             return 0
@@ -163,14 +168,16 @@ class ChunkRepository(BaseChunkRepository):
         tnt = tenant_id or self.tenant_id or "default"
         sql = (
             "INSERT IGNORE INTO {} "
-            "(chunk_id, document_id, tenant_id, strategy, vector_id, chunk_index, content, "
-            "start_offset, end_offset, metadata) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            "(chunk_id, document_id, tenant_id, strategy, vector_id, version, "
+            "chunk_index, content, start_offset, end_offset, metadata) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
         ).format(self.TABLE)
 
         rows_data = [
             (
-                c.chunk_id, c.document_id, tnt, strat, int(getattr(c, "vector_id", 0) or 0),
+                c.chunk_id, c.document_id, tnt, strat,
+                int(getattr(c, "vector_id", 0) or 0),
+                int(getattr(c, "version", 1) or 1),
                 c.chunk_index, c.content, c.start_offset, c.end_offset,
                 json.dumps(c.metadata, ensure_ascii=False) if c.metadata else None,
             )
@@ -240,27 +247,34 @@ class ChunkRepository(BaseChunkRepository):
         return rows
 
     def get_vector_ids_by_document(self, document_id: str,
-                                   tenant_id: Optional[str] = None) -> List[int]:
-        """返回某文档的全部稳定向量 ID（跨 strategy 去重）。
+                                   tenant_id: Optional[str] = None,
+                                   version: Optional[int] = None) -> List[int]:
+        """返回某文档的稳定向量 ID（跨 strategy 去重）。
 
         删除文档时据此从向量后端 / metadata.json 移除，无需重建索引。
+        version 提供时仅返回该版本的 vector_ids（版本 GC 用）。
         """
         tnt = tenant_id if tenant_id is not None else self.tenant_id
         tenant_clause, tenant_params = self._tenant_clause(tnt)
+        version_clause = ""
+        version_params = []
+        if version is not None:
+            version_clause = " AND version = %s"
+            version_params = [int(version)]
         sql = (
             "SELECT DISTINCT vector_id FROM {} "
-            "WHERE document_id = %s AND vector_id > 0{}"
-        ).format(self.TABLE, tenant_clause)
+            "WHERE document_id = %s AND vector_id > 0{}{}"
+        ).format(self.TABLE, tenant_clause, version_clause)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (document_id, *tenant_params))
+                cur.execute(sql, (document_id, *tenant_params, *version_params))
                 return [int(r["vector_id"]) for r in cur.fetchall()]
 
     # ---- 删除接口 ----
 
     def delete_by_document(self, document_id: str,
                            tenant_id: Optional[str] = None) -> int:
-        """删除某文档的所有 chunks（所有 strategy）。
+        """删除某文档的所有 chunks（所有 strategy、所有版本）。
 
         tenant_id 默认取 self.tenant_id（None 时不按租户过滤）。
         """
@@ -275,6 +289,26 @@ class ChunkRepository(BaseChunkRepository):
         logger.info(
             "删除文档 chunks: doc_id=%s, tenant=%s, affected=%d",
             document_id, tnt if tnt is not None else "*", rows,
+        )
+        # 失效缓存
+        self._cache_list = None
+        self._cache_map = None
+        return rows
+
+    def delete_by_document_version(self, document_id: str, version: int,
+                                   tenant_id: Optional[str] = None) -> int:
+        """删除某文档指定版本的 chunks（版本 GC 用）。"""
+        tnt = tenant_id if tenant_id is not None else self.tenant_id
+        tenant_clause, tenant_params = self._tenant_clause(tnt)
+        sql = (
+            "DELETE FROM {} WHERE document_id = %s AND version = %s{}"
+        ).format(self.TABLE, tenant_clause)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                rows = cur.execute(sql, (document_id, int(version), *tenant_params))
+        logger.info(
+            "删除文档版本 chunks: doc_id=%s, version=%s, tenant=%s, affected=%d",
+            document_id, version, tnt if tnt is not None else "*", rows,
         )
         # 失效缓存
         self._cache_list = None

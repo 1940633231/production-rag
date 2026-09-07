@@ -39,15 +39,20 @@ class IndexWriter:
               tenant_id: str = "default",
               owner_user_id: str = "",
               index_path: Optional[str] = None,
-              metadata_path: Optional[str] = None) -> Dict:
+              metadata_path: Optional[str] = None,
+              version_bump: bool = True) -> Dict:
         """写入文档到所有启用的存储后端。
 
         流程:
           1. Clean → Chunk → Embed
-          2. 写向量后端（Milvus 启用优先 Milvus，失败降级 FAISS）
-          3. 写 metadata.json（始终写入，作为降级兜底）
-          4. 写 MySQL（如果 storage.backends.mysql.enabled，软失败）
-          5. 写 ES（如果 storage.backends.es.enabled，软失败）
+          2. 文档版本化（document_versioning.enabled 时）：每文档解析版本
+             - version_bump=True（upload）：已存在文档 → current_version+1；新文档 → 1
+             - version_bump=False（rebuild/incremental）：保持当前版本（稳定，不 bump）
+          3. 写向量后端（Milvus 启用优先 Milvus，失败降级 FAISS）
+          4. 写 metadata.json（始终写入，作为降级兜底）
+          5. 写 MySQL（如果 storage.backends.mysql.enabled，软失败）
+          6. 写 ES（如果 storage.backends.es.enabled，软失败）
+          7. 版本收尾：原子切换活跃版本指针 + GC 旧版本（retention=latest 同步 GC）
 
         租户隔离:
           - tenant_id 决定索引文件 / MySQL 行 / ES 索引 / Milvus collection 的归属
@@ -64,6 +69,7 @@ class IndexWriter:
             owner_user_id: 上传者 user_id（默认 ''，表示存量/共享文档）
             index_path: FAISS 索引输出路径（None 时按租户自动构造）
             metadata_path: metadata.json 输出路径（None 时按租户自动构造）
+            version_bump: 是否推进文档版本（upload=True；rebuild/incremental=False 保持稳定）
 
         返回:
             {document_count, chunk_count, dimension, documents, chunks,
@@ -148,7 +154,14 @@ class IndexWriter:
             "Chunk 完成: %.3fs, 总 chunks=%d", time.time() - t, len(chunks)
         )
 
-        # 2b. 分配稳定向量 ID（chunk_id 哈希派生）——作为 FAISS/Milvus 显式主键，
+        # 2b. 文档版本化：解析每文档版本（upload bump / rebuild 保持），
+        #     chunk_id 含版本 → 各端隔离（向量/metadata/MySQL/ES 零冲突追加）
+        version_by_doc = self._resolve_doc_versions(
+            cleaned_documents, tenant_id, version_bump
+        )
+        self._apply_version_to_chunks(chunks, version_by_doc)
+
+        # 2c. 分配稳定向量 ID（chunk_id 哈希派生）——作为 FAISS/Milvus 显式主键，
         #     使向量 id 稳定、删除不影响其余向量（无需重建）
         for c in chunks:
             if not c.vector_id:
@@ -266,6 +279,7 @@ class IndexWriter:
                 "chunk_id": c.chunk_id,
                 "document_id": c.document_id,
                 "vector_id": c.vector_id,
+                "version": c.version,
                 "content": c.content,
                 "start_offset": c.start_offset,
                 "end_offset": c.end_offset,
@@ -309,6 +323,8 @@ class IndexWriter:
             len(cleaned_documents), len(chunks),
             mysql_persisted, es_persisted, milvus_persisted,
         )
+        # 版本收尾：原子切换活跃版本指针 + GC 旧版本（retention=latest 同步 GC）
+        self._finalize_versions(version_by_doc, strategy, tenant_id)
         self._bump_version(strategy, tenant_id)
         return result
 
@@ -377,6 +393,7 @@ class IndexWriter:
             owner_user_id=owner_user_id,
             index_path=index_path,
             metadata_path=metadata_path,
+            version_bump=False,
         )
         result["mysql_deleted"] = mysql_deleted
         result["es_dropped"] = es_dropped
@@ -634,6 +651,200 @@ class IndexWriter:
             return
         from app.storage.index_version_repository import IndexVersionRepository
         IndexVersionRepository().bump(tenant_id, strategy)
+
+    # ---- 文档版本化（同名上传 = 新版本，活跃指针切换 + GC）----
+
+    def _versioning_active(self) -> bool:
+        """版本化是否生效：开关开启 + MySQL 后端启用（版本状态权威源）。"""
+        return bool(
+            self.config.document_versioning_enabled
+            and self.config.storage_mysql_enabled
+        )
+
+    def _resolve_doc_versions(self, documents, tenant_id: str,
+                              bump: bool) -> Dict:
+        """解析每文档目标版本：{document_id: version}。
+
+        - bump=True（upload）：已存在文档 → current_version+1（新版本）；
+          新文档 → 1
+        - bump=False（rebuild/incremental）：保持当前版本（不 bump，
+          保证 rebuild 后 vector_id/chunk_id 稳定，ACL 不丢）
+        - 版本化未生效：全部返回 1（chunk_id 保持旧格式，行为零变化）
+        """
+        versions = {d.document_id: 1 for d in documents}
+        if not self._versioning_active():
+            return versions
+        from app.storage import DocumentRepository
+        from app.storage.mysql import MySQLManager
+
+        mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+        doc_repo = DocumentRepository(mgr)
+        for doc in documents:
+            cur = doc_repo.get_current_version(doc.document_id, tenant_id)
+            if cur is None:
+                versions[doc.document_id] = 1
+            elif bump:
+                versions[doc.document_id] = cur + 1
+            else:
+                versions[doc.document_id] = cur
+        return versions
+
+    def _apply_version_to_chunks(self, chunks: List, version_by_doc: Dict) -> None:
+        """版本化 chunk：chunk_id 含版本、重算 vector_id、metadata 带 version。
+
+        幂等：重复执行（rebuild 重新写入同版本）得到相同 chunk_id/vector_id。
+        版本化未启用时：version=1、chunk_id 保持 chunker 生成格式，零变化。
+        """
+        for c in chunks:
+            ver = int(version_by_doc.get(c.document_id, 1) or 1)
+            if self._versioning_active():
+                c.chunk_id = "{0}_v{1}_chunk_{2}".format(
+                    c.document_id, ver, c.chunk_index
+                )
+                c.metadata = dict(c.metadata or {})
+                c.metadata["version"] = ver
+            c.version = ver
+
+    def _finalize_versions(self, version_by_doc: Dict,
+                           strategy: str, tenant_id: str) -> None:
+        """写入完成后收尾：原子切换活跃版本指针 + GC 旧版本。
+
+        P1 仅支持 retention=latest：切换后同步 GC 旧版本各端数据，
+        保证"上传完成 = 只剩活跃版本"，检索无需版本过滤。
+        """
+        if not self._versioning_active():
+            return
+        if self.config.document_versioning_retention != "latest":
+            logger.warning(
+                "document_versioning.retention=%s 暂不支持（P1 仅 latest），跳过版本收尾",
+                self.config.document_versioning_retention,
+            )
+            return
+        from app.storage import ChunkRepository, DocumentRepository
+        from app.storage.mysql import MySQLManager
+
+        mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+        doc_repo = DocumentRepository(mgr)
+        chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
+        for doc_id, new_ver in version_by_doc.items():
+            old_ver = new_ver - 1
+            if old_ver < 1:
+                continue  # 新文档：documents.current_version 已默认 1
+            # 原子切换（乐观锁：current_version 仍为旧值才切，防并发覆盖）
+            ok = doc_repo.set_current_version(
+                doc_id, new_ver, expected_version=old_ver, tenant_id=tenant_id
+            )
+            if not ok:
+                logger.warning(
+                    "版本切换冲突（并发上传），跳过 GC: doc=%s, v=%s",
+                    doc_id, new_ver,
+                )
+                continue
+            self._gc_version(doc_id, old_ver, strategy, tenant_id, chunk_repo)
+
+    def _gc_version(self, doc_id: str, version: int, strategy: str,
+                    tenant_id: str, chunk_repo) -> None:
+        """删除旧版本各端数据（向量/metadata/MySQL/ES）。失败仅告警。"""
+        try:
+            vector_ids = chunk_repo.get_vector_ids_by_document(
+                doc_id, tenant_id=tenant_id, version=version
+            )
+            if vector_ids:
+                self._remove_vectors(vector_ids, strategy, tenant_id)
+            self._remove_metadata(doc_id, version, strategy, tenant_id)
+            chunk_repo.delete_by_document_version(doc_id, version, tenant_id)
+            if self.config.storage_es_enabled:
+                from app.storage.es_repository import ChunkESRepository
+                ChunkESRepository(
+                    strategy=strategy, tenant_id=tenant_id
+                ).delete_by_document_version(doc_id, version)
+            logger.info(
+                "版本 GC 完成: doc=%s, v=%s, vectors=%d",
+                doc_id, version, len(vector_ids),
+            )
+        except Exception as e:
+            logger.warning(
+                "版本 GC 失败（残留数据，可重建修复）: doc=%s, v=%s, %s",
+                doc_id, version, e, exc_info=True,
+            )
+
+    def _remove_vectors(self, vector_ids: List[int], strategy: str,
+                        tenant_id: str) -> None:
+        """按 vector_id 从向量后端（Milvus/FAISS）移除向量。"""
+        if not vector_ids:
+            return
+        if self.config.storage_milvus_enabled:
+            try:
+                from app.vector import create_vector_store
+
+                col = self.config.milvus_collection_for(strategy, tenant_id)
+                store = create_vector_store(
+                    backend="milvus", dimension=1,
+                    host=self.config.milvus_host,
+                    port=self.config.milvus_port,
+                    collection_name=col,
+                )
+                store.load(col)
+                store.remove(vector_ids)
+                logger.info(
+                    "Milvus 移除向量: collection=%s, ids=%d",
+                    col, len(vector_ids),
+                )
+                return
+            except Exception as e:
+                logger.warning(
+                    "Milvus 移除向量失败（可重建修复）: %s", e,
+                )
+                return
+        try:
+            from app.vector import create_vector_store
+
+            index_path = self.config.index_dir_for(strategy, tenant_id) / "faiss.index"
+            if Path(index_path).exists():
+                store = create_vector_store(
+                    backend="faiss", dimension=1,
+                    index_type=self.config.vector_index_type,
+                )
+                store.load(str(index_path))
+                store.remove(vector_ids)
+                store.save(str(index_path))
+                logger.info(
+                    "FAISS 移除向量: path=%s, ids=%d",
+                    index_path, len(vector_ids),
+                )
+        except Exception as e:
+            logger.warning(
+                "FAISS 移除向量失败（可重建修复）: %s", e,
+            )
+
+    def _remove_metadata(self, doc_id: str, version: int, strategy: str,
+                         tenant_id: str) -> None:
+        """从 metadata.json 摘除指定 (document_id, version) 的条目。"""
+        try:
+            from app.storage.metadata_store import MetadataStore
+
+            meta_path = self.config.index_dir_for(strategy, tenant_id) / "metadata.json"
+            if not Path(meta_path).exists():
+                return
+            ms = MetadataStore()
+            entries = ms.load(str(meta_path)) or {}
+            kept = {
+                vid: e for vid, e in entries.items()
+                if not (
+                    e.get("document_id") == doc_id
+                    and int(e.get("version", 1)) == int(version)
+                )
+            }
+            if len(kept) != len(entries):
+                ms.save_entries(kept, str(meta_path))
+                logger.info(
+                    "metadata 摘除版本条目: doc=%s, v=%s, 移除=%d, 剩余=%d",
+                    doc_id, version, len(entries) - len(kept), len(kept),
+                )
+        except Exception as e:
+            logger.warning(
+                "metadata 摘除版本条目失败（可重建修复）: %s", e,
+            )
 
     def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str],
                                 tenant_id: str = "default") -> bool:

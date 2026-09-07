@@ -221,6 +221,27 @@ class Config:
             "model_name"
         ) or self.generation_model
 
+    @property
+    def ingestion_config(self):
+        """ingestion 段整体，缺失时返回空 dict。"""
+        return self.data.get("ingestion", {})
+
+    @property
+    def document_versioning_enabled(self):
+        """文档版本化开关（默认 false：同名上传保持现状，行为零变化）。
+
+        开启后同名文档每次上传 = 新版本（各端隔离写入 + 活跃指针原子切换 +
+        旧版本 GC），检索只命中活跃版本。
+        """
+        vc = self.ingestion_config.get("document_versioning", {})
+        return bool(vc.get("enabled", False))
+
+    @property
+    def document_versioning_retention(self):
+        """版本保留策略：latest（只留最新，感知为"更新"）——P1 仅支持 latest。"""
+        vc = self.ingestion_config.get("document_versioning", {})
+        return str(vc.get("retention", "latest")).lower()
+
     # ---- storage 段（MySQL / ES / Milvus 持久化配置）----
 
     @property

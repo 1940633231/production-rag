@@ -34,3 +34,6 @@ class Chunk:
 
     # 稳定向量 ID（写入链路分配，= vector_id_for(chunk_id)），作为 FAISS/Milvus 显式主键
     vector_id: int = 0
+
+    # 所属文档版本（文档版本化：同名上传=新版本，chunk_id 含版本 → 各端隔离）
+    version: int = 1

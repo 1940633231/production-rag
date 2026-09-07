@@ -108,6 +108,7 @@ class ChunkESRepository(BaseChunkRepository):
                 "strategy": strat,
                 "chunk_index": c.chunk_index,
                 "vector_id": int(getattr(c, "vector_id", 0) or 0),
+                "version": int(getattr(c, "version", 1) or 1),
                 "content": c.content,
                 "start_offset": c.start_offset,
                 "end_offset": c.end_offset,
@@ -132,9 +133,33 @@ class ChunkESRepository(BaseChunkRepository):
                 self._es._client.delete_by_query(
                     index=idx,
                     body={"query": {"term": {"document_id": doc_id}}},
+                    refresh=True,
                 )
-                logger.info("ES 增量删除: doc_id=%s, strategy=%s", doc_id, strat)
         self.batch_insert(chunks, strat)
+
+    def delete_by_document_version(self, document_id: str, version: int):
+        """删除某文档指定版本的 chunks（版本 GC 用）。"""
+        idx = self._es._index_name(self.strategy)
+        self._es._client.delete_by_query(
+            index=idx,
+            body={
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"document_id": document_id}},
+                            {"term": {"version": int(version)}},
+                        ]
+                    }
+                }
+            },
+            refresh=True,
+        )
+        logger.info(
+            "ES 删除文档版本 chunks: strategy=%s, doc=%s, version=%s",
+            self.strategy, document_id, version,
+        )
+        self._cache_list = None
+        self._cache_map = None
 
     def drop_index(self):
         """删除整个 ES 索引（全量重建时使用）。"""
