@@ -242,6 +242,21 @@ class Config:
         vc = self.ingestion_config.get("document_versioning", {})
         return str(vc.get("retention", "latest")).lower()
 
+    @property
+    def write_validation_enabled(self):
+        """发布前校验开关（默认 true）：确认本次 chunks 已写入各启用后端。"""
+        return bool(self.ingestion_config.get("write_validation", {}).get(
+            "enabled", True
+        ))
+
+    @property
+    def write_validation_strict(self):
+        """校验失败策略（默认 true）：strict=抛异常中止发布（版本不切换）；
+        false=仅告警继续发布。"""
+        return bool(self.ingestion_config.get("write_validation", {}).get(
+            "strict", True
+        ))
+
     # ---- storage 段（MySQL / ES / Milvus 持久化配置）----
 
     @property

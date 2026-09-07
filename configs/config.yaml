@@ -75,6 +75,12 @@ ingestion:
   document_versioning:
     enabled: true          # false：同名上传保持现状（行为零变化）
     retention: latest         # latest=只留最新（P1）/ N=保留N版可回溯（P2）
+  # 发布前校验（Build → Validation → Publish 分离）：确认本次 chunks 已写入
+  # 各启用后端（metadata/ES/向量），校验通过才切换版本；失败默认中止发布
+  write_validation:
+    enabled: true          # 校验开关（true=发布前校验）
+    strict: true           # 失败策略：true=中止发布（版本不切换，构建数据待对账/重试）
+                           #           false=仅告警继续发布
 
 
 
