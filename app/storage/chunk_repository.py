@@ -248,47 +248,61 @@ class ChunkRepository(BaseChunkRepository):
 
     def get_vector_ids_by_document(self, document_id: str,
                                    tenant_id: Optional[str] = None,
-                                   version: Optional[int] = None) -> List[int]:
-        """返回某文档的稳定向量 ID（跨 strategy 去重）。
+                                   version: Optional[int] = None,
+                                   strategy: Optional[str] = None) -> List[int]:
+        """返回某文档的稳定向量 ID。
 
         删除文档时据此从向量后端 / metadata.json 移除，无需重建索引。
         version 提供时仅返回该版本的 vector_ids（版本 GC 用）。
+        strategy 提供时仅返回该策略的 vector_ids（策略隔离：同名覆盖/版本化
+        只作用于当前上传策略，不误伤其他策略的索引）。
         """
         tnt = tenant_id if tenant_id is not None else self.tenant_id
         tenant_clause, tenant_params = self._tenant_clause(tnt)
-        version_clause = ""
-        version_params = []
+        extra_clause = ""
+        extra_params = []
         if version is not None:
-            version_clause = " AND version = %s"
-            version_params = [int(version)]
+            extra_clause += " AND version = %s"
+            extra_params.append(int(version))
+        if strategy is not None:
+            extra_clause += " AND strategy = %s"
+            extra_params.append(strategy)
         sql = (
             "SELECT DISTINCT vector_id FROM {} "
             "WHERE document_id = %s AND vector_id > 0{}{}"
-        ).format(self.TABLE, tenant_clause, version_clause)
+        ).format(self.TABLE, tenant_clause, extra_clause)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (document_id, *tenant_params, *version_params))
+                cur.execute(sql, (document_id, *tenant_params, *extra_params))
                 return [int(r["vector_id"]) for r in cur.fetchall()]
 
     # ---- 删除接口 ----
 
     def delete_by_document(self, document_id: str,
-                           tenant_id: Optional[str] = None) -> int:
-        """删除某文档的所有 chunks（所有 strategy、所有版本）。
+                           tenant_id: Optional[str] = None,
+                           strategy: Optional[str] = None) -> int:
+        """删除某文档的 chunks。
 
-        tenant_id 默认取 self.tenant_id（None 时不按租户过滤）。
+        strategy 提供时仅删除该策略下的 chunks（策略隔离：覆盖更新只删
+        当前上传策略）；None 时删除所有策略（文档整体删除场景）。
         """
         tnt = tenant_id if tenant_id is not None else self.tenant_id
         tenant_clause, tenant_params = self._tenant_clause(tnt)
-        sql = "DELETE FROM {} WHERE document_id = %s{}".format(
-            self.TABLE, tenant_clause
+        strategy_clause = ""
+        strategy_params = []
+        if strategy is not None:
+            strategy_clause = " AND strategy = %s"
+            strategy_params = [strategy]
+        sql = "DELETE FROM {} WHERE document_id = %s{}{}".format(
+            self.TABLE, tenant_clause, strategy_clause
         )
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
-                rows = cur.execute(sql, (document_id, *tenant_params))
+                rows = cur.execute(sql, (document_id, *tenant_params, *strategy_params))
         logger.info(
-            "删除文档 chunks: doc_id=%s, tenant=%s, affected=%d",
-            document_id, tnt if tnt is not None else "*", rows,
+            "删除文档 chunks: doc_id=%s, strategy=%s, tenant=%s, affected=%d",
+            document_id, strategy if strategy is not None else "*",
+            tnt if tnt is not None else "*", rows,
         )
         # 失效缓存
         self._cache_list = None
@@ -296,19 +310,31 @@ class ChunkRepository(BaseChunkRepository):
         return rows
 
     def delete_by_document_version(self, document_id: str, version: int,
-                                   tenant_id: Optional[str] = None) -> int:
-        """删除某文档指定版本的 chunks（版本 GC 用）。"""
+                                   tenant_id: Optional[str] = None,
+                                   strategy: Optional[str] = None) -> int:
+        """删除某文档指定版本的 chunks（版本 GC 用）。
+
+        strategy 提供时仅删除该策略的（策略隔离）；None 时删除所有策略。
+        """
         tnt = tenant_id if tenant_id is not None else self.tenant_id
         tenant_clause, tenant_params = self._tenant_clause(tnt)
+        strategy_clause = ""
+        strategy_params = []
+        if strategy is not None:
+            strategy_clause = " AND strategy = %s"
+            strategy_params = [strategy]
         sql = (
-            "DELETE FROM {} WHERE document_id = %s AND version = %s{}"
-        ).format(self.TABLE, tenant_clause)
+            "DELETE FROM {} WHERE document_id = %s AND version = %s{}{}"
+        ).format(self.TABLE, tenant_clause, strategy_clause)
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
-                rows = cur.execute(sql, (document_id, int(version), *tenant_params))
+                rows = cur.execute(
+                    sql, (document_id, int(version), *tenant_params, *strategy_params)
+                )
         logger.info(
-            "删除文档版本 chunks: doc_id=%s, version=%s, tenant=%s, affected=%d",
-            document_id, version, tnt if tnt is not None else "*", rows,
+            "删除文档版本 chunks: doc_id=%s, version=%s, strategy=%s, tenant=%s, affected=%d",
+            document_id, version, strategy if strategy is not None else "*",
+            tnt if tnt is not None else "*", rows,
         )
         # 失效缓存
         self._cache_list = None

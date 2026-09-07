@@ -757,35 +757,28 @@ class IndexWriter:
                     tenant_id: str, chunk_repo) -> None:
         """删除旧版本各端数据（向量/metadata/MySQL/ES）。失败仅告警。
 
-        遍历 fixed + recursive 两个分块策略清理（同一逻辑文档可能同时存在于
-        两种策略索引，且跨策略的 chunk_id/vector_id 相同）：
-          - MySQL：delete_by_document_version 无 strategy 条件 → 一次全删
-          - 向量/metadata/ES：按策略逐个清理（remove 对不存在 id 幂等安全）
+        **策略隔离**：只清理当前上传策略（strategy）的旧版本数据，
+        不误伤其他策略的索引——同名版本化只作用于本次上传的策略。
         """
         try:
             vector_ids = chunk_repo.get_vector_ids_by_document(
-                doc_id, tenant_id=tenant_id, version=version
+                doc_id, tenant_id=tenant_id, version=version, strategy=strategy
             )
-            for strat in ("fixed", "recursive"):
-                try:
-                    if vector_ids:
-                        self._remove_vectors(vector_ids, strat, tenant_id)
-                    self._remove_metadata(doc_id, version, strat, tenant_id)
-                    if self.config.storage_es_enabled:
-                        from app.storage.es_repository import ChunkESRepository
-                        ChunkESRepository(
-                            strategy=strat, tenant_id=tenant_id
-                        ).delete_by_document_version(doc_id, version)
-                except Exception as se:
-                    logger.warning(
-                        "版本 GC 失败（strategy=%s，残留可重建修复）: doc=%s, v=%s, %s",
-                        strat, doc_id, version, se, exc_info=True,
-                    )
-            # MySQL：无 strategy 条件，一次删除该文档该版本的全部 chunks
-            chunk_repo.delete_by_document_version(doc_id, version, tenant_id)
+            if vector_ids:
+                self._remove_vectors(vector_ids, strategy, tenant_id)
+            self._remove_metadata(doc_id, version, strategy, tenant_id)
+            if self.config.storage_es_enabled:
+                from app.storage.es_repository import ChunkESRepository
+                ChunkESRepository(
+                    strategy=strategy, tenant_id=tenant_id
+                ).delete_by_document_version(doc_id, version)
+            # MySQL：只删当前策略该版本 chunks（策略隔离）
+            chunk_repo.delete_by_document_version(
+                doc_id, version, tenant_id, strategy=strategy
+            )
             logger.info(
-                "版本 GC 完成: doc=%s, v=%s, vectors=%d, strategies=fixed,recursive",
-                doc_id, version, len(vector_ids),
+                "版本 GC 完成: doc=%s, v=%s, vectors=%d, strategy=%s",
+                doc_id, version, len(vector_ids), strategy,
             )
         except Exception as e:
             logger.warning(
@@ -896,33 +889,29 @@ class IndexWriter:
 
     def _purge_document(self, doc_id: str, strategy: str, tenant_id: str,
                         chunk_repo) -> None:
-        """清空某文档各端旧内容（全策略、全版本），documents 行保留（ACL 不丢）。"""
+        """清空某文档在当前策略下的旧内容（向量/metadata/MySQL/ES）。
+
+        **策略隔离**：只清理当前上传策略（strategy），不误伤其他策略索引；
+        documents 行保留（ACL 不丢）。MySQL 删除失败抛异常（中止写入，
+        避免半覆盖不一致）；向量/metadata/ES 失败仅告警（可重建修复）。
+        """
         try:
             vector_ids = chunk_repo.get_vector_ids_by_document(
-                doc_id, tenant_id=tenant_id
+                doc_id, tenant_id=tenant_id, strategy=strategy
             )
-            for strat in ("fixed", "recursive"):
-                try:
-                    if vector_ids:
-                        self._remove_vectors(vector_ids, strat, tenant_id)
-                    self._remove_metadata_document(doc_id, strat, tenant_id)
-                    if self.config.storage_es_enabled:
-                        from app.storage.es_repository import ChunkESRepository
-                        ChunkESRepository(
-                            strategy=strat, tenant_id=tenant_id
-                        ).incremental_reindex(
-                            chunks=[], deleted_doc_ids=[doc_id]
-                        )
-                except Exception as se:
-                    logger.warning(
-                        "覆盖清理失败（strategy=%s，孤儿可重建修复）: doc=%s, %s",
-                        strat, doc_id, se, exc_info=True,
-                    )
-            # MySQL chunks：删除失败抛异常（中止写入，避免半覆盖不一致）
-            chunk_repo.delete_by_document(doc_id, tenant_id)
+            if vector_ids:
+                self._remove_vectors(vector_ids, strategy, tenant_id)
+            self._remove_metadata_document(doc_id, strategy, tenant_id)
+            if self.config.storage_es_enabled:
+                from app.storage.es_repository import ChunkESRepository
+                ChunkESRepository(
+                    strategy=strategy, tenant_id=tenant_id
+                ).incremental_reindex(chunks=[], deleted_doc_ids=[doc_id])
+            # MySQL chunks：只删当前策略（策略隔离）；失败抛异常中止写入
+            chunk_repo.delete_by_document(doc_id, tenant_id, strategy=strategy)
             logger.info(
-                "覆盖更新清理完成: doc=%s, vectors=%d, strategies=fixed,recursive",
-                doc_id, len(vector_ids),
+                "覆盖更新清理完成: doc=%s, vectors=%d, strategy=%s",
+                doc_id, len(vector_ids), strategy,
             )
         except Exception as e:
             logger.warning(

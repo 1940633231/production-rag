@@ -203,12 +203,12 @@ class TestGcVersion:
 
         class FakeChunkRepo:
             def get_vector_ids_by_document(self, document_id, tenant_id=None,
-                                           version=None):
+                                           version=None, strategy=None):
                 return [10, 20]
 
             def delete_by_document_version(self, document_id, version,
-                                           tenant_id=None):
-                deleted_db.append((document_id, version))
+                                           tenant_id=None, strategy=None):
+                deleted_db.append((document_id, version, strategy))
 
         monkeypatch.setattr(
             w, "_remove_vectors",
@@ -220,10 +220,10 @@ class TestGcVersion:
                 removed_meta.append((strategy, doc_id, version)),
         )
         w._gc_version("report", 1, "recursive", "default", FakeChunkRepo())
-        # 遍历 fixed + recursive 两个策略清理；MySQL 一次全删
-        assert removed_vectors == [("fixed", [10, 20]), ("recursive", [10, 20])]
-        assert removed_meta == [("fixed", "report", 1), ("recursive", "report", 1)]
-        assert deleted_db == [("report", 1)]
+        # 策略隔离：只清当前策略（recursive），MySQL 按 strategy 过滤
+        assert removed_vectors == [("recursive", [10, 20])]
+        assert removed_meta == [("recursive", "report", 1)]
+        assert deleted_db == [("report", 1, "recursive")]
 
     def test_gc_failure_is_caught(self, monkeypatch):
         cfg = _Cfg()
@@ -281,11 +281,13 @@ class TestOverwritePurge:
         deleted_db = []
 
         class FakeChunkRepo:
-            def get_vector_ids_by_document(self, document_id, tenant_id=None):
+            def get_vector_ids_by_document(self, document_id, tenant_id=None,
+                                           version=None, strategy=None):
                 return [10, 20]
 
-            def delete_by_document(self, document_id, tenant_id=None):
-                deleted_db.append(document_id)
+            def delete_by_document(self, document_id, tenant_id=None,
+                                   strategy=None):
+                deleted_db.append((document_id, strategy))
 
         monkeypatch.setattr(
             w, "_remove_vectors",
@@ -296,10 +298,10 @@ class TestOverwritePurge:
             lambda doc_id, strategy, tenant_id: removed_meta.append((strategy, doc_id)),
         )
         w._purge_document("report", "recursive", "default", FakeChunkRepo())
-        # 跨策略清理 + MySQL 删 chunks（documents 行保留）
-        assert removed_vectors == [("fixed", [10, 20]), ("recursive", [10, 20])]
-        assert removed_meta == [("fixed", "report"), ("recursive", "report")]
-        assert deleted_db == ["report"]
+        # 策略隔离：只清当前策略（recursive）；documents 行保留
+        assert removed_vectors == [("recursive", [10, 20])]
+        assert removed_meta == [("recursive", "report")]
+        assert deleted_db == [("report", "recursive")]
 
     def test_purge_db_failure_raises(self, monkeypatch):
         cfg = _Cfg()
@@ -308,10 +310,11 @@ class TestOverwritePurge:
 
         class BoomChunkRepo:
             def get_vector_ids_by_document(self, document_id, tenant_id=None,
-                                           version=None):
+                                           version=None, strategy=None):
                 return []
 
-            def delete_by_document(self, document_id, tenant_id=None):
+            def delete_by_document(self, document_id, tenant_id=None,
+                                   strategy=None):
                 raise RuntimeError("db down")
 
         # MySQL 删除失败 → 抛异常中止写入（避免半覆盖不一致）
