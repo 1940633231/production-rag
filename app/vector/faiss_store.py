@@ -228,6 +228,12 @@ class FAISSStore(BaseVectorStore):
         faiss.write_index(self.index, path)
         logger.info("FAISS 索引保存: path=%s, type=%s", path, self.index_type)
 
+    def ids(self):
+        """返回索引中全部显式 id 列表（对账/巡检用，按位置顺序）。"""
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        return [int(i) for i in self.index.id_map.tolist()]
+
     def load(self, path):
         t = time.time()
         logger.info("加载 FAISS 索引: %s", path)

@@ -981,85 +981,75 @@ class IndexWriter:
     def _persist_to_mysql(self, documents, chunks, strategy,
                           tenant_id: str = "default",
                           owner_user_id: str = "") -> bool:
-        """将文档和 chunks 写入 MySQL（如果启用）。
+        """将文档和 chunks 写入 MySQL（如果启用）——**提交点严格模式**。
 
         租户隔离：documents/chunks 均写入 tenant_id。
         文档级 ACL：documents 写入 owner_user_id（上传者）。
-        软失败：异常时记 warning 返回 False，不中断写入流程。
+
+        一致性设计（多写无共享事务）：
+          - MySQL（documents + chunks）是「事实源/提交点」：任一步失败即抛异常
+            中止本次写入 —— 上传对外失败、版本不切换，检索看不到半截数据
+          - 派生索引（FAISS/Milvus、metadata、ES）失败不会导致提交点回滚，
+            由对账任务（Reconciler）以 MySQL 为基准最终一致补齐
         """
         if not self.config.storage_mysql_enabled:
             logger.info("MySQL 持久化跳过: storage_mysql_enabled=false")
             return False
 
         t = time.time()
+        from app.storage import DocumentRepository, ChunkRepository
+        from app.storage.mysql import MySQLManager
+
+        mgr = MySQLManager(pool_size=self.config.storage_pool_size)
         try:
-            from app.storage import DocumentRepository, ChunkRepository
-            from app.storage.mysql import MySQLManager
-
-            logger.info(
-                "MySQL 连接: pool_size=%d, host=%s",
-                self.config.storage_pool_size,
-                "from env",
+            mgr.init_schema()
+        except Exception as e:
+            # MySQL 启用但不可用 = 提交点不可用：中止（严格一致，宁可失败不可半截）
+            logger.error(
+                "MySQL 不可用，中止写入（提交点严格模式）: %s", e, exc_info=True,
             )
-            mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+            raise RuntimeError(
+                "MySQL 不可用，无法完成写入（提交点严格模式）。"
+                "请确认 MySQL 服务正常后重试。" 
+            ) from e
+
+        doc_repo = DocumentRepository(mgr)
+        chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
+
+        # documents 行（主记录）：失败中止（版本推进/ACL 依赖它）
+        for doc in documents:
             try:
-                mgr.init_schema()
-            except Exception as e:
-                logger.info("MySQL 连接失败: {}。请确认 MySQL 服务运行中且环境变量已配置。".format(e))
-                return False
-
-            doc_repo = DocumentRepository(mgr)
-            chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
-
-            # 逐个插入文档，记录每个结果
-            doc_inserted = 0
-            for doc in documents:
-                try:
-                    doc_repo.insert(
-                        document_id=doc.document_id,
-                        file_name=doc.metadata.get("source", doc.document_id),
-                        content_length=len(doc.content),
-                        source=doc.metadata.get("source"),
-                        tenant_id=tenant_id,
-                        owner_user_id=owner_user_id,
-                    )
-                    doc_inserted += 1
-                except Exception as de:
-                    logger.warning(
-                        "MySQL 文档插入失败: doc_id=%s, tenant=%s, %s",
-                        doc.document_id, tenant_id, de, exc_info=True,
-                    )
-            logger.info(
-                "MySQL 文档插入: 成功=%d/%d", doc_inserted, len(documents)
-            )
-
-            # 批量插入 chunks
-            try:
-                chunk_repo.batch_insert(chunks)
-                logger.info(
-                    "MySQL chunks 批量插入成功: strategy=%s, tenant=%s, chunks=%d",
-                    strategy, tenant_id, len(chunks),
+                doc_repo.insert(
+                    document_id=doc.document_id,
+                    file_name=doc.metadata.get("source", doc.document_id),
+                    content_length=len(doc.content),
+                    source=doc.metadata.get("source"),
+                    tenant_id=tenant_id,
+                    owner_user_id=owner_user_id,
                 )
-            except Exception as ce:
-                logger.warning(
-                    "MySQL chunks 批量插入失败: strategy=%s, tenant=%s, chunks=%d, %s",
-                    strategy, tenant_id, len(chunks), ce, exc_info=True,
+            except Exception as de:
+                logger.error(
+                    "MySQL 文档插入失败，中止写入（提交点）: doc_id=%s, tenant=%s, %s",
+                    doc.document_id, tenant_id, de, exc_info=True,
                 )
                 raise
 
-            logger.info(
-                "MySQL 持久化完成: %.3fs, strategy=%s, tenant=%s, docs=%d, chunks=%d",
-                time.time() - t, strategy, tenant_id, doc_inserted, len(chunks),
+        # chunks（主记录）：失败中止
+        try:
+            chunk_repo.batch_insert(chunks)
+        except Exception as ce:
+            logger.error(
+                "MySQL chunks 批量插入失败，中止写入（提交点）: "
+                "strategy=%s, tenant=%s, chunks=%d, %s",
+                strategy, tenant_id, len(chunks), ce, exc_info=True,
             )
-            return True
-        except Exception as e:
-            logger.warning(
-                "MySQL 持久化失败（不影响索引）: strategy=%s, tenant=%s, docs=%d, chunks=%d, "
-                "error=%s: %s",
-                strategy, tenant_id, len(documents), len(chunks),
-                type(e).__name__, e, exc_info=True,
-            )
-            return False
+            raise
+
+        logger.info(
+            "MySQL 持久化完成（提交点提交）: %.3fs, strategy=%s, tenant=%s, docs=%d, chunks=%d",
+            time.time() - t, strategy, tenant_id, len(documents), len(chunks),
+        )
+        return True
 
     def _cleanup_mysql(self, strategy, tenant_id: str = "default") -> int:
         """删除指定 strategy（+tenant）的所有 chunks（重建前清理）。
