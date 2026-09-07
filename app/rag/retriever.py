@@ -75,24 +75,66 @@ class Retriever:
             getattr(self, "strategy", "unknown"), time.time() - vt
         )
 
+        return self._assemble(scores, ids, document_ids)
+
+    def search_batch(self, queries, per_query, document_ids=None):
+        """批量多路检索：一次 encode 所有 query，各路向量检索后返回。
+
+        返回 List[List[Dict]]（与 queries 一一对应），供多路召回合并去重。
+        关键收益：多路召回从「N 次模型调用」降为「1 次 batch 调用」，
+        且无并发调用 embedding 的线程安全风险。
+        """
+        from app.core.metrics import metrics
+
+        t = time.time()
+        queries = list(queries)
+        logger.info(
+            "批量向量检索开始: 路数=%d, per_query=%d", len(queries), per_query,
+        )
+
+        # 一次批量 encode 所有 query（batch）
+        et = time.time()
+        query_vectors = self.embedding_model.encode(queries)
+        metrics.record_embedding(
+            getattr(self, "strategy", "unknown"), time.time() - et
+        )
+
+        # 先过滤后检索：可读文档 → 允许向量集合（各路共用一次翻译）
+        vector_ids = None
+        if document_ids is not None:
+            vector_ids = self._document_vector_ids(document_ids)
+
+        # 各路向量检索（向量库检索本身快，循环即可；embedding 已是单次 batch）
+        vt = time.time()
+        all_results = []
+        for qv in query_vectors:
+            scores, ids = self.vector_store.search(
+                qv, per_query, vector_ids=vector_ids
+            )
+            all_results.append(self._assemble(scores, ids, document_ids))
+        metrics.record_vector(
+            getattr(self, "strategy", "unknown"), time.time() - vt
+        )
+        logger.info(
+            "批量向量检索完成: %.3fs, 路数=%d, 合计候选=%d",
+            time.time() - t, len(queries), sum(len(r) for r in all_results),
+        )
+        return all_results
+
+    def _assemble(self, scores, ids, document_ids):
+        """把向量检索结果组装为 chunk dict 列表（LRU 缓存 + ACL 兜底）。"""
         results = []
-
         for score, index in zip(scores[0], ids[0]):
-
             if index < 0:
                 continue
-
             idx = int(index)
-
             # LRU 缓存：命中则跳过 chunk_repo 查询
             if idx not in self._cache:
                 self._cache[idx] = self.chunk_repo.get_by_id(idx)
-
             document = self._cache[idx]
             if document is None:
                 logger.warning("chunk_repo 未找到 vector_id=%d，跳过", idx)
                 continue
-
             # 文档级 ACL 兜底：预过滤后仍只返回可读文档（防御性校验）
             if document_ids is not None:
                 doc_id = document.get("document_id")
@@ -102,7 +144,6 @@ class Retriever:
                         idx, doc_id,
                     )
                     continue
-
             results.append(
                 {
                     "vector_id": idx,
@@ -114,10 +155,4 @@ class Retriever:
                     "metadata": document["metadata"],
                 }
             )
-
-        logger.info(
-            "向量检索完成: %.3fs, 结果数=%d, top_score=%.4f",
-            time.time() - t, len(results),
-            results[0]["score"] if results else 0,
-        )
         return results

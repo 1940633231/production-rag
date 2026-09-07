@@ -148,12 +148,27 @@ class RAGPipeline:
         per_query = max(per_query, 1)
         merged: List[Dict] = []
         seen = set()
-        for q in queries:
-            for r in self.retriever.search(q, top_k=per_query, document_ids=document_ids):
+
+        def _merge(route_results: List[Dict]):
+            """按 chunk_id 去重合并一路结果。"""
+            for r in route_results:
                 cid = r.get("chunk_id")
                 if cid is None or cid not in seen:
                     seen.add(cid)
                     merged.append(r)
+
+        # 批量多路检索：向量 Retriever 支持 search_batch（一次 batch encode 所有路，
+        # 多路召回从 N 次模型调用降为 1 次）；BM25/ES/Hybrid 无则回退逐路 search
+        if hasattr(self.retriever, "search_batch"):
+            for route_results in self.retriever.search_batch(
+                queries, per_query, document_ids=document_ids
+            ):
+                _merge(route_results)
+        else:
+            for q in queries:
+                _merge(self.retriever.search(
+                    q, top_k=per_query, document_ids=document_ids
+                ))
         logger.info("多路检索合并: %d 路 → %d 候选", len(queries), len(merged))
         return merged
 
