@@ -417,19 +417,25 @@ def get_service(
     mode: str = "vector",
     use_rerank: bool = True,
     tenant_id: str = "default",
+    index_version: Optional[str] = None,
 ) -> RAGService:
     """获取缓存的 RAGService 单例。
 
-    缓存 key 含索引版本号（metadata.json 的 mtime+size）与 tenant_id：
+    缓存 key 含索引版本号（数据库 index_versions 表为权威源）与 tenant_id：
       - 配置不变、索引未变：直接复用（模型 + 索引均在内存）
       - 索引变更（上传/删除/重建）：自动构建新 service，
         模型从 _embedding_cache/_reranker_cache 复用，不重复加载权重
       - 租户隔离：不同 tenant 使用独立的 service 与索引（permission-aware cache）
 
+    index_version: 调用方已计算的索引版本（如 chat 端点构造缓存 key 时），
+        传入可避免同一请求对 DB 的重复查询；None 时内部计算。
+
     注意：auth 关闭或默认租户时 tenant_id='default'，缓存行为与旧版一致。
     """
     _config = config or Config()
-    version = _index_version(strategy, tenant_id)
+    version = index_version if index_version is not None else _index_version(
+        strategy, tenant_id
+    )
     key = (strategy, mode, use_rerank, _config.storage_milvus_enabled, tenant_id, version)
     with _cache_lock:
         if key not in _service_cache:

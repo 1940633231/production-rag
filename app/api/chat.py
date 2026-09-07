@@ -230,8 +230,9 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     cache_enabled = config.cache_enabled
     cache_key = None
     cache = None
+    # 索引版本：同一请求只查一次（缓存 key 与 service key 共用，避免双查 DB）
+    index_version = _index_version(req.strategy, tenant_id)
     if cache_enabled:
-        index_version = _index_version(req.strategy, tenant_id)
         if index_version == "unknown":
             # strict：版本权威源（DB）不可用 → 本次禁用缓存，实时检索兜底
             logger.warning(
@@ -273,6 +274,7 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
         mode=req.mode,
         use_rerank=req.use_rerank,
         tenant_id=tenant_id,
+        index_version=index_version,
     )
 
     # RAG 查询为同步阻塞（embedding + rerank + LLM），用线程池避免阻塞事件循环
@@ -357,9 +359,10 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
     cache_enabled = config.cache_enabled
     cache_key = None
     cache = None
+    # 索引版本：同一请求只查一次（缓存 key 与 service key 共用，避免双查 DB）
+    index_version = _index_version(req.strategy, tenant_id)
     if cache_enabled:
         from app.core.metrics import metrics
-        index_version = _index_version(req.strategy, tenant_id)
         if index_version == "unknown":
             # strict：版本权威源（DB）不可用 → 本次禁用缓存，实时检索兜底
             logger.warning(
@@ -397,6 +400,7 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
         mode=req.mode,
         use_rerank=req.use_rerank,
         tenant_id=tenant_id,
+        index_version=index_version,
     )
 
     async def event_generator():
