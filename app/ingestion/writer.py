@@ -40,19 +40,22 @@ class IndexWriter:
               owner_user_id: str = "",
               index_path: Optional[str] = None,
               metadata_path: Optional[str] = None,
-              version_bump: bool = True) -> Dict:
+              version_bump: bool = True,
+              overwrite_existing: bool = True) -> Dict:
         """写入文档到所有启用的存储后端。
 
         流程:
           1. Clean → Chunk → Embed
-          2. 文档版本化（document_versioning.enabled 时）：每文档解析版本
-             - version_bump=True（upload）：已存在文档 → current_version+1；新文档 → 1
-             - version_bump=False（rebuild/incremental）：保持当前版本（稳定，不 bump）
+          2. 同名文档处理（二选一，由版本化开关决定）:
+             - 版本化开启（document_versioning.enabled=true）：新版本写入 +
+               活跃指针原子切换 + GC（见 _finalize_versions）
+             - 版本化关闭（默认）：**覆盖更新**（overwrite_existing=true 时）——
+               同名文档先清旧内容（各端、全策略），再写新，各端一致无孤儿
           3. 写向量后端（Milvus 启用优先 Milvus，失败降级 FAISS）
           4. 写 metadata.json（始终写入，作为降级兜底）
           5. 写 MySQL（如果 storage.backends.mysql.enabled，软失败）
           6. 写 ES（如果 storage.backends.es.enabled，软失败）
-          7. 版本收尾：原子切换活跃版本指针 + GC 旧版本（retention=latest 同步 GC）
+          7. 版本收尾（版本化开启时）：原子切换活跃版本指针 + GC 旧版本
 
         租户隔离:
           - tenant_id 决定索引文件 / MySQL 行 / ES 索引 / Milvus collection 的归属
@@ -69,7 +72,9 @@ class IndexWriter:
             owner_user_id: 上传者 user_id（默认 ''，表示存量/共享文档）
             index_path: FAISS 索引输出路径（None 时按租户自动构造）
             metadata_path: metadata.json 输出路径（None 时按租户自动构造）
-            version_bump: 是否推进文档版本（upload=True；rebuild/incremental=False 保持稳定）
+            version_bump: 是否推进文档版本（版本化开启时；upload=True；rebuild=False）
+            overwrite_existing: 版本化关闭时是否覆盖更新同名文档（upload=True；
+                rebuild/incremental=False，它们已先全量清理）
 
         返回:
             {document_count, chunk_count, dimension, documents, chunks,
@@ -161,7 +166,12 @@ class IndexWriter:
         )
         self._apply_version_to_chunks(chunks, version_by_doc)
 
-        # 2c. 分配稳定向量 ID（chunk_id 哈希派生）——作为 FAISS/Milvus 显式主键，
+        # 2c. 覆盖更新（版本化关闭时）：同名文档先清旧内容（各端、全策略），
+        #     再写新 → 各端一致、无孤儿；版本化开启时由版本切换 + GC 处理
+        if not self._versioning_active() and overwrite_existing:
+            self._overwrite_purge(cleaned_documents, strategy, tenant_id)
+
+        # 2d. 分配稳定向量 ID（chunk_id 哈希派生）——作为 FAISS/Milvus 显式主键，
         #     使向量 id 稳定、删除不影响其余向量（无需重建）
         for c in chunks:
             if not c.vector_id:
@@ -394,6 +404,7 @@ class IndexWriter:
             index_path=index_path,
             metadata_path=metadata_path,
             version_bump=False,
+            overwrite_existing=False,
         )
         result["mysql_deleted"] = mysql_deleted
         result["es_dropped"] = es_dropped
@@ -858,6 +869,91 @@ class IndexWriter:
         except Exception as e:
             logger.warning(
                 "metadata 摘除版本条目失败（可重建修复）: %s", e,
+            )
+
+    # ---- 覆盖更新（版本化关闭时的同名文档处理）----
+
+    def _overwrite_purge(self, documents, strategy: str, tenant_id: str) -> None:
+        """覆盖更新前置：同名文档（documents 表已存在）先清旧内容。
+
+        仅 MySQL 启用时生效（依赖 documents 表判定存在性；MySQL 关闭的纯本地
+        模式保持原半覆盖行为）。MySQL chunks 删除失败抛异常（中止写入，避免
+        半覆盖不一致）；向量/metadata/ES 清理失败仅告警（孤儿可重建修复）。
+        """
+        if not self.config.storage_mysql_enabled:
+            return
+        from app.storage import ChunkRepository, DocumentRepository
+        from app.storage.mysql import MySQLManager
+
+        mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+        doc_repo = DocumentRepository(mgr)
+        chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
+        for doc in documents:
+            existing = doc_repo.get(doc.document_id, tenant_id=tenant_id)
+            if existing is None:
+                continue  # 新文档，无旧内容
+            self._purge_document(doc.document_id, strategy, tenant_id, chunk_repo)
+
+    def _purge_document(self, doc_id: str, strategy: str, tenant_id: str,
+                        chunk_repo) -> None:
+        """清空某文档各端旧内容（全策略、全版本），documents 行保留（ACL 不丢）。"""
+        try:
+            vector_ids = chunk_repo.get_vector_ids_by_document(
+                doc_id, tenant_id=tenant_id
+            )
+            for strat in ("fixed", "recursive"):
+                try:
+                    if vector_ids:
+                        self._remove_vectors(vector_ids, strat, tenant_id)
+                    self._remove_metadata_document(doc_id, strat, tenant_id)
+                    if self.config.storage_es_enabled:
+                        from app.storage.es_repository import ChunkESRepository
+                        ChunkESRepository(
+                            strategy=strat, tenant_id=tenant_id
+                        ).incremental_reindex(
+                            chunks=[], deleted_doc_ids=[doc_id]
+                        )
+                except Exception as se:
+                    logger.warning(
+                        "覆盖清理失败（strategy=%s，孤儿可重建修复）: doc=%s, %s",
+                        strat, doc_id, se, exc_info=True,
+                    )
+            # MySQL chunks：删除失败抛异常（中止写入，避免半覆盖不一致）
+            chunk_repo.delete_by_document(doc_id, tenant_id)
+            logger.info(
+                "覆盖更新清理完成: doc=%s, vectors=%d, strategies=fixed,recursive",
+                doc_id, len(vector_ids),
+            )
+        except Exception as e:
+            logger.warning(
+                "覆盖更新清理失败（中止写入）: doc=%s, %s", doc_id, e, exc_info=True,
+            )
+            raise
+
+    def _remove_metadata_document(self, doc_id: str, strategy: str,
+                                  tenant_id: str) -> None:
+        """从 metadata.json 摘除某文档的全部条目（覆盖更新用）。"""
+        try:
+            from app.storage.metadata_store import MetadataStore
+
+            meta_path = self.config.index_dir_for(strategy, tenant_id) / "metadata.json"
+            if not Path(meta_path).exists():
+                return
+            ms = MetadataStore()
+            entries = ms.load(str(meta_path)) or {}
+            kept = {
+                vid: e for vid, e in entries.items()
+                if e.get("document_id") != doc_id
+            }
+            if len(kept) != len(entries):
+                ms.save_entries(kept, str(meta_path))
+                logger.info(
+                    "metadata 摘除文档条目: doc=%s, 移除=%d, 剩余=%d",
+                    doc_id, len(entries) - len(kept), len(kept),
+                )
+        except Exception as e:
+            logger.warning(
+                "metadata 摘除文档条目失败（可重建修复）: %s", e,
             )
 
     def _cleanup_es_incremental(self, strategy: str, deleted_doc_ids: List[str],

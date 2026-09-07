@@ -235,3 +235,85 @@ class TestGcVersion:
 
         # 不应抛异常（仅告警）
         w._gc_version("report", 1, "recursive", "default", BoomChunkRepo())
+
+
+class TestOverwritePurge:
+    """覆盖更新（版本化关闭时的同名文档处理）。"""
+
+    def test_purge_only_existing_documents(self, monkeypatch):
+        cfg = _Cfg()
+        cfg.document_versioning_enabled = False
+        w = IndexWriter(config=cfg)
+        purged = []
+
+        class FakeDocRepo:
+            def get(self, doc_id, tenant_id=None):
+                return {"document_id": doc_id} if doc_id == "report" else None
+
+        class FakeChunkRepo:
+            def get_vector_ids_by_document(self, document_id, tenant_id=None):
+                return []
+
+        monkeypatch.setattr(
+            "app.storage.DocumentRepository", lambda manager=None: FakeDocRepo()
+        )
+        monkeypatch.setattr(
+            "app.storage.ChunkRepository",
+            lambda manager=None, strategy=None, tenant_id=None: FakeChunkRepo(),
+        )
+        monkeypatch.setattr(
+            w, "_purge_document", lambda doc_id, strategy, tenant_id, chunk_repo:
+                purged.append(doc_id),
+        )
+        from app.ingestion.document import Document
+
+        docs = [Document(document_id="report", content="x", metadata={}),
+                Document(document_id="newdoc", content="y", metadata={})]
+        w._overwrite_purge(docs, "recursive", "default")
+        assert purged == ["report"]   # 只清同名已存在的，新文档跳过
+
+    def test_purge_document_cleans_all_backends(self, monkeypatch):
+        cfg = _Cfg()
+        cfg.storage_es_enabled = False
+        w = IndexWriter(config=cfg)
+        removed_vectors = []
+        removed_meta = []
+        deleted_db = []
+
+        class FakeChunkRepo:
+            def get_vector_ids_by_document(self, document_id, tenant_id=None):
+                return [10, 20]
+
+            def delete_by_document(self, document_id, tenant_id=None):
+                deleted_db.append(document_id)
+
+        monkeypatch.setattr(
+            w, "_remove_vectors",
+            lambda ids, strategy, tenant_id: removed_vectors.append((strategy, ids)),
+        )
+        monkeypatch.setattr(
+            w, "_remove_metadata_document",
+            lambda doc_id, strategy, tenant_id: removed_meta.append((strategy, doc_id)),
+        )
+        w._purge_document("report", "recursive", "default", FakeChunkRepo())
+        # 跨策略清理 + MySQL 删 chunks（documents 行保留）
+        assert removed_vectors == [("fixed", [10, 20]), ("recursive", [10, 20])]
+        assert removed_meta == [("fixed", "report"), ("recursive", "report")]
+        assert deleted_db == ["report"]
+
+    def test_purge_db_failure_raises(self, monkeypatch):
+        cfg = _Cfg()
+        cfg.storage_es_enabled = False
+        w = IndexWriter(config=cfg)
+
+        class BoomChunkRepo:
+            def get_vector_ids_by_document(self, document_id, tenant_id=None,
+                                           version=None):
+                return []
+
+            def delete_by_document(self, document_id, tenant_id=None):
+                raise RuntimeError("db down")
+
+        # MySQL 删除失败 → 抛异常中止写入（避免半覆盖不一致）
+        with pytest.raises(RuntimeError):
+            w._purge_document("report", "recursive", "default", BoomChunkRepo())
