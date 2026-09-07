@@ -198,6 +198,113 @@ class ESClient:
         result = self._client.count(index=idx)
         return result.get("count", 0)
 
+    # ---- 按需读取（避免全量加载到内存）----
+
+    @staticmethod
+    def _to_chunk_dict(hit) -> Dict:
+        src = hit.get("_source", {})
+        return {
+            "chunk_id": src.get("chunk_id"),
+            "document_id": src.get("document_id"),
+            "strategy": src.get("strategy"),
+            "chunk_index": src.get("chunk_index", 0),
+            "vector_id": src.get("vector_id"),
+            "version": src.get("version"),
+            "content": src.get("content"),
+            "start_offset": src.get("start_offset", 0),
+            "end_offset": src.get("end_offset", 0),
+            "metadata": src.get("metadata", {}),
+            "score": hit.get("_score", 0),
+        }
+
+    def get_by_vector_id(self, strategy: str, vector_id: int) -> Optional[Dict]:
+        """按稳定 vector_id 单查 chunk（检索命中时按需取元数据）。"""
+        idx = self._index_name(strategy)
+        body = {"query": {"term": {"vector_id": int(vector_id)}}, "size": 1}
+        resp = self._client.search(index=idx, body=body)
+        hits = resp.get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+        return self._to_chunk_dict(hits[0])
+
+    def search_all(self, strategy: str, query: str = "*",
+                   document_ids: Optional[List] = None,
+                   page_size: int = 500) -> List[Dict]:
+        """分页拉取全部命中（search_after 游标，避免单次 size 上限截断）。
+
+        供 BM25 全量语料 / list_all 使用；返回按 vector_id 升序（与向量位置对齐）。
+        """
+        idx = self._index_name(strategy)
+        if query in ("*", ""):
+            query_clause: Dict = {"match_all": {}}
+        else:
+            query_clause = {"match": {"content": query}}
+        if document_ids is not None:
+            body: Dict = {
+                "query": {
+                    "bool": {
+                        "must": [query_clause],
+                        "filter": [{"terms": {"document_id": list(document_ids)}}],
+                    }
+                },
+            }
+        else:
+            body = {"query": query_clause}
+        body["sort"] = [{"vector_id": {"order": "asc", "unmapped_type": "long"}}]
+        body["size"] = page_size
+
+        results: List[Dict] = []
+        search_after = None
+        while True:
+            if search_after is not None:
+                body["search_after"] = search_after
+            resp = self._client.search(index=idx, body=body)
+            hits = resp.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+            results.extend(self._to_chunk_dict(h) for h in hits)
+            if len(hits) < page_size:
+                break
+            search_after = hits[-1].get("sort")
+        return results
+
+    def vector_ids_by_documents(self, strategy: str,
+                                document_ids: List) -> Dict[str, set]:
+        """按可读文档集合返回 {document_id: {vector_id}}（先过滤后检索）。
+
+        只取 document_id/vector_id 两字段分页拉取，避免全量文档进内存。
+        """
+        if not document_ids:
+            return {}
+        idx = self._index_name(strategy)
+        body = {
+            "query": {
+                "bool": {"filter": [{"terms": {"document_id": list(document_ids)}}]}
+            },
+            "_source": ["document_id", "vector_id"],
+            "sort": [{"vector_id": {"order": "asc", "unmapped_type": "long"}}],
+            "size": 1000,
+        }
+        m: Dict[str, set] = {}
+        search_after = None
+        while True:
+            if search_after is not None:
+                body["search_after"] = search_after
+            resp = self._client.search(index=idx, body=body)
+            hits = resp.get("hits", {}).get("hits", [])
+            if not hits:
+                break
+            for h in hits:
+                src = h.get("_source", {})
+                doc = src.get("document_id")
+                vid = src.get("vector_id")
+                if doc and vid is not None:
+                    m.setdefault(doc, set()).add(int(vid))
+            if len(hits) < 1000:
+                break
+            search_after = hits[-1].get("sort")
+        return m
+
     def ping(self) -> bool:
         """检查 ES 连接是否可用。"""
         try:

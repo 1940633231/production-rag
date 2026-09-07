@@ -86,6 +86,15 @@ class _FakeChunkRepo:
                 return c
         return None
 
+    def vector_ids_by_documents(self, document_ids):
+        allowed = set(document_ids)
+        m = {}
+        for c in self._chunks:
+            doc = c.get("document_id")
+            if doc and doc in allowed:
+                m.setdefault(doc, set()).add(int(c["vector_id"]))
+        return m
+
 
 class TestRetrieverPrefilter:
     def _make(self, ids=(10, 30, 20), scores=(0.9, 0.8, 0.7)):

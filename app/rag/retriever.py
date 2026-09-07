@@ -22,26 +22,17 @@ class Retriever:
         self.chunk_repo = chunk_repo
         # 本地缓存：vector_id(int) → chunk_dict，同一实例内避免重复查 repo
         self._cache = {}
-        # 懒加载缓存：document_id → {vector_id, ...}（用于先过滤后检索）
-        self._doc_vectors = None
 
     def _document_vector_ids(self, document_ids) -> set:
         """把可读文档集合翻译为允许的 vector_id 集合（先过滤后检索）。
 
-        基于 chunk_repo.list_all()（当前 strategy 全量 chunks，已缓存）构建
-        document_id → vector_id 映射，一次构建、后续查询零开销。
+        通过 chunk_repo.vector_ids_by_documents 按需查询（不加载全量语料），
+        由各后端实现（MySQL/ES 走过滤查询，metadata 走文件遍历）。
         """
-        if self._doc_vectors is None:
-            m = {}
-            for c in self.chunk_repo.list_all():
-                doc = c.get("document_id")
-                vid = int(c.get("vector_id", 0))
-                if doc:
-                    m.setdefault(doc, set()).add(vid)
-            self._doc_vectors = m
+        m = self.chunk_repo.vector_ids_by_documents(list(document_ids))
         allowed: set = set()
         for doc_id in document_ids:
-            allowed |= self._doc_vectors.get(doc_id, set())
+            allowed |= m.get(doc_id, set())
         return allowed
 
     def search(self, query, top_k=10, document_ids=None):

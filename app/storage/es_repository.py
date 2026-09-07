@@ -32,63 +32,28 @@ class ChunkESRepository(BaseChunkRepository):
             from app.storage.es_client import ESClient
             self._es = ESClient(tenant_id=tenant_id, **kwargs)
 
-        # 懒加载缓存
-        self._cache_list: Optional[List[Dict]] = None
-        self._cache_map: Optional[Dict[int, Dict]] = None
-
-    def _ensure_loaded(self):
-        """首次访问时从 ES 加载所有 chunks 到内存缓存。
-
-        关键：cache_map 的 key 必须是 ES 文档中的 vector_id 字段
-        （与 FAISS IndexFlatIP 的位置 ID 对齐），而不是 enumerate 顺序索引。
-        否则 Retriever.get_by_id(int(faiss_id)) 会取到错误的 chunk。
-        """
-        if self._cache_list is not None:
-            return
-        # 按 vector_id 升序，保证 list_all 顺序与写入顺序一致
-        result = self._es.search(
-            self.strategy, query="*", top_k=10000, sort_by_vector_id=True
-        )
-        # 用 vector_id 作为 key（对齐 FAISS ID），缺失 vector_id 的文档跳过
-        self._cache_list = result
-        self._cache_map = {}
-        missing_vector_id = 0
-        for r in result:
-            vid = r.get("vector_id")
-            if vid is None:
-                missing_vector_id += 1
-                continue
-            self._cache_map[int(vid)] = r
-        if missing_vector_id:
-            logger.warning(
-                "ChunkESRepository 加载: %d 个文档缺少 vector_id 字段，已跳过",
-                missing_vector_id,
-            )
-        logger.info(
-            "ChunkESRepository 加载: strategy=%s, chunks=%d, map_keys=%d",
-            self.strategy, len(result), len(self._cache_map),
-        )
-
     def get_by_id(self, id: int) -> Optional[Dict]:
-        self._ensure_loaded()
-        return self._cache_map.get(id)
+        """按稳定 vector_id 按需单查（无全量内存缓存）。"""
+        return self._es.get_by_vector_id(self.strategy, int(id))
 
     def batch_get_by_ids(self, ids: List[int]) -> List[Dict]:
-        self._ensure_loaded()
+        """批量按向量 ID 查询 chunks（逐条按需，命中数通常很小）。"""
         result = []
         for i in ids:
-            doc = self._cache_map.get(i)
+            doc = self._es.get_by_vector_id(self.strategy, int(i))
             if doc is not None:
                 result.append(doc)
         return result
 
     def list_all(self) -> List[Dict]:
-        self._ensure_loaded()
-        return self._cache_list
+        """返回当前 strategy 的所有 chunks（分页拉取，避免单次 size 截断）。"""
+        return self._es.search_all(self.strategy, query="*")
+
+    def vector_ids_by_documents(self, document_ids) -> Dict[str, set]:
+        """按可读文档集合返回 {document_id: {vector_id}}（先过滤后检索，按需）。"""
+        return self._es.vector_ids_by_documents(self.strategy, list(document_ids))
 
     def count(self) -> int:
-        if self._cache_list is not None:
-            return len(self._cache_list)
         return self._es.count(self.strategy)
 
     # ---- 写接口 ----
@@ -117,9 +82,6 @@ class ChunkESRepository(BaseChunkRepository):
             for c in chunks
         ]
         self._es.bulk_index(strat, es_docs)
-        # 失效缓存
-        self._cache_list = None
-        self._cache_map = None
 
     def incremental_reindex(self, chunks: List, deleted_doc_ids: List[str] = None):
         """增量更新：只删除被移除文档的 chunks，再写入新 chunks。
@@ -158,11 +120,7 @@ class ChunkESRepository(BaseChunkRepository):
             "ES 删除文档版本 chunks: strategy=%s, doc=%s, version=%s",
             self.strategy, document_id, version,
         )
-        self._cache_list = None
-        self._cache_map = None
 
     def drop_index(self):
         """删除整个 ES 索引（全量重建时使用）。"""
         self._es.drop_index(self.strategy)
-        self._cache_list = None
-        self._cache_map = None

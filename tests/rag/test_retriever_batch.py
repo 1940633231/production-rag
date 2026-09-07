@@ -60,6 +60,15 @@ class FakeChunkRepo:
             "end_offset": 0,
         }
 
+    def vector_ids_by_documents(self, document_ids):
+        allowed = set(document_ids)
+        m = {}
+        for c in self.list_all():
+            doc = c.get("document_id")
+            if doc and doc in allowed:
+                m.setdefault(doc, set()).add(int(c["vector_id"]))
+        return m
+
 
 @pytest.fixture
 def retriever():

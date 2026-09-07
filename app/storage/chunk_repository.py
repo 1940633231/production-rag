@@ -39,9 +39,6 @@ class ChunkRepository(BaseChunkRepository):
         self.manager = manager or MySQLManager()
         self.strategy = strategy
         self.tenant_id = tenant_id
-        # 懒加载缓存：position(int) → chunk_dict
-        self._cache_list: Optional[List[Dict]] = None
-        self._cache_map: Optional[Dict[int, Dict]] = None
 
     @staticmethod
     def _tenant_clause(tenant_id: Optional[str]):
@@ -52,22 +49,57 @@ class ChunkRepository(BaseChunkRepository):
 
     # ---- BaseChunkRepository 读接口（按 strategy + tenant 过滤，按 vector_id 索引）----
 
-    def _ensure_loaded(self):
-        """首次访问时按 strategy(+tenant) 全量加载 chunks 到内存缓存。
+    def get_by_id(self, id: int) -> Optional[Dict]:
+        """按向量 ID（稳定 vector_id）按需查询单个 chunk（无全量缓存）。"""
+        tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
+        sql = (
+            "SELECT chunk_id, document_id, vector_id, version, content, "
+            "start_offset, end_offset, metadata "
+            "FROM {} WHERE strategy = %s AND vector_id = %s{} LIMIT 1"
+        ).format(self.TABLE, tenant_clause)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (self.strategy, int(id), *tenant_params))
+                row = cur.fetchone()
+        if row and row.get("metadata"):
+            row["metadata"] = json.loads(row["metadata"])
+        return row
 
-        _cache_map 以 vector_id（稳定 ID）为 key，而非 enumerate 位置；
-        get_by_id(int) 即按 vector_id 查询，与 FAISS/Milvus 显式主键一致。
+    def batch_get_by_ids(self, ids: List[int]) -> List[Dict]:
+        """批量按向量 ID 查询 chunks（WHERE vector_id IN (...)）。"""
+        if not ids:
+            return []
+        tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
+        placeholders = ",".join(["%s"] * len(ids))
+        sql = (
+            "SELECT chunk_id, document_id, vector_id, version, content, "
+            "start_offset, end_offset, metadata "
+            "FROM {} WHERE strategy = %s AND vector_id IN ({}){} "
+            "ORDER BY FIELD(vector_id, {})"
+        ).format(
+            self.TABLE, placeholders, tenant_clause,
+            ",".join(["%s"] * len(ids)),
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (self.strategy, *ids, *tenant_params, *ids))
+                rows = cur.fetchall()
+        for r in rows:
+            if r.get("metadata"):
+                r["metadata"] = json.loads(r["metadata"])
+        return rows
+
+    def list_all(self) -> List[Dict]:
+        """返回当前 strategy(+tenant) 的所有 chunks，按向量位置顺序排列。
+
+        供 BM25 等需要全量语料的检索器使用；不做内存缓存（按需查询）。
         """
-        if self._cache_list is not None:
-            return
-        t_load = time.time()
         tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
         sql = (
             "SELECT chunk_id, document_id, vector_id, version, content, "
             "start_offset, end_offset, metadata "
             "FROM {} WHERE strategy = %s{} ORDER BY id ASC"
         ).format(self.TABLE, tenant_clause)
-        rows = []
         with self.manager.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (self.strategy, *tenant_params))
@@ -75,38 +107,30 @@ class ChunkRepository(BaseChunkRepository):
         for r in rows:
             if r.get("metadata"):
                 r["metadata"] = json.loads(r["metadata"])
-        self._cache_list = rows
-        self._cache_map = {int(r.get("vector_id", 0)): r for r in rows}
-        logger.info(
-            "ChunkRepository 全量加载: strategy=%s, tenant=%s, %.3fs, chunks=%d",
-            self.strategy, self.tenant_id if self.tenant_id is not None else "*",
-            time.time() - t_load, len(rows),
-        )
+        return rows
 
-    def get_by_id(self, id: int) -> Optional[Dict]:
-        """按向量 ID（稳定 vector_id）查询单个 chunk。"""
-        self._ensure_loaded()
-        return self._cache_map.get(int(id))
-
-    def batch_get_by_ids(self, ids: List[int]) -> List[Dict]:
-        """批量按向量位置 ID 查询 chunks。"""
-        self._ensure_loaded()
-        result = []
-        for i in ids:
-            doc = self._cache_map.get(i)
-            if doc is not None:
-                result.append(doc)
-        return result
-
-    def list_all(self) -> List[Dict]:
-        """返回当前 strategy(+tenant) 的所有 chunks，按向量位置顺序排列。"""
-        self._ensure_loaded()
-        return self._cache_list
+    def vector_ids_by_documents(self, document_ids) -> Dict[str, set]:
+        """按可读文档集合返回 document_id → {vector_id}（先过滤后检索，按需查询）。"""
+        if not document_ids:
+            return {}
+        tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
+        placeholders = ",".join(["%s"] * len(document_ids))
+        sql = (
+            "SELECT DISTINCT document_id, vector_id FROM {} "
+            "WHERE strategy = %s AND vector_id > 0{} "
+            "AND document_id IN ({})"
+        ).format(self.TABLE, tenant_clause, placeholders)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (self.strategy, *tenant_params, *document_ids))
+                rows = cur.fetchall()
+        m: Dict[str, set] = {}
+        for r in rows:
+            m.setdefault(r["document_id"], set()).add(int(r["vector_id"]))
+        return m
 
     def count(self) -> int:
         """当前 strategy(+tenant) 的 chunk 总数。"""
-        if self._cache_list is not None:
-            return len(self._cache_list)
         tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
         sql = "SELECT COUNT(*) AS cnt FROM {} WHERE strategy = %s{}".format(
             self.TABLE, tenant_clause
@@ -304,9 +328,6 @@ class ChunkRepository(BaseChunkRepository):
             document_id, strategy if strategy is not None else "*",
             tnt if tnt is not None else "*", rows,
         )
-        # 失效缓存
-        self._cache_list = None
-        self._cache_map = None
         return rows
 
     def delete_by_document_version(self, document_id: str, version: int,
@@ -336,9 +357,6 @@ class ChunkRepository(BaseChunkRepository):
             document_id, version, strategy if strategy is not None else "*",
             tnt if tnt is not None else "*", rows,
         )
-        # 失效缓存
-        self._cache_list = None
-        self._cache_map = None
         return rows
 
     def delete_by_strategy(self, strategy: Optional[str] = None,
@@ -360,7 +378,4 @@ class ChunkRepository(BaseChunkRepository):
             "删除 strategy chunks: strategy=%s, tenant=%s, affected=%d",
             strat, tnt if tnt is not None else "*", rows,
         )
-        # 失效缓存
-        self._cache_list = None
-        self._cache_map = None
         return rows
