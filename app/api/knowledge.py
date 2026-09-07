@@ -18,7 +18,7 @@
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.audit.logger import record
@@ -185,7 +185,7 @@ class TaskStatusResponse(BaseModel):
 )
 async def upload_document(
     file: UploadFile = File(...),
-    strategy: str = "recursive",
+    strategy: str = Form("recursive"),
     async_: bool = False,
     user: AuthUser = Depends(get_current_user),
 ):
@@ -196,8 +196,8 @@ async def upload_document(
 
     参数:
       - file: 上传的文件（支持 .txt/.html/.pdf/.docx）
-      - strategy: 分块策略 fixed/recursive
-      - async_: 是否后台异步执行（大文件推荐 true）
+      - strategy: 分块策略 fixed/recursive（表单字段，前端 FormData 传递）
+      - async_: 是否后台异步执行（大文件推荐 true，query 参数 ?async_=true）
     """
     if strategy not in ("fixed", "recursive"):
         raise HTTPException(status_code=400, detail="strategy 必须为 fixed 或 recursive")
