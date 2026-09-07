@@ -17,7 +17,9 @@
 - **生成可靠性**：超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
 - **多后端持久化**：MySQL 存储文档/chunks（含连接池与 CASCADE 删除）+ Elasticsearch 全文检索 + Milvus 向量库（替代本地 FAISS），均可按开关启用
 - **缓存优化**：embedding/reranker 模型按名复用 + **索引版本以数据库为唯一权威源**（`index_versions` 表，多活部署各实例全局一致），上传/删除后自动失效缓存、不重载模型
-- **安全加固**：上传路径穿越防护 + 50MB 大小限制，分块读取防内存打爆
+- **安全加固（fail-closed）**：文档级 ACL 判定异常时一律**拒绝/查无**（可读文档返回空集、删除授权 deny），杜绝 fail-open 造成的越权读取与越权删除；上传路径穿越防护 + 50MB 流式写盘（边读边写，不整包聚合进内存）
+- **LLM 信任边界（防注入）**：检索上下文与对话历史均按**不可信输入**处理——系统提示词显式声明不执行其中夹带的任何指令（缓解 indirect prompt injection 与伪造历史）；历史清洗（仅最近回合、角色过滤、单条 2000 字 + 总量 8000 字限长）约束注入载荷进入信任层
+- **写入一致性 / 并发**：索引写入持 (strategy, tenant) 级**跨进程写锁**（并发 upload/rebuild 串行，防 FAISS/metadata 竞态）；文档删除按稳定 ID 清理并联调**孤儿可观测**（清理失败 5xx 提示，不静默）；同名覆盖更新失败自动**回滚旧源**（不丢重上传前的源文件）
 - **认证与 RBAC**：JWT 登录（bcrypt 密码哈希 + PyJWT）、用户/角色/权限点三级模型、`require_permission` 路由门禁、种子账号脚本，业务 API 全部要求 Bearer token
 - **多租户隔离**：`tenant_id` 贯穿 MySQL/ES/Milvus/索引路径/缓存 key，租户间数据完全隔离
 - **文档级 ACL**：`documents.owner_user_id` + `document_acl` 授权表，按 用户/角色 授予 read/write/delete；检索/列表按可读文档过滤，删除按归属校验；删文档/用户/角色时级联清理授权（document_acl 外键 + 代码级）
@@ -51,11 +53,11 @@ production-rag/
 │   │   ├── admin.py          #   用户/角色管理 + 审计查询
 │   │   └── __main__.py       #   启动入口（python -m app.api）
 │   ├── auth/                 # 认证与 RBAC（JWT/密码哈希/权限点/登录 API）
-│   ├── acl/                  # 文档级 ACL（document_acl 表 + 授权判定）
+│   ├── acl/                  # 文档级 ACL（document_acl 表 + 授权判定 + 决策服务 service）
 │   ├── audit/                # 审计日志（MySQL 落库 + 401/403 中间件）
 │   ├── cache/                # 权限感知查询缓存（内存 LRU / Redis 双后端，key 含租户/权限/user_id）
 │   ├── ingestion/            # 文档摄入
-│   │   ├── loader/           #   文档加载器（txt/html/pdf/word）
+│   │   ├── loader/           #   文档加载器（txt/html/pdf/word + 加载器注册表 registry）
 │   │   ├── chunker/          #   分块器（fixed/recursive）
 │   │   ├── cleaner/          #   文档清洗
 │   │   └── writer.py         #   统一索引写入器（稳定 ID 追加语义）
@@ -375,7 +377,7 @@ audit:
 | POST | `/api/chat/stream` | RAG 问答（SSE 流式） | `chat:query` |
 | GET | `/api/health` | 深度健康检查 | - |
 | POST | `/api/knowledge/upload` | 上传文档并构建索引（限 50MB） | `knowledge:upload` |
-| DELETE | `/api/knowledge/{doc_id}` | 删除文档（按归属/授权校验，无需重建索引） | `knowledge:delete` |
+| DELETE | `/api/knowledge/{doc_id}` | 删除文档（按归属/授权校验，稳定 ID 清理；清理失败返回 500 提示孤儿） | `knowledge:delete` |
 | POST | `/api/knowledge/rebuild` | 重建索引 | `knowledge:rebuild` |
 | GET | `/api/knowledge/status` | 查看索引状态 | `knowledge:read` |
 | GET | `/api/knowledge/documents` | 列出当前用户可读文档（含归属人） | `knowledge:read` |
@@ -438,7 +440,7 @@ curl -X POST http://localhost:8000/api/chat \
   }'
 ```
 
-> 多轮说明：服务端仅保留最近 5 轮历史，超出自动截断；Query 改写（LLM 指代消解）在存在 history 时自动生效，改写结果用于检索与生成，原始问题保留在响应 `query` 字段、改写结果在 `stats.rewritten_query` 中。
+> 多轮说明：服务端仅保留最近 5 轮历史，并按不可信输入清洗（非法角色过滤、单条/总量限长），超出自动截断；Query 改写（LLM 指代消解）在存在 history 时自动生效，改写结果用于检索与生成，原始问题保留在响应 `query` 字段、改写结果在 `stats.rewritten_query` 中。
 
 ### 示例：上传文档
 
