@@ -49,26 +49,53 @@ class RAGService:
         logger.info("RAGService 初始化完成")
 
     def _build_pipeline(self) -> RAGPipeline:
-        """从 config 初始化所有组件并构建 pipeline。"""
+        """从 config 初始化所有组件并构建 pipeline。
+
+        仅做装配编排；各组件初始化按组抽到下方私有方法（_build_*），
+        避免单方法过长、便于单点阅读与复用。
+        """
         logger.info("开始构建 pipeline (tenant=%s)", self.tenant_id)
         build_start = time.time()
 
-        # ---- 向量后端判定 & 路径（按租户隔离）----
-        use_milvus = self.config.storage_milvus_enabled
-        vector_backend = "milvus" if use_milvus else "faiss"
-        index_dir = self.config.index_dir_for(self.strategy, self.tenant_id)
-        faiss_index_path = index_dir / "faiss.index"
-        metadata_path = index_dir / "metadata.json"
-        milvus_collection = (
-            self.config.milvus_collection_for(self.strategy, self.tenant_id)
-            if use_milvus else None
-        )
-        logger.info(
-            "向量后端: backend=%s, strategy=%s, tenant=%s, milvus_collection=%s, faiss_index=%s",
-            vector_backend, self.strategy, self.tenant_id, milvus_collection, faiss_index_path,
+        chunk_repo = self._build_chunk_repo()
+        retriever = self._build_retriever(chunk_repo)
+        reranker = self._build_reranker()
+        context_manager = self._build_context_manager()
+        generator = self._build_generator()
+        query_rewriter, multi_query_expander = self._build_query_augment(generator)
+
+        logger.info("pipeline 构建完成: 总耗时=%.3fs", time.time() - build_start)
+        return RAGPipeline(
+            retriever=retriever,
+            reranker=reranker,
+            context_manager=context_manager,
+            generator=generator,
+            query_rewriter=query_rewriter,
+            multi_query_expander=multi_query_expander,
+            top_k=self.config.retrieval_top_k,
+            rerank_candidate_pool=self.config.rerank_candidate_pool,
         )
 
-        # ---- Chunk Repository（多后端：MySQL 优先，降级到 metadata.json）----
+    # ---- 组件装配（供 _build_pipeline 复用）----
+
+    def _index_paths(self):
+        """按租户计算向量后端的路径/集合名。"""
+        use_milvus = self.config.storage_milvus_enabled
+        index_dir = self.config.index_dir_for(self.strategy, self.tenant_id)
+        return {
+            "use_milvus": use_milvus,
+            "faiss_index_path": index_dir / "faiss.index",
+            "metadata_path": index_dir / "metadata.json",
+            "milvus_collection": (
+                self.config.milvus_collection_for(self.strategy, self.tenant_id)
+                if use_milvus else None
+            ),
+        }
+
+    def _build_chunk_repo(self):
+        """初始化 chunk 仓储（MySQL 优先，不可用降级到 metadata.json）。"""
+        paths = self._index_paths()
+        metadata_path = paths["metadata_path"]
         chunk_repo = None
         try:
             from app.storage import create_chunk_repo
@@ -86,8 +113,6 @@ class RAGService:
         except Exception as e:
             logger.warning("存储后端不可用，将降级到 metadata.json: %s", e)
             chunk_repo = None
-
-        # 降级：从 metadata.json 加载并包装为 MetadataChunkRepository
         if chunk_repo is None:
             if not metadata_path.exists():
                 logger.error("Metadata 文件不存在: %s", metadata_path)
@@ -103,8 +128,16 @@ class RAGService:
                 "Metadata 降级加载完成: %.3fs, chunks=%d, path=%s",
                 time.time() - t, len(metadata), metadata_path,
             )
+        return chunk_repo
 
-        # ---- Retriever（按 mode 切换，延迟 import 避免强制依赖）----
+    def _build_retriever(self, chunk_repo):
+        """按 mode 构建检索器（vector / bm25 / hybrid）。"""
+        paths = self._index_paths()
+        use_milvus = paths["use_milvus"]
+        faiss_index_path = paths["faiss_index_path"]
+        milvus_collection = paths["milvus_collection"]
+
+        dense = None
         if self.mode in ("vector", "hybrid"):
             from app.embedding.model import EmbeddingModel
             from app.vector import create_vector_store
@@ -117,7 +150,6 @@ class RAGService:
                 _embedding_cache[model_name] = EmbeddingModel(model_name)
             embedding_model = _embedding_cache[model_name]
 
-            # Milvus/FAISS 分支
             if use_milvus:
                 logger.info(
                     "Milvus 向量检索加载: host=%s, port=%s, collection=%s",
@@ -136,7 +168,6 @@ class RAGService:
                     hnsw_ef_construction=self.config.hnsw_ef_construction,
                     hnsw_ef_search=self.config.hnsw_ef_search,
                 )
-                # Milvus.load(path) 用 path 作 collection name 连接并加载
                 vector_store.load(milvus_collection)
                 index_label = "milvus:" + milvus_collection
             else:
@@ -165,15 +196,13 @@ class RAGService:
                 time.time() - t, embedding_model.dimension, index_label,
             )
 
+        sparse = None
         if self.mode in ("bm25", "hybrid"):
             t = time.time()
-            sparse = None
             sparse_backend = "bm25_local"
-            # 优先：ES 全文检索（storage.backends.es.enabled 时）
             if self.config.storage_es_enabled:
                 try:
                     from app.search.es_fulltext_search import ESFulltextSearch
-
                     sparse = ESFulltextSearch(strategy=self.strategy)
                     sparse_backend = "es_fulltext"
                 except Exception as es_err:
@@ -182,10 +211,8 @@ class RAGService:
                         es_err,
                     )
                     sparse = None
-            # 兜底：本地 BM25（rank_bm25 + jieba）
             if sparse is None:
                 from app.search.bm25_search import BM25Search
-
                 sparse = BM25Search(chunk_repo)
                 sparse_backend = "bm25_local"
             logger.info(
@@ -204,20 +231,23 @@ class RAGService:
             sparse.strategy = self.strategy  # 供 BM25/ES 打分阶段打标签
         retriever.strategy = self.strategy
         logger.info("检索器已就绪: mode=%s, type=%s", self.mode, type(retriever).__name__)
+        return retriever
 
-        # ---- Reranker（可选）----
-        reranker = None
-        if self.use_rerank:
-            from app.rerank.reranker import Reranker
-            model_name = self.config.rerank_model
-            if model_name not in _reranker_cache:
-                t = time.time()
-                logger.info("Reranker 加载开始: %s", model_name)
-                _reranker_cache[model_name] = Reranker(model_name)
-                logger.info("Reranker 加载完成: %.3fs", time.time() - t)
-            reranker = _reranker_cache[model_name]
+    def _build_reranker(self):
+        """构建 reranker（use_rerank 关闭时返回 None）。"""
+        if not self.use_rerank:
+            return None
+        from app.rerank.reranker import Reranker
+        model_name = self.config.rerank_model
+        if model_name not in _reranker_cache:
+            t = time.time()
+            logger.info("Reranker 加载开始: %s", model_name)
+            _reranker_cache[model_name] = Reranker(model_name)
+            logger.info("Reranker 加载完成: %.3fs", time.time() - t)
+        return _reranker_cache[model_name]
 
-        # ---- ContextManager（从 config 注入全部参数）----
+    def _build_context_manager(self):
+        """构建 ContextManager（从 config 注入全部参数）。"""
         from app.ingestion.tokenizer import create_token_counter
         from app.context.builder import ContextBuilder
         from app.context.compressor import ContextCompressor
@@ -244,16 +274,16 @@ class RAGService:
             self.config.reserved_tokens,
             self.config.context_order_strategy,
         )
+        return context_manager
 
-        # ---- Generator（从 config 切换 backend：stub 零依赖 / qwen DashScope / openai 兼容）----
+    def _build_generator(self):
+        """构建 Generator（按 backend 传参：openai 用独立 base_url + api_key_env）。"""
         from app.generation.generator import create_generator
         t = time.time()
         logger.info(
             "Generator 初始化开始: backend=%s, model=%s",
             self.config.generation_backend, self.config.generation_model,
         )
-        # 按后端传参：openai 用 generation.openai.*（base_url + 独立 api_key_env），
-        # 其余（qwen）沿用顶层 generation.*
         if self.config.generation_backend == "openai":
             generator = create_generator(
                 "openai",
@@ -283,34 +313,23 @@ class RAGService:
             "Generator 初始化完成: %.3fs, type=%s",
             time.time() - t, type(generator).__name__,
         )
+        return generator
 
-        # ---- Query 改写器（复用 generator；stub 时自动跳过改写）----
+    def _build_query_augment(self, generator):
+        """构建查增强件：改写器 + 多路扩展器（复用 generator；stub/关闭时回退）。"""
         query_rewriter = None
+        multi_query_expander = None
         if generator is not None:
             from app.generation.query_rewriter import QueryRewriter
             query_rewriter = QueryRewriter(generator)
-
-        # ---- Multi-Query 扩展器（多路召回；stub/关闭时回退单路）----
-        multi_query_expander = None
-        if generator is not None and self.config.retrieval_multi_query > 1:
-            from app.generation.multi_query import MultiQueryExpander
-            multi_query_expander = MultiQueryExpander(
-                generator,
-                num_queries=self.config.retrieval_multi_query,
-                auto=self.config.retrieval_multi_query_auto,
-            )
-
-        logger.info("pipeline 构建完成: 总耗时=%.3fs", time.time() - build_start)
-        return RAGPipeline(
-            retriever=retriever,
-            reranker=reranker,
-            context_manager=context_manager,
-            generator=generator,
-            query_rewriter=query_rewriter,
-            multi_query_expander=multi_query_expander,
-            top_k=self.config.retrieval_top_k,
-            rerank_candidate_pool=self.config.rerank_candidate_pool,
-        )
+            if self.config.retrieval_multi_query > 1:
+                from app.generation.multi_query import MultiQueryExpander
+                multi_query_expander = MultiQueryExpander(
+                    generator,
+                    num_queries=self.config.retrieval_multi_query,
+                    auto=self.config.retrieval_multi_query_auto,
+                )
+        return query_rewriter, multi_query_expander
 
     def query(self, query: str, history: Optional[List] = None,
               document_ids: Optional[set] = None) -> RAGResponse:
