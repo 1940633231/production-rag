@@ -36,7 +36,10 @@ def mock_upload(monkeypatch):
     """替换 _do_upload 为假实现，跳过真实索引构建。"""
     import app.api.knowledge as knowledge
 
-    def fake_do_upload(save_path, strategy, tenant_id="default", owner_user_id=""):
+    def fake_do_upload(save_path, strategy, tenant_id="default", owner_user_id="",
+                       backup_path=None):
+        if backup_path is not None and backup_path.exists():
+            backup_path.unlink()  # 模拟成功上传清理备份
         return {
             "document_count": 1, "chunk_count": 2, "dimension": 768,
             "index_path": "data/index/{}/recursive/faiss.index".format(tenant_id),

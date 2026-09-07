@@ -140,6 +140,24 @@ class ChunkRepository(BaseChunkRepository):
                 cur.execute(sql, (self.strategy, *tenant_params))
                 return cur.fetchone()["cnt"]
 
+    def counts_by_documents(self, document_ids) -> Dict[str, int]:
+        """批量统计多个文档的 chunk 数（单条 GROUP BY 语句，避免 N+1）。
+
+        供列表接口避免逐文档 COUNT 查询。返回 {document_id: chunk_count}。
+        """
+        if not document_ids:
+            return {}
+        tenant_clause, tenant_params = self._tenant_clause(self.tenant_id)
+        placeholders = ",".join(["%s"] * len(document_ids))
+        sql = (
+            "SELECT document_id, COUNT(*) AS cnt FROM {} "
+            "WHERE strategy = %s{} AND document_id IN ({}) GROUP BY document_id"
+        ).format(self.TABLE, tenant_clause, placeholders)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (self.strategy, *tenant_params, *document_ids))
+                return {r["document_id"]: int(r["cnt"]) for r in cur.fetchall()}
+
     # ---- 写接口 ----
 
     def insert(self, chunk_id: str, document_id: str, chunk_index: int,

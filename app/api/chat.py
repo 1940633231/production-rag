@@ -104,6 +104,26 @@ def _intersect_ids(acl_ids, scope_ids):
     return acl_ids & scope_ids
 
 
+def _acl_readable_document_ids(user, tenant_id):
+    """计算当前用户可读文档集合，**fail-closed**。
+
+    返回 None 表示不设文档级过滤（鉴权关闭 / superadmin）；
+    非 superadmin 用户 ACL 查询异常时返回空集 set()（放行任何文档 = 泄露风险，
+    故宁可查无结果也不放行），并记录错误日志。
+    """
+    if user is None or user.is_superadmin:
+        return None
+    try:
+        from app.acl.repository import ACLRepository
+        return ACLRepository().get_readable_document_ids(user, tenant_id)
+    except Exception as e:
+        logger.error(
+            "ACL 可读文档计算失败，fail-closed（空集，不放行任何文档）: %s",
+            e, exc_info=True,
+        )
+        return set()
+
+
 def _resolve_scope(config, req, tenant_id):
     """Query Scope（可选能力）：解析业务范围过滤集。
 
@@ -212,15 +232,8 @@ async def chat(req: ChatRequest, user: Optional[AuthUser] = Depends(get_current_
     tenant_id = user.tenant_id if user else "default"
     config = _get_config()
 
-    # ---- 文档级 ACL：计算当前用户可读文档集合（失败回退为不设过滤）----
-    document_ids = None
-    if user is not None:
-        try:
-            from app.acl.repository import ACLRepository
-            document_ids = ACLRepository().get_readable_document_ids(user, tenant_id)
-        except Exception as e:
-            logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
-            document_ids = None
+    # ---- 文档级 ACL：计算当前用户可读文档集合（fail-closed：异常返回空集）----
+    document_ids = _acl_readable_document_ids(user, tenant_id)
 
     # ---- Query Scope（可选能力）：业务范围过滤集 ∩ ACL 可读集 ----
     scope_ids, scope_entity = _resolve_scope(config, req, tenant_id)
@@ -341,15 +354,8 @@ async def chat_stream(req: ChatRequest, user: Optional[AuthUser] = Depends(get_c
     tenant_id = user.tenant_id if user else "default"
     config = _get_config()
 
-    # ---- 文档级 ACL：计算当前用户可读文档集合（失败回退为不设过滤）----
-    document_ids = None
-    if user is not None:
-        try:
-            from app.acl.repository import ACLRepository
-            document_ids = ACLRepository().get_readable_document_ids(user, tenant_id)
-        except Exception as e:
-            logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
-            document_ids = None
+    # ---- 文档级 ACL：计算当前用户可读文档集合（fail-closed：异常返回空集）----
+    document_ids = _acl_readable_document_ids(user, tenant_id)
 
     # ---- Query Scope（可选能力）：业务范围过滤集 ∩ ACL 可读集 ----
     scope_ids, scope_entity = _resolve_scope(config, req, tenant_id)

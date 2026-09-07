@@ -29,82 +29,51 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
+# 可复用决策逻辑抽到独立模块（P2-5：减负路由文件），以原名回导出保持外部/测试兼容
+from app.acl.service import (  # noqa: E402
+    can_delete as _can_delete,
+    can_manage_acl as _can_manage_acl,
+    readable_document_ids as _readable_document_ids,
+)
+from app.ingestion.loader.registry import LOADER_MAP as _LOADER_MAP  # noqa: E402
+
 
 def _current_tenant(user: AuthUser) -> str:
     """当前请求的租户（auth 关闭时回落 default）。"""
     return user.tenant_id if user else "default"
 
-
-def _readable_document_ids(user: AuthUser, tenant_id: str):
-    """计算当前用户可读文档集合；None 表示不设文档级过滤（鉴权关闭/superadmin）。
-
-    软失败：ACL 查询异常时回退为不设过滤，避免阻断主流程。
-    """
-    if user is None or user.is_superadmin:
-        return None
-    try:
-        from app.acl.repository import ACLRepository
-        return ACLRepository().get_readable_document_ids(user, tenant_id)
-    except Exception as e:
-        logger.warning("ACL 可读文档计算失败，回退为不设文档级过滤: %s", e)
-        return None
-
-
-def _can_delete(user: AuthUser, tenant_id: str, document_id: str) -> bool:
-    """判断用户是否有权删除文档（superadmin / owner / delete 授权）。
-
-    软失败：ACL 查询异常时放行（与项目软失败约定一致）。
-    """
-    if user is None or user.is_superadmin:
-        return True
-    try:
-        from app.acl.repository import ACLRepository
-        return ACLRepository().has_permission(user, document_id, "delete", tenant_id)
-    except Exception as e:
-        logger.warning("ACL 删除权限判定失败，放行: %s", e)
-        return True
-
-
-def _can_manage_acl(user: AuthUser, tenant_id: str, document_id: str) -> bool:
-    """判断用户是否有权管理文档授权（superadmin / 文档归属人）。"""
-    if user is None or user.is_superadmin:
-        return True
-    try:
-        from app.storage.document_repository import DocumentRepository
-        doc = DocumentRepository().get(document_id, tenant_id=tenant_id)
-        return doc is not None and doc.get("owner_user_id") == user.user_id
-    except Exception as e:
-        logger.warning("ACL 管理权限判定失败: %s", e)
-        return False
-
-# 支持的文件类型 → 对应 loader
-_LOADER_MAP = {
-    ".txt": "app.ingestion.loader.txt_loader.TxtLoader",
-    ".html": "app.ingestion.loader.html_loader.HtmlLoader",
-    ".pdf": "app.ingestion.loader.pdf_loader.PdfLoader",
-    ".docx": "app.ingestion.loader.word_loader.WordLoader",
-}
-
 # 上传大小限制（50MB），防止超大文件打爆内存
 _MAX_UPLOAD_SIZE = 50 * 1024 * 1024
 
 
-async def _read_upload_limited(file: UploadFile, max_size: int) -> bytes:
-    """分块读取上传文件，超过 max_size 直接拒绝，避免一次性读入内存。"""
-    chunks = []
+async def _stream_upload_to_file(file: UploadFile, save_path: Path, max_size: int) -> int:
+    """流式写盘上传内容，超过 max_size 立即 413 拒绝（P2-1）。
+
+    原实现把整个上传聚合为一个内存 bytes（b"".join 单次持有最高 max_size 字节）——
+    改为边读边写，内存占用恒定。返回实际写入字节数。
+    """
     total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_size:
-            raise HTTPException(
-                status_code=413,
-                detail="文件大小超过限制: {} bytes".format(max_size),
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+    try:
+        with open(save_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="文件大小超过限制: {} bytes".format(max_size),
+                    )
+                out.write(chunk)
+    except HTTPException:
+        # 超限：清理部分写入文件，旧源回滚由调用方处理
+        try:
+            save_path.unlink()
+        except OSError:
+            pass
+        raise
+    return total
 
 
 class UploadResponse(BaseModel):
@@ -219,10 +188,31 @@ async def upload_document(
     raw_dir.mkdir(parents=True, exist_ok=True)
     save_path = raw_dir / Path(file.filename or "").name
 
-    content = await _read_upload_limited(file, _MAX_UPLOAD_SIZE)
-    save_path.write_bytes(content)
+    # P1-3: 覆盖更新前先备份旧源文件，索引失败时回滚，避免丢失回滚源。
+    #   backup 后缀 '.bak' 不在 loader 支持列表，不会被 rebuild/扫描误读。
+    backup_path = None
+    if save_path.exists():
+        backup_path = raw_dir / (save_path.name + ".bak")
+        try:
+            import shutil as _shutil
+            _shutil.copy2(save_path, backup_path)
+            logger.info("已备份旧源文件: %s → %s", save_path, backup_path)
+        except Exception as be:
+            logger.error("备份旧源文件失败，中止上传: %s", be, exc_info=True)
+            raise HTTPException(status_code=500, detail="备份旧源文件失败: {}".format(be))
+
+    # P2-1: 流式写盘，不把上传整包聚合进内存；超限(413)时回滚旧源
+    try:
+        total = await _stream_upload_to_file(file, save_path, _MAX_UPLOAD_SIZE)
+    except HTTPException:
+        if backup_path is not None and backup_path.exists():
+            try:
+                backup_path.replace(save_path)
+            except Exception:
+                pass
+        raise
     logger.info(
-        "文件已保存: %s (%d bytes, tenant=%s)", save_path, len(content), tenant_id
+        "文件已保存: %s (%d bytes, tenant=%s)", save_path, total, tenant_id
     )
 
     # 后台异步执行
@@ -230,6 +220,7 @@ async def upload_document(
         from app.core.task_queue import task_manager
         task_id = task_manager.submit(
             "upload", _do_upload, save_path, strategy, tenant_id, owner_user_id,
+            backup_path,
         )
         record(
             action="document.upload", tenant_id=tenant_id,
@@ -252,7 +243,7 @@ async def upload_document(
     from starlette.concurrency import run_in_threadpool
     try:
         result = await run_in_threadpool(
-            _do_upload, save_path, strategy, tenant_id, owner_user_id
+            _do_upload, save_path, strategy, tenant_id, owner_user_id, backup_path
         )
     except Exception as e:
         logger.error("索引构建失败: %s", e, exc_info=True)
@@ -276,16 +267,21 @@ async def upload_document(
 
 
 def _do_upload(save_path: Path, strategy: str, tenant_id: str = "default",
-               owner_user_id: str = "") -> dict:
+               owner_user_id: str = "", backup_path: Optional[Path] = None) -> dict:
     """上传单个文档并构建索引（通过 IndexWriter 统一写入）。
 
     返回 dict 形式的 UploadResponse 数据，供 task_manager 查询时返回。
+
+    backup_path 非空时，成功则删除备份、失败则把旧源文件回滚到 save_path
+    （P1-3：覆盖更新不丢回滚源）。回滚放在 finally 前的包边界处理，保证
+    无论成功/失败旧源都可恢复。
     """
     import time as _time
     t = _time.time()
     logger.info(
-        "_do_upload 开始: file=%s, strategy=%s, tenant=%s, owner=%s",
+        "_do_upload 开始: file=%s, strategy=%s, tenant=%s, owner=%s, backup=%s",
         save_path.name, strategy, tenant_id, owner_user_id or "-",
+        backup_path if backup_path is not None else "-",
     )
 
     try:
@@ -304,29 +300,46 @@ def _do_upload(save_path: Path, strategy: str, tenant_id: str = "default",
         # embedding/reranker 模型继续复用
         logger.info("索引已更新（upload 完成，service 缓存将按版本号自动刷新）")
 
-        logger.info(
-            "_do_upload 完成: %.3fs, file=%s, strategy=%s, tenant=%s, docs=%d, chunks=%d, "
-            "dim=%d, mysql=%s, es=%s",
-            _time.time() - t, save_path.name, strategy, tenant_id,
-            result["document_count"], result["chunk_count"],
-            result["dimension"], result["mysql_persisted"],
-            result["es_persisted"],
-        )
-        return {
-            "strategy": strategy,
-            "document_count": result["document_count"],
-            "chunk_count": result["chunk_count"],
-            "dimension": result["dimension"],
-            "index_path": result["index_path"],
-            "metadata_path": result["metadata_path"],
-        }
+        # 索引构建成功：删除旧源备份
+        if backup_path is not None and backup_path.exists():
+            try:
+                backup_path.unlink()
+                logger.info("上传成功，已删除旧源备份: %s", backup_path)
+            except Exception as be:
+                logger.warning("删除旧源备份失败（可手动清理）: %s", be)
     except Exception as e:
+        # 索引构建失败：回滚旧源文件，保证不丢回滚源
+        if backup_path is not None and backup_path.exists():
+            try:
+                backup_path.replace(save_path)
+                logger.warning(
+                    "索引构建失败，已回滚旧源文件: %s", save_path,
+                )
+            except Exception as be:
+                logger.error("回滚旧源文件失败: %s（旧源保留于 %s）", be, backup_path)
         logger.error(
             "_do_upload 失败: %.3fs, file=%s, strategy=%s, tenant=%s, error=%s: %s",
             _time.time() - t, save_path.name, strategy, tenant_id,
             type(e).__name__, e, exc_info=True,
         )
         raise
+
+    logger.info(
+        "_do_upload 完成: %.3fs, file=%s, strategy=%s, tenant=%s, docs=%d, chunks=%d, "
+        "dim=%d, mysql=%s, es=%s",
+        _time.time() - t, save_path.name, strategy, tenant_id,
+        result["document_count"], result["chunk_count"],
+        result["dimension"], result["mysql_persisted"],
+        result["es_persisted"],
+    )
+    return {
+        "strategy": strategy,
+        "document_count": result["document_count"],
+        "chunk_count": result["chunk_count"],
+        "dimension": result["dimension"],
+        "index_path": result["index_path"],
+        "metadata_path": result["metadata_path"],
+    }
 
 
 @router.post(
@@ -658,6 +671,38 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
                 detail="无权删除文档: {}（非归属人或未授权）".format(resolved_doc_id),
             )
 
+        # P1-2: MySQL 未启用时，删除原始文件后向量/metadata/ES 会残留孤儿。
+        #   从 metadata.json 按 document_id 派生该文档的 vector_ids，
+        #   供步骤 3 的 remove_document 稳定 ID 清理（无需重建）。
+        if not deleted_from_mysql and not vector_ids:
+            import json as _json
+            # 上传时 document_id 取文件名 stem（见 loaders）
+            resolved_doc_id = file_stem or resolved_doc_id
+            for strategy in ("fixed", "recursive"):
+                meta_path = config.index_dir_for(strategy, tenant_id) / "metadata.json"
+                if not meta_path.exists():
+                    continue
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        entries = _json.load(f)
+                except Exception as e:
+                    logger.warning(
+                        "读取 metadata.json 失败（跳过策略 %s）: %s", strategy, e,
+                    )
+                    continue
+                for vid, e in entries.items():
+                    if e.get("document_id") == resolved_doc_id:
+                        raw = e.get("vector_id", vid)
+                        try:
+                            vector_ids.append(int(raw))
+                        except (TypeError, ValueError):
+                            pass
+            vector_ids = sorted(set(vector_ids))
+            logger.info(
+                "MySQL 未启用，从 metadata.json 派生 vector_ids: doc=%s, count=%d",
+                resolved_doc_id, len(vector_ids),
+            )
+
         return {
             "deleted_from_mysql": deleted_from_mysql,
             "deleted_chunks": deleted_chunks,
@@ -679,10 +724,27 @@ async def delete_document(doc_id: str, user: AuthUser = Depends(get_current_user
     if r["vector_ids"]:
         from app.ingestion.writer import IndexWriter
         writer = IndexWriter()
+        orphan_issues = []
         for strategy in ("fixed", "recursive"):
-            writer.remove_document(
-                strategy=strategy, tenant_id=tenant_id,
-                document_id=r["document_id"], vector_ids=r["vector_ids"],
+            try:
+                issues = writer.remove_document(
+                    strategy=strategy, tenant_id=tenant_id,
+                    document_id=r["document_id"], vector_ids=r["vector_ids"],
+                    raise_on_orphan=False,
+                )
+                if issues:
+                    orphan_issues.extend("[{}] {}".format(strategy, i) for i in issues)
+            except Exception as e:
+                orphan_issues.append("[{}] {}".format(strategy, e))
+        # P1-1: 孤儿清理失败不再静默——聚合后以 5xx 暴露，提示对账/重建修复
+        if orphan_issues:
+            logger.error(
+                "文档 %s 删除后向量/元数据清理失败（MySQL/文件已删除，存在孤儿）: %s",
+                r["document_id"], "; ".join(orphan_issues),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="文档已删除，但向量/元数据清理失败（存在孤儿），请运行对账/重建修复",
             )
 
     record(
@@ -730,17 +792,23 @@ async def list_documents(user: AuthUser = Depends(get_current_user)):
                 chunk_repo = ChunkRepository(tenant_id=tenant_id)
                 # 文档级 ACL：仅 MySQL 为数据源时按可读文档过滤
                 readable = _readable_document_ids(user, tenant_id)
-                for row in doc_repo.list_all(limit=1000, tenant_id=tenant_id):
+                rows = [
+                    r for r in doc_repo.list_all(limit=1000, tenant_id=tenant_id)
+                    if readable is None or r["document_id"] in readable
+                ]
+                # P2-2：批量统计 chunk 数，避免逐文档 COUNT（N+1）
+                counts = chunk_repo.counts_by_documents(
+                    [r["document_id"] for r in rows]
+                )
+                for row in rows:
                     doc_id = row["document_id"]
-                    if readable is not None and doc_id not in readable:
-                        continue
                     documents.append(DocumentItem(
                         document_id=doc_id,
                         file_name=row.get("file_name", ""),
                         content_length=row.get("content_length", 0),
                         source=row.get("source") or "",
                         owner_user_id=row.get("owner_user_id") or "",
-                        chunk_count=len(chunk_repo.get_by_document(doc_id)),
+                        chunk_count=counts.get(doc_id, 0),
                         created_at=str(row.get("created_at", "")),
                     ))
                 return DocumentListResponse(documents=documents, total=len(documents))

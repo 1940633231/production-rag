@@ -12,6 +12,8 @@
   - MySQL / ES 软失败：写入异常时记 warning 不中断流程
   - 重建时先 delete_by_strategy + es drop_index + milvus drop 保证幂等
 """
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -21,6 +23,91 @@ from app.core.logger import get_logger
 from app.ingestion.chunk import vector_id_for
 
 logger = get_logger(__name__)
+
+
+# 线程本地：记录当前线程已持有的写锁栈，实现进程内可重入
+_lock_local = threading.local()
+
+
+class IndexWriteLock:
+    """（strategy, tenant）粒度跨进程互斥写锁（Windows/Unix 兼容、可重入）。
+
+    解决 P1-4（FAISS/metadata.json 多 worker 并发写竞态）与
+    P1-5（rebuild 与 upload 之间缺 tenant+strategy 级互斥）。
+
+    实现：
+      - 锁文件置于该 (strategy, tenant) 的 index 目录下（write.lock）
+      - Unix 用 fcntl.flock(LOCK_EX)；Windows 用 msvcrt.locking 锁首字节
+      - 进程内可重入：嵌套调用（如 rebuild → write）复用同一把 OS 锁，
+        通过线程本地计数避免死锁；跨进程由 OS 互斥保证串行
+    """
+
+    def __init__(self, lock_file: Path):
+        self.lock_file = Path(lock_file)
+        self._fh = None
+        self._own = False
+
+    def __enter__(self):
+        stack = getattr(_lock_local, "held", dict())
+        key = str(self.lock_file)
+        if key in stack:
+            # 进程内已持有该锁 → 可重入，仅计数
+            stack[key] += 1
+            _lock_local.held = stack
+            return self
+
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.lock_file, "a+", encoding="utf-8")
+        if sys.platform == "win32":
+            import msvcrt
+            self._fh.seek(0)
+            if self._fh.read(1) == "":
+                self._fh.write("L")
+                self._fh.flush()
+            self._fh.seek(0)
+            while True:
+                try:
+                    # 锁文件区段：从当前位置起锁定 1 字节
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+
+        stack[key] = 1
+        _lock_local.held = stack
+        self._own = True
+        return self
+
+    def __exit__(self, *exc):
+        stack = getattr(_lock_local, "held", dict())
+        key = str(self.lock_file)
+        cnt = stack.get(key, 0) - 1
+        if cnt <= 0:
+            stack.pop(key, None)
+        else:
+            stack[key] = cnt
+        _lock_local.held = stack
+
+        if self._own and self._fh is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    self._fh.seek(0)
+                    try:
+                        msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+                    fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+        self._own = False
+        return False
 
 
 class IndexWriter:
@@ -35,6 +122,12 @@ class IndexWriter:
 
     # ---- 核心写入 ----
 
+    def _write_lock(self, strategy: str, tenant_id: str) -> IndexWriteLock:
+        """（strategy, tenant）粒度写锁。"""
+        return IndexWriteLock(
+            self.config.index_dir_for(strategy, tenant_id) / "write.lock"
+        )
+
     def write(self, documents: List, strategy: str,
               tenant_id: str = "default",
               owner_user_id: str = "",
@@ -43,6 +136,24 @@ class IndexWriter:
               version_bump: bool = True,
               overwrite_existing: bool = True) -> Dict:
         """写入文档到所有启用的存储后端。
+
+        外层持（strategy, tenant）写锁（P1-4/P1-5：跨进程互斥、防文件竞态），
+        实际逻辑在 _write_locked（可重入，rebuild 等嵌套调用复用同一把锁）。
+        """
+        with self._write_lock(strategy, tenant_id):
+            return self._write_locked(
+                documents, strategy, tenant_id, owner_user_id,
+                index_path, metadata_path, version_bump, overwrite_existing,
+            )
+
+    def _write_locked(self, documents: List, strategy: str,
+                      tenant_id: str = "default",
+                      owner_user_id: str = "",
+                      index_path: Optional[str] = None,
+                      metadata_path: Optional[str] = None,
+                      version_bump: bool = True,
+                      overwrite_existing: bool = True) -> Dict:
+        """写入文档到所有启用的存储后端。（在 write 已持锁的临界区内执行）
 
         流程:
           1. Clean → Chunk → Embed
@@ -431,6 +542,20 @@ class IndexWriter:
                 metadata_path: Optional[str] = None) -> Dict:
         """幂等重建索引：先清理旧数据，再全量写入。
 
+        外层持（strategy, tenant）写锁（P1-5：与 upload 等写入互斥）。
+        """
+        with self._write_lock(strategy, tenant_id):
+            return self._rebuild_locked(
+                strategy, tenant_id, owner_user_id, index_path, metadata_path,
+            )
+
+    def _rebuild_locked(self, strategy: str,
+                        tenant_id: str = "default",
+                        owner_user_id: str = "",
+                        index_path: Optional[str] = None,
+                        metadata_path: Optional[str] = None) -> Dict:
+        """幂等重建索引：先清理旧数据，再全量写入。（在已持锁临界区内执行）:
+
         清理顺序:
           1. MySQL: chunk_repo.delete_by_strategy(strategy, tenant_id)
           2. ES: es_client.drop_index(strategy)（租户索引）
@@ -515,6 +640,25 @@ class IndexWriter:
         metadata_path: Optional[str] = None,
     ) -> Dict:
         """删除文档后的增量重建：ES/MySQL 按文档级增量清理，向量层（FAISS/Milvus）+ metadata 重写。
+
+        外层持（strategy, tenant）写锁（P1-5）。
+        """
+        with self._write_lock(strategy, tenant_id):
+            return self._incremental_rebuild_locked(
+                strategy, deleted_doc_ids, tenant_id, owner_user_id,
+                index_path, metadata_path,
+            )
+
+    def _incremental_rebuild_locked(
+        self,
+        strategy: str,
+        deleted_doc_ids: List[str],
+        tenant_id: str = "default",
+        owner_user_id: str = "",
+        index_path: Optional[str] = None,
+        metadata_path: Optional[str] = None,
+    ) -> Dict:
+        """删除文档后的增量重建（在已持锁临界区内执行）。:
 
         相对 rebuild() 的优化：
           - **跳过 MySQL `delete_by_strategy`**（上层 knowledge.py 已按文档级 delete_by_document 清完，
@@ -634,88 +778,56 @@ class IndexWriter:
         return result
 
     def remove_document(self, strategy: str, tenant_id: str,
-                        document_id: str, vector_ids: List[int]) -> None:
+                        document_id: str, vector_ids: List[int],
+                        raise_on_orphan: bool = True) -> List[str]:
+        """删除文档后，从向量后端 + metadata.json + ES 移除对应数据（无需重建索引）。
+
+        外层持（strategy, tenant）写锁（P1-4/P1-5）。
+        """
+        with self._write_lock(strategy, tenant_id):
+            return self._remove_document_locked(
+                strategy, tenant_id, document_id, vector_ids, raise_on_orphan,
+            )
+
+    def _remove_document_locked(self, strategy: str, tenant_id: str,
+                                document_id: str, vector_ids: List[int],
+                                raise_on_orphan: bool = True) -> List[str]:
         """删除文档后，从向量后端 + metadata.json + ES 移除对应数据（无需重建索引）。
 
         稳定 ID 索引：向量按显式 vector_id 删除，其余向量 id 不变；
         metadata.json 按 str(vector_id) 摘除对应条目。
+
+        **孤儿可观测**（P1-1）：各后端移除后做校验，任何移除失败/确认仍残留
+        都会收集进失败列表并返回——不再静默 warning。为避免孤儿，向量未移除时
+        metadata 与 ES 仍继续清理（尽量清干净能清的），最后汇总失败。
 
         参数:
             strategy: 分块策略
             tenant_id: 租户
             document_id: 文档 ID（ES 按文档删除用）
             vector_ids: 该文档 chunk 的稳定向量 ID 列表
+            raise_on_orphan: 存在孤儿清理失败时是否抛异常（默认 True 使调用方可观测）
+
+        返回:
+            失败描述列表（空字符串列表表示清理完整、无孤儿）。
         """
         vector_ids = [int(v) for v in vector_ids if v]
         logger.info(
             "remove_document: strategy=%s, tenant=%s, doc=%s, vector_ids=%d",
             strategy, tenant_id, document_id, len(vector_ids),
         )
+        failures: List[str] = []
 
-        # 1. 向量后端（Milvus 优先，否则 FAISS）——按 vector_id 删除
-        if vector_ids and self.config.storage_milvus_enabled:
-            try:
-                from app.vector import create_vector_store
-
-                col = self.config.milvus_collection_for(strategy, tenant_id)
-                store = create_vector_store(
-                    backend="milvus", dimension=1,
-                    host=self.config.milvus_host,
-                    port=self.config.milvus_port,
-                    collection_name=col,
-                )
-                store.load(col)
-                store.remove(vector_ids)
-                logger.info(
-                    "Milvus 移除向量: collection=%s, ids=%d",
-                    col, len(vector_ids),
-                )
-            except Exception as e:
-                logger.warning(
-                    "Milvus 移除向量失败（可稍后重建索引修复）: %s", e,
-                )
-        elif vector_ids:
-            try:
-                from app.vector import create_vector_store
-
-                index_path = self.config.index_dir_for(strategy, tenant_id) / "faiss.index"
-                if Path(index_path).exists():
-                    store = create_vector_store(
-                        backend="faiss", dimension=1,
-                        index_type=self.config.vector_index_type,
-                    )
-                    store.load(str(index_path))
-                    store.remove(vector_ids)
-                    store.save(str(index_path))
-                    logger.info(
-                        "FAISS 移除向量: path=%s, ids=%d",
-                        index_path, len(vector_ids),
-                    )
-            except Exception as e:
-                logger.warning(
-                    "FAISS 移除向量失败（可稍后重建索引修复）: %s", e,
-                )
+        # 1. 向量后端（Milvus 优先，否则 FAISS）——移除后校验，确认无残留
+        if vector_ids:
+            failures.extend(self._remove_vectors_verified(vector_ids, strategy, tenant_id))
 
         # 2. metadata.json：按 vector_id 摘除条目
         if vector_ids:
             try:
-                from app.storage.metadata_store import MetadataStore
-
-                meta_path = self.config.index_dir_for(strategy, tenant_id) / "metadata.json"
-                if Path(meta_path).exists():
-                    ms = MetadataStore()
-                    entries = ms.load(str(meta_path)) or {}
-                    for vid in vector_ids:
-                        entries.pop(str(vid), None)
-                    ms.save_entries(entries, str(meta_path))
-                    logger.info(
-                        "metadata.json 移除条目: path=%s, 剩余=%d",
-                        meta_path, len(entries),
-                    )
+                self._remove_metadata_by_ids(vector_ids, strategy, tenant_id)
             except Exception as e:
-                logger.warning(
-                    "metadata.json 移除条目失败（可稍后重建索引修复）: %s", e,
-                )
+                failures.append("metadata.json 移除条目失败: {}".format(e))
 
         # 3. ES：按文档删除 chunks
         if self.config.storage_es_enabled:
@@ -729,12 +841,107 @@ class IndexWriter:
                     strategy, document_id,
                 )
             except Exception as e:
-                logger.warning(
-                    "ES 删除文档 chunks 失败（可稍后重建索引修复）: %s", e,
-                )
+                failures.append("ES 删除文档 chunks 失败: {}".format(e))
 
         # 4. 索引版本 +1（数据库唯一权威源；strict：登记失败则删除操作失败）
         self._bump_version(strategy, tenant_id)
+
+        if failures:
+            msg = "remove_document 清理不完整（存在孤儿，需对账/重建修复）:" \
+                  "[{}] {}".format(strategy, "; ".join(failures))
+            logger.error("%s —— doc=%s, tenant=%s", msg, document_id, tenant_id)
+            if raise_on_orphan:
+                raise RuntimeError(msg)
+        else:
+            logger.info(
+                "remove_document 清理完整（无孤儿）: doc=%s, vector_ids=%d, strategy=%s",
+                document_id, len(vector_ids), strategy,
+            )
+        return failures
+
+    def _remove_vectors_verified(self, vector_ids: List[int], strategy: str,
+                                 tenant_id: str) -> List[str]:
+        """按 vector_id 移除向量并校验无残留；返回失败描述列表（空=干净）。"""
+        failures: List[str] = []
+        if not vector_ids:
+            return failures
+        target = set(int(v) for v in vector_ids)
+
+        # Milvus：remove 失败即异常；无法低成本枚举校验，依赖 remove 自身一致性
+        if self.config.storage_milvus_enabled:
+            try:
+                from app.vector import create_vector_store
+
+                col = self.config.milvus_collection_for(strategy, tenant_id)
+                store = create_vector_store(
+                    backend="milvus", dimension=1,
+                    host=self.config.milvus_host,
+                    port=self.config.milvus_port,
+                    collection_name=col,
+                )
+                store.load(col)
+                store.remove(list(target))
+                logger.info(
+                    "Milvus 移除向量: collection=%s, ids=%d",
+                    col, len(target),
+                )
+            except Exception as e:
+                failures.append("Milvus 移除向量失败: {}".format(e))
+            return failures
+
+        # FAISS：移除后通过 ids() 枚举校验，确认目标 id 已不存在
+        try:
+            from app.vector import create_vector_store
+
+            index_path = self.config.index_dir_for(strategy, tenant_id) / "faiss.index"
+            if not Path(index_path).exists():
+                # 该策略无本地向量索引 → 无孤儿，视为干净
+                logger.info("FAISS 索引不存在，跳过向量移除: %s", index_path)
+                return failures
+            store = create_vector_store(
+                backend="faiss", dimension=1,
+                index_type=self.config.vector_index_type,
+            )
+            store.load(str(index_path))
+            store.remove(list(target))
+            store.save(str(index_path))
+            remaining = set(int(i) for i in store.ids()) & target
+            if remaining:
+                samples = sorted(remaining)[:10]
+                failures.append(
+                    "FAISS 移除后仍残留 {} 个向量: {}".format(
+                        len(remaining), samples
+                    )
+                )
+            else:
+                logger.info(
+                    "FAISS 移除向量并校验通过: path=%s, ids=%d",
+                    index_path, len(target),
+                )
+        except Exception as e:
+            failures.append("FAISS 移除向量异常: {}".format(e))
+        return failures
+
+    def _remove_metadata_by_ids(self, vector_ids: List[int], strategy: str,
+                                tenant_id: str) -> None:
+        """从 metadata.json 按 vector_id 摘除条目（并发安全：读-改-写）。"""
+        from app.storage.metadata_store import MetadataStore
+
+        meta_path = self.config.index_dir_for(strategy, tenant_id) / "metadata.json"
+        if not Path(meta_path).exists():
+            return
+        ms = MetadataStore()
+        entries = ms.load(str(meta_path)) or {}
+        removed = 0
+        for vid in vector_ids:
+            if entries.pop(str(vid), None) is not None:
+                removed += 1
+        if removed:
+            ms.save_entries(entries, str(meta_path))
+            logger.info(
+                "metadata.json 移除条目: path=%s, 移除=%d, 剩余=%d",
+                meta_path, removed, len(entries),
+            )
 
     def _bump_version(self, strategy: str, tenant_id: str) -> None:
         """索引版本 +1（数据库为唯一权威源；strict：失败抛异常）。
@@ -1263,17 +1470,12 @@ class IndexWriter:
         """加载某租户 data/raw/ 目录下所有支持的文档。"""
         import importlib
 
+        from app.ingestion.loader.registry import LOADER_MAP as loader_map
+
         raw_dir = self.config.raw_dir_for(tenant_id)
         if not raw_dir.exists():
             logger.error("data/raw 目录不存在 (tenant=%s): %s", tenant_id, raw_dir)
             raise FileNotFoundError("data/raw 目录不存在 (tenant={})".format(tenant_id))
-
-        loader_map = {
-            ".txt": "app.ingestion.loader.txt_loader.TxtLoader",
-            ".html": "app.ingestion.loader.html_loader.HtmlLoader",
-            ".pdf": "app.ingestion.loader.pdf_loader.PdfLoader",
-            ".docx": "app.ingestion.loader.word_loader.WordLoader",
-        }
 
         files = [f for f in raw_dir.iterdir() if f.suffix.lower() in loader_map]
         logger.info(
@@ -1305,12 +1507,7 @@ class IndexWriter:
         """加载单个文档。"""
         import importlib
 
-        loader_map = {
-            ".txt": "app.ingestion.loader.txt_loader.TxtLoader",
-            ".html": "app.ingestion.loader.html_loader.HtmlLoader",
-            ".pdf": "app.ingestion.loader.pdf_loader.PdfLoader",
-            ".docx": "app.ingestion.loader.word_loader.WordLoader",
-        }
+        from app.ingestion.loader.registry import LOADER_MAP as loader_map
 
         loader_cls_path = loader_map.get(file_path.suffix.lower())
         if not loader_cls_path:

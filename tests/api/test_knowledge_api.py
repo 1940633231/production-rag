@@ -70,7 +70,7 @@ class TestUploadRoute:
 
         monkeypatch.setattr(
             knowledge, "_do_upload",
-            lambda path, strategy, tenant_id="default", owner_user_id="": {
+            lambda path, strategy, tenant_id="default", owner_user_id="", backup_path=None: {
                 "document_count": 1, "chunk_count": 2, "dimension": 768,
                 "index_path": "data/index/recursive/faiss.index",
                 "metadata_path": "data/index/recursive/metadata.json",
