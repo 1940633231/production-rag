@@ -212,16 +212,17 @@ class TestGcVersion:
 
         monkeypatch.setattr(
             w, "_remove_vectors",
-            lambda ids, strategy, tenant_id: removed_vectors.append(ids),
+            lambda ids, strategy, tenant_id: removed_vectors.append((strategy, ids)),
         )
         monkeypatch.setattr(
             w, "_remove_metadata",
             lambda doc_id, version, strategy, tenant_id:
-                removed_meta.append((doc_id, version)),
+                removed_meta.append((strategy, doc_id, version)),
         )
         w._gc_version("report", 1, "recursive", "default", FakeChunkRepo())
-        assert removed_vectors == [[10, 20]]
-        assert removed_meta == [("report", 1)]
+        # 遍历 fixed + recursive 两个策略清理；MySQL 一次全删
+        assert removed_vectors == [("fixed", [10, 20]), ("recursive", [10, 20])]
+        assert removed_meta == [("fixed", "report", 1), ("recursive", "report", 1)]
         assert deleted_db == [("report", 1)]
 
     def test_gc_failure_is_caught(self, monkeypatch):
