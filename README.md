@@ -23,7 +23,8 @@
 - **文档级 ACL**：`documents.owner_user_id` + `document_acl` 授权表，按 用户/角色 授予 read/write/delete；检索/列表按可读文档过滤，删除按归属校验；删文档/用户/角色时级联清理授权（document_acl 外键 + 代码级）
 - **权限感知缓存**：RAG 结果缓存 key 含 租户+权限指纹+user_id+索引版本，不同租户/权限/用户不串缓存，权限变更或索引重建自动失效；支持**内存（LRU）/ Redis** 双后端，Redis 不可用时自动降级内存
 - **审计日志**：401/403 越权自动记录 + 登录/用户/角色/文档操作显式记录（MySQL `audit_logs` 表），支持按租户/操作者/action 过滤查询
-- **稳定 ID 索引**：向量使用显式稳定 ID（chunk_id 哈希），删除按 ID 移除向量、无需全量重建；upload 追加写入不覆盖旧索引
+- **稳定 ID 索引**：向量使用显式稳定 ID（chunk_id 哈希），删除按 ID 移除向量、无需全量重建
+- **同名文档更新（可选）**：`ingestion.document_versioning.enabled=false`（默认）时同名上传 = **覆盖更新**（先清当前策略旧内容再写新，各端一致、无孤儿、ACL 保留）；`enabled=true` 时 = **版本化**（新版本写入 + 活跃指针原子切换 + 乐观锁 + GC）；两者都只作用于当前切分策略，不影响其他策略索引
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
 - **管理台 Web UI**：登录鉴权 + 9 面板（问答/上传/文档/索引/任务/用户/角色/审计日志/监控），支持文档 ACL 授权、用户/角色管理、审计查询、指标可视化（`/admin` 或 `/` 跳转）
@@ -274,6 +275,12 @@ vector:
 chunk:
   chunk_size: 800   # 每块字符数
   overlap: 120      # 重叠字符数
+
+ingestion:
+  document_versioning:  # 同名文档处理（可选，默认关闭）
+    enabled: false      # false：同名上传 = 覆盖更新（先清当前策略旧内容再写新，各端一致）
+                        # true：同名上传 = 版本化（新版本 + 活跃指针原子切换 + GC）
+    retention: latest   # latest=只留最新（P1）/ N=保留N版可回溯（P2）
 
 retrieval:
   top_k: 5          # 检索返回数
