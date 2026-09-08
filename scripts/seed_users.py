@@ -32,6 +32,13 @@ def main():
     username = args.username or config.auth_seed_username
     password = args.password or config.auth_seed_password
 
+    # 生产护栏：生产模式下拒绝用默认管理员密码建号（fail-fast）
+    if config.is_production and password == Config.DEFAULT_ADMIN_PASSWORD:
+        raise SystemExit(
+            "ERROR: 生产模式（APP_ENV=production）不允许以默认密码 'admin123' 初始化管理员。"
+            "请执行 python scripts/seed_users.py --password <强密码>"
+        )
+
     from app.auth.rbac_repository import RBACRepository
     from app.auth.rbac import SUPERADMIN_ROLE
     from app.auth.security import hash_password

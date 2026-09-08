@@ -12,6 +12,66 @@ class Config:
 
             self.data = yaml.safe_load(f)
 
+    # ---- 运行环境与生产安全护栏 ----
+
+    # 已知默认值：生产模式不允许原样使用（fail-fast）
+    DEFAULT_JWT_SECRET = "dev-secret-change-me"
+    DEFAULT_ADMIN_PASSWORD = "admin123"
+
+    @property
+    def run_mode(self):
+        """运行模式：环境变量 APP_ENV（dev/production，默认 dev/dev_local）。"""
+        import os
+        return os.getenv("APP_ENV", "dev").strip().lower() or "dev"
+
+    @property
+    def is_production(self):
+        """是否生产模式（APP_ENV=production / prod）。"""
+        return self.run_mode in ("production", "prod")
+
+    def validate_production_security(self):
+        """生产模式安全校验：发现已知默认密钥/默认管理员密码则抛错，拒绝以弱配置启动。
+
+        目的：不依赖 deployment operator 自觉修改。任何一次启动若仍带着
+        dev-secret-change-me / admin123 跑生产，直接启动失败，而不是默默上线。
+        """
+        if not self.is_production:
+            return
+        errors = []
+        if self.auth_config.get("enabled", True):
+            secret = self.auth_jwt_secret
+            if secret == self.DEFAULT_JWT_SECRET:
+                errors.append("JWT 密钥仍为默认占位 'dev-secret-change-me'")
+            elif len(secret.encode("utf-8")) < 32:
+                errors.append("JWT 密钥过短（<32 字节），易被暴力破解")
+            if self.auth_seed_password == self.DEFAULT_ADMIN_PASSWORD:
+                errors.append("管理员密码仍为默认 'admin123'")
+        if errors:
+            raise RuntimeError(
+                "生产模式（APP_ENV=production）安全校验失败："
+                + "; ".join(errors)
+                + "。请设置强密钥：export JWT_SECRET=<强随机值>；"
+                  "并以 seed_users.py --password <强密码> 初始化管理员后更新 auth.seed_password。"
+            )
+
+    def warn_default_credentials(self):
+        """非生产模式下的善意提醒（不阻断启动）。"""
+        if self.is_production:
+            return
+        import logging
+        if self.auth_config.get("enabled", True):
+            secret = self.auth_jwt_secret
+            if secret == self.DEFAULT_JWT_SECRET or len(secret.encode("utf-8")) < 32:
+                logging.getLogger(__name__).warning(
+                    "JWT 密钥仍为默认/过短（%s...）。生产环境请务必通过环境变量 %s 覆盖强密钥。",
+                    secret[:8], self.auth_config.get("jwt_secret_env", "JWT_SECRET"),
+                )
+            if self.auth_seed_password == self.DEFAULT_ADMIN_PASSWORD:
+                logging.getLogger(__name__).warning(
+                    "管理员密码仍为默认 'admin123'。请用 scripts/seed_users.py --password <强密码> "
+                    "重设并在部署配置中覆盖 auth.seed_password。",
+                )
+
     @property
     def embedding_model(self):
         return self.data["embedding"]["model_name"]

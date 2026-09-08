@@ -24,6 +24,13 @@ def create_app() -> FastAPI:
     # 加载 .env（确保 DASHSCOPE_API_KEY 等环境变量可用）
     load_env()
 
+    # 生产安全护栏：APP_ENV=production 时若仍使用默认 JWT 密钥/默认管理员密码，
+    # 立即抛错拒绝启动（fail-fast），不依赖部署方自觉修改。
+    from app.core.config import Config
+    _cfg = Config()
+    _cfg.validate_production_security()
+    _cfg.warn_default_credentials()
+
     app = FastAPI(
         title="Production RAG API",
         description="生产级 RAG 问答服务：文档摄入 → 检索 → 重排 → 上下文管理 → 生成 → 引用溯源",

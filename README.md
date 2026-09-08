@@ -139,6 +139,10 @@ pip install -r requirements.txt
 # 认证 / RBAC（生产必须设置 JWT 密钥，未设置回退 config.yaml 的 auth.jwt_secret）
 JWT_SECRET=your-long-random-secret
 
+# 运行模式（默认 dev）。生产必须显式设为 production——
+# 启用生产安全护栏：仍用默认 JWT 密钥(dev-secret-change-me) 或默认管理员密码(admin123)
+# 时，服务启动直接失败（fail-fast），不再依赖部署人员自觉修改。
+APP_ENV=production
 # DashScope（LLM 生成，backend=qwen 时使用，不使用 Qwen 可不配）
 DASHSCOPE_API_KEY=sk-your-api-key-here
 DASHSCOPE_MODEL=qwen-plus
@@ -169,7 +173,9 @@ CREATE DATABASE IF NOT EXISTS production_rag CHARACTER SET utf8mb4;
 
 ### 4. 初始化认证与种子账号
 
-首次部署需运行种子脚本：自动创建 RBAC / 审计 / 文档 ACL 表，并创建管理员账号（默认 `admin / admin123`，请尽快修改）：
+首次部署需运行种子脚本：自动创建 RBAC / 审计 / 文档 ACL 表，并创建管理员账号（默认 `admin / admin123`，**生产模式必设强密码**）：
+
+> 生产护栏（`APP_ENV=production`）：① 服务启动若仍用默认 JWT 密钥/默认 `admin123` 直接启动失败；② `seed_users.py` 以默认 `admin123` 建号会被拒绝。都不再依赖“请尽快修改”的自觉。
 
 ```bash
 .venv\Scripts\python.exe scripts\seed_users.py
@@ -338,13 +344,13 @@ storage:
 
 auth:
   enabled: true                 # 鉴权总开关：false 时跳过 JWT 校验（本地调试）
-  jwt_secret: dev-secret-change-me  # JWT 签名密钥（生产用环境变量 JWT_SECRET 覆盖）
+  jwt_secret: dev-secret-change-me  # JWT 签名密钥（dev 占位；生产用环境变量 JWT_SECRET 覆盖，否则启动失败）
   jwt_secret_env: JWT_SECRET    # 从环境变量读密钥（优先级 > jwt_secret）
   token_expire_hours: 24        # token 有效期（小时）
   token_version_check: true    # 权限变更即时吊销：旧 token 下次请求 401（需 MySQL 可用）
   algorithm: HS256              # JWT 签名算法
   seed_username: admin          # 种子账号（scripts/seed_users.py 使用）
-  seed_password: admin123
+  seed_password: admin123       # 种子密码（dev 占位；APP_ENV=production 时拒绝用默认值建号/启动）
 
 cache:
   enabled: true                 # 权限感知查询缓存开关
