@@ -99,6 +99,8 @@ class BM25Search:
                     "score": float(score),
                     "vector_id": int(document.get("vector_id", 0)),
                     "chunk_id": document["chunk_id"],
+                    "document_id": document.get("document_id"),
+                    "version": int(document.get("version", 1) or 1),
                     "content": document["content"],
                     "start_offset": document.get("start_offset", 0),
                     "end_offset": document.get("end_offset", 0),

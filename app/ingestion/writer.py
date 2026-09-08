@@ -271,9 +271,13 @@ class IndexWriter:
         )
 
         # 2b. 文档版本化：解析每文档版本（upload bump / rebuild 保持），
-        #     chunk_id 含版本 → 各端隔离（向量/metadata/MySQL/ES 零冲突追加）
+        #     chunk_id 含版本 → 各端隔离（向量/metadata/MySQL/ES 零冲突追加）。
+        #     版本化先确保 schema 已迁移（document_versions.strategy / token_version 等），
+        #     避免在持久化阶段才 init，导致此处版本解析先报 Unknown column。
+        if self._versioning_active():
+            self._ensure_schema()
         version_by_doc = self._resolve_doc_versions(
-            cleaned_documents, tenant_id, version_bump
+            cleaned_documents, tenant_id, strategy, version_bump
         )
         self._apply_version_to_chunks(chunks, version_by_doc)
 
@@ -963,15 +967,28 @@ class IndexWriter:
             and self.config.storage_mysql_enabled
         )
 
-    def _resolve_doc_versions(self, documents, tenant_id: str,
-                              bump: bool) -> Dict:
-        """解析每文档目标版本：{document_id: version}。
+    def _ensure_schema(self):
+        """确保 MySQL 表结构就绪并完成迁移（幂等，失败放延迟到持久化阶段）。
 
-        - bump=True（upload）：已存在文档 → current_version+1（新版本）；
-          新文档 → 1
-        - bump=False（rebuild/incremental）：保持当前版本（不 bump，
+        版本解析/台账写入前显式 init_schema：把老库缺列的迁移（如
+        document_versions 补 strategy）在查询前完成，避免 Unknown column。
+        """
+        try:
+            from app.storage.mysql import MySQLManager
+            MySQLManager(pool_size=self.config.storage_pool_size).init_schema()
+        except Exception as e:
+            logger.warning("前置 schema 初始化失败（持久化阶段将重试）: %s", e)
+
+    def _resolve_doc_versions(self, documents, tenant_id: str,
+                              strategy: str, bump: bool) -> Dict:
+        """解析每文档目标版本：{document_id: version}（按 (document, strategy) 维度）。
+
+        - bump=True（upload）：该 (doc, strategy) 现存最大版本 + 1（新版本）；无则 1
+        - bump=False（rebuild/incremental）：保持该 (doc, strategy) 当前活跃版本（不 bump，
           保证 rebuild 后 vector_id/chunk_id 稳定，ACL 不丢）
         - 版本化未生效：全部返回 1（chunk_id 保持旧格式，行为零变化）
+
+        版本按策略隔离：同一文档在 fixed / recursive 各自独立版本，互不串扰。
         """
         versions = {d.document_id: 1 for d in documents}
         if not self._versioning_active():
@@ -981,14 +998,17 @@ class IndexWriter:
 
         mgr = MySQLManager(pool_size=self.config.storage_pool_size)
         doc_repo = DocumentRepository(mgr)
+        if not bump:
+            active = doc_repo.get_active_versions(
+                [d.document_id for d in documents], strategy, tenant_id
+            )
         for doc in documents:
-            cur = doc_repo.get_current_version(doc.document_id, tenant_id)
-            if cur is None:
-                versions[doc.document_id] = 1
-            elif bump:
-                versions[doc.document_id] = cur + 1
+            if bump:
+                versions[doc.document_id] = doc_repo.next_version(
+                    doc.document_id, strategy, tenant_id
+                )
             else:
-                versions[doc.document_id] = cur
+                versions[doc.document_id] = active.get(doc.document_id, 1)
         return versions
 
     def _apply_version_to_chunks(self, chunks: List, version_by_doc: Dict) -> None:
@@ -1007,21 +1027,33 @@ class IndexWriter:
                 c.metadata["version"] = ver
             c.version = ver
 
+    def _retention_keep(self) -> Optional[int]:
+        """返回版本保留策略：latest → None（只留活跃）；N（int）→ 保留最近 N 版。"""
+        raw = str(self.config.document_versioning_retention or "latest").lower().strip()
+        if raw == "latest":
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning(
+                "document_versioning.retention=%r 无法解析，按 latest（只留活跃）处理", raw,
+            )
+            return None
+
     def _finalize_versions(self, version_by_doc: Dict,
                            strategy: str, tenant_id: str) -> None:
-        """写入完成后收尾：原子切换活跃版本指针 + GC 旧版本。
+        """写入完成后收尾：记录 (document, strategy) 版本台账 + 按 retention 清理旧版本。
 
-        P1 仅支持 retention=latest：切换后同步 GC 旧版本各端数据，
-        保证"上传完成 = 只剩活跃版本"，检索无需版本过滤。
+        活跃版本 = 该 (document, strategy) 现存版本最大者（rehydration 自洽），
+        因此无需额外的活跃指针切换；版本号按 (doc,strategy) 单调递增 + PK 去重保证并发安全。
+
+        - retention=latest：GC 上一版本（当前策略，只留活跃）
+        - retention=N：保留最近 N 版，清理 N 之前的旧版（老版本仍在索引，由检索
+          活跃过滤保证只命中活跃版）
         """
         if not self._versioning_active():
             return
-        if self.config.document_versioning_retention != "latest":
-            logger.warning(
-                "document_versioning.retention=%s 暂不支持（P1 仅 latest），跳过版本收尾",
-                self.config.document_versioning_retention,
-            )
-            return
+        keep = self._retention_keep()
         from app.storage import ChunkRepository, DocumentRepository
         from app.storage.mysql import MySQLManager
 
@@ -1030,19 +1062,93 @@ class IndexWriter:
         chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
         for doc_id, new_ver in version_by_doc.items():
             old_ver = new_ver - 1
-            if old_ver < 1:
-                continue  # 新文档：documents.current_version 已默认 1
-            # 原子切换（乐观锁：current_version 仍为旧值才切，防并发覆盖）
-            ok = doc_repo.set_current_version(
-                doc_id, new_ver, expected_version=old_ver, tenant_id=tenant_id
-            )
-            if not ok:
-                logger.warning(
-                    "版本切换冲突（并发上传），跳过 GC: doc=%s, v=%s",
-                    doc_id, new_ver,
+            # 记录新版本到台账（版本列表/回滚/活跃版本派生的数据源）
+            self._record_version(doc_id, strategy, new_ver, tenant_id)
+
+            if keep is None:
+                # retention=latest：GC 上一版本（当前策略），台账只留活跃
+                if old_ver >= 1:
+                    self._gc_version(doc_id, old_ver, strategy, tenant_id, chunk_repo)
+                    try:
+                        doc_repo.delete_version(doc_id, strategy, old_ver, tenant_id)
+                    except Exception as e:
+                        logger.warning(
+                            "删除旧版本台账失败: doc=%s, strategy=%s, v=%s, %s",
+                            doc_id, strategy, old_ver, e,
+                        )
+            else:
+                # retention=N：保留最近 N 版，清理 N 之前的旧版本（当前策略）
+                for v in range(1, new_ver - keep + 1):
+                    if doc_repo.has_version(doc_id, strategy, v, tenant_id):
+                        self._gc_version(doc_id, v, strategy, tenant_id, chunk_repo)
+                        doc_repo.delete_version(doc_id, strategy, v, tenant_id)
+
+    def _record_version(self, doc_id: str, strategy: str, version: int,
+                        tenant_id: str) -> None:
+        """把 (doc, strategy, version) 记录到 document_versions 台账（含该策略 chunk 数）。"""
+        try:
+            from app.storage import ChunkRepository, DocumentRepository
+            from app.storage.mysql import MySQLManager
+
+            mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+            chunk_count = len(
+                ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
+                .get_vector_ids_by_document(
+                    doc_id, tenant_id=tenant_id, version=version, strategy=strategy
                 )
-                continue
-            self._gc_version(doc_id, old_ver, strategy, tenant_id, chunk_repo)
+            )
+            DocumentRepository(mgr).insert_version(
+                doc_id, strategy, version, tenant_id, chunk_count=chunk_count
+            )
+        except Exception as e:
+            logger.warning(
+                "记录文档版本台账失败: doc=%s, strategy=%s, v=%s, %s",
+                doc_id, strategy, version, e,
+            )
+
+    def rollback_document(self, document_id: str, target_version: int,
+                          strategy: str, tenant_id: str = "default") -> int:
+        """把文档在**指定策略**下回滚到较早版本（单活跃：切到目标并丢弃所有更新版本）。
+
+        前置（按 (document, strategy)）：
+          - 版本化必须启用
+          - 目标版本必须存在于台账（未回收）且早于当前活跃版本
+        成功后返回新活跃版本号。持该策略写锁与其他写入互斥。
+        """
+        if not self._versioning_active():
+            raise RuntimeError("文档版本化未启用，无法执行回滚")
+        from app.storage import ChunkRepository, DocumentRepository
+        from app.storage.mysql import MySQLManager
+
+        mgr = MySQLManager(pool_size=self.config.storage_pool_size)
+        doc_repo = DocumentRepository(mgr)
+
+        with self._write_lock(strategy, tenant_id):
+            active = doc_repo.get_active_versions(
+                [document_id], strategy, tenant_id
+            ).get(document_id)
+            if active is None:
+                raise ValueError("文档不存在或尚无版本: {}".format(document_id))
+            target = int(target_version)
+            if target < 1 or target >= active:
+                raise ValueError(
+                    "仅支持回滚到较早版本（1 <= target < 当前版本 {}）".format(active)
+                )
+            if not doc_repo.has_version(document_id, strategy, target, tenant_id):
+                raise ValueError("目标版本 {} 已回收/不存在，无法回滚".format(target))
+            chunk_repo = ChunkRepository(mgr, strategy=strategy, tenant_id=tenant_id)
+            # 单活跃：丢弃 target 之后的所有版本（数据 + 台账）
+            for v in range(target + 1, active + 1):
+                if doc_repo.has_version(document_id, strategy, v, tenant_id):
+                    self._gc_version(document_id, v, strategy, tenant_id, chunk_repo)
+                    doc_repo.delete_version(document_id, strategy, v, tenant_id)
+            # 索引版本 +1：使查询缓存失效
+            self._bump_version(strategy, tenant_id)
+            logger.info(
+                "文档回滚完成: doc=%s, strategy=%s, 活跃 %s → %s",
+                document_id, strategy, active, target,
+            )
+            return target
 
     def _gc_version(self, doc_id: str, version: int, strategy: str,
                     tenant_id: str, chunk_repo) -> None:

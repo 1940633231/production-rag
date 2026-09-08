@@ -77,7 +77,8 @@ chunk:
 ingestion:
   document_versioning:
     enabled: true          # false：同名上传保持现状（行为零变化）
-    retention: latest         # latest=只留最新（P1）/ N=保留N版可回溯（P2）
+    retention: latest      # latest=只留最新 / N（如 3）=保留最近 N 版可回溯（配合 /versions 回滚 API）
+                           #   注意 N>latest 时旧版本留在索引，检索按活跃版本过滤，不会串旧版
   # 发布前校验（Build → Validation → Publish 分离）：确认本次 chunks 已写入
   # 各启用后端（metadata/ES/向量），校验通过才切换版本；失败默认中止发布
   write_validation:

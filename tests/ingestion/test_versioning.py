@@ -79,7 +79,7 @@ class TestResolveDocVersions:
         from app.ingestion.document import Document
 
         docs = [Document(document_id="report", content="x", metadata={})]
-        assert w._resolve_doc_versions(docs, "default", bump=True) == {"report": 1}
+        assert w._resolve_doc_versions(docs, "default", "recursive", bump=True) == {"report": 1}
 
     def test_bump_existing_document(self, monkeypatch):
         cfg = _Cfg()
@@ -87,8 +87,8 @@ class TestResolveDocVersions:
         w = IndexWriter(config=cfg)
 
         class FakeDocRepo:
-            def get_current_version(self, doc_id, tenant_id=None):
-                return {"report": 1, "newdoc": None}.get(doc_id)
+            def next_version(self, doc_id, strategy, tenant_id=None):
+                return {"report": 2, "newdoc": 1}.get(doc_id)
 
         monkeypatch.setattr(
             "app.storage.DocumentRepository", lambda manager=None: FakeDocRepo()
@@ -97,7 +97,7 @@ class TestResolveDocVersions:
 
         docs = [Document(document_id="report", content="x", metadata={}),
                 Document(document_id="newdoc", content="y", metadata={})]
-        versions = w._resolve_doc_versions(docs, "default", bump=True)
+        versions = w._resolve_doc_versions(docs, "default", "recursive", bump=True)
         assert versions == {"report": 2, "newdoc": 1}   # 已存在 +1，新文档 1
 
     def test_rebuild_keeps_current(self, monkeypatch):
@@ -106,8 +106,8 @@ class TestResolveDocVersions:
         w = IndexWriter(config=cfg)
 
         class FakeDocRepo:
-            def get_current_version(self, doc_id, tenant_id=None):
-                return 3   # 当前活跃 v3
+            def get_active_versions(self, document_ids, strategy, tenant_id=None):
+                return {"report": 3}   # 该策略当前活跃 v3
 
         monkeypatch.setattr(
             "app.storage.DocumentRepository", lambda manager=None: FakeDocRepo()
@@ -116,80 +116,123 @@ class TestResolveDocVersions:
 
         docs = [Document(document_id="report", content="x", metadata={})]
         # bump=False（rebuild）：保持 v3，不推进
-        assert w._resolve_doc_versions(docs, "default", bump=False) == {"report": 3}
+        assert w._resolve_doc_versions(docs, "default", "recursive", bump=False) == {"report": 3}
+
+
+class _LedgerDocRepo:
+    """记录调用的 DocumentRepository 替身（per-strategy 契约）。"""
+    def __init__(self):
+        self.deleted = []
+        self.inserted = []
+        self.active = {}
+
+    def set_active(self, active_map):
+        self.active = active_map
+
+    def get_active_versions(self, document_ids, strategy, tenant_id=None):
+        return {d: v for d, v in self.active.items() if d in document_ids}
+
+    def next_version(self, doc_id, strategy, tenant_id=None):
+        return int(self.active.get(doc_id, 0)) + 1
+
+    def has_version(self, doc_id, strategy, version, tenant_id=None):
+        return True
+
+    def delete_version(self, doc_id, strategy, version, tenant_id=None):
+        self.deleted.append((doc_id, strategy, version))
+
+    def insert_version(self, doc_id, strategy, version, tenant_id="default",
+                       chunk_count=0):
+        self.inserted.append((doc_id, strategy, version))
+
+
+class _FakeChunkRepo:
+    def get_vector_ids_by_document(self, document_id, tenant_id=None,
+                                   version=None, strategy=None):
+        return []
 
 
 class TestFinalizeVersions:
-    def test_new_document_skips_switch_and_gc(self, monkeypatch):
+    def test_new_document_no_gc(self, monkeypatch):
         cfg = _Cfg()
         cfg.document_versioning_enabled = True
         w = IndexWriter(config=cfg)
-        called = []
-        monkeypatch.setattr(w, "_gc_version", lambda *a, **k: called.append(a))
-        monkeypatch.setattr(
-            "app.storage.DocumentRepository", lambda manager=None: object()
-        )
-        monkeypatch.setattr(
-            "app.storage.ChunkRepository", lambda manager=None, strategy=None,
-            tenant_id=None: object()
-        )
+        gced = []
+        fdr = _LedgerDocRepo()
+        monkeypatch.setattr("app.storage.DocumentRepository", lambda manager=None: fdr)
+        monkeypatch.setattr("app.storage.ChunkRepository", lambda manager=None, **kw: _FakeChunkRepo())
+        monkeypatch.setattr(w, "_gc_version", lambda *a, **k: gced.append(a))
         w._finalize_versions({"report": 1}, "recursive", "default")
-        assert called == []   # v1 新文档：无旧版本可 GC
+        assert gced == []                  # v1 新文档：无旧版本
+        assert fdr.inserted == [("report", "recursive", 1)]  # 已记录台账
 
-    def test_existing_document_switches_then_gc(self, monkeypatch):
-        cfg = _Cfg()
-        cfg.document_versioning_enabled = True
-        w = IndexWriter(config=cfg)
-        switched = []
-        gced = []
-
-        class FakeDocRepo:
-            def set_current_version(self, doc_id, new_version,
-                                    expected_version=None, tenant_id=None):
-                switched.append((doc_id, new_version, expected_version))
-                return True
-
-        monkeypatch.setattr(
-            "app.storage.DocumentRepository", lambda manager=None: FakeDocRepo()
-        )
-        monkeypatch.setattr(
-            "app.storage.ChunkRepository", lambda manager=None, strategy=None,
-            tenant_id=None: object()
-        )
-        monkeypatch.setattr(
-            w, "_gc_version",
-            lambda doc_id, version, strategy, tenant_id, chunk_repo:
-                gced.append((doc_id, version)),
-        )
-        w._finalize_versions({"report": 2}, "recursive", "default")
-        assert switched == [("report", 2, 1)]   # 原子切换 1 → 2
-        assert gced == [("report", 1)]          # GC 旧版本 v1
-
-    def test_switch_conflict_skips_gc(self, monkeypatch):
+    def test_latest_gc_previous_version(self, monkeypatch):
+        """retention=latest，上传到 v2 → 记台账 v2，GC v1。"""
         cfg = _Cfg()
         cfg.document_versioning_enabled = True
         w = IndexWriter(config=cfg)
         gced = []
-
-        class FakeDocRepo:
-            def set_current_version(self, doc_id, new_version,
-                                    expected_version=None, tenant_id=None):
-                return False   # 并发冲突（current_version 已不是 1）
-
-        monkeypatch.setattr(
-            "app.storage.DocumentRepository", lambda manager=None: FakeDocRepo()
-        )
-        monkeypatch.setattr(
-            "app.storage.ChunkRepository", lambda manager=None, strategy=None,
-            tenant_id=None: object()
-        )
-        monkeypatch.setattr(
-            w, "_gc_version",
-            lambda doc_id, version, strategy, tenant_id, chunk_repo:
-                gced.append((doc_id, version)),
-        )
+        fdr = _LedgerDocRepo()
+        monkeypatch.setattr("app.storage.DocumentRepository", lambda manager=None: fdr)
+        monkeypatch.setattr("app.storage.ChunkRepository", lambda manager=None, **kw: _FakeChunkRepo())
+        monkeypatch.setattr(w, "_gc_version",
+                            lambda doc_id, v, strategy, tenant, repo: gced.append((doc_id, v)))
         w._finalize_versions({"report": 2}, "recursive", "default")
-        assert gced == []   # 切换失败 → 不 GC（避免误删他人新版本）
+        assert gced == [("report", 1)]                     # GC 旧版本 v1（当前策略）
+        assert ("report", "recursive", 1) in fdr.deleted   # 台账同步删 v1
+
+
+class TestRetentionPolicy:
+    """retention=N（P2）：保留最近 N 版，清理更早版本 / 回滚丢弃更新版本（per-strategy）。"""
+
+    @pytest.fixture
+    def w(self, monkeypatch):
+        cfg = _Cfg()
+        cfg.document_versioning_enabled = True
+        cfg.document_versioning_retention = "3"
+        w = IndexWriter(config=cfg)
+
+        class _NoopLock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(w, "_write_lock", lambda strat, tenant: _NoopLock())
+        return w
+
+    def test_retention_n_prunes_beyond_keep(self, monkeypatch, w):
+        """retention=3, 上传到 v5 → 保留 v3/v4/v5，GC v1/v2（当前策略）。"""
+        fdr = _LedgerDocRepo()
+        monkeypatch.setattr("app.storage.DocumentRepository", lambda manager=None: fdr)
+        monkeypatch.setattr("app.storage.ChunkRepository", lambda manager=None, **kw: _FakeChunkRepo())
+        gced = []
+        monkeypatch.setattr(w, "_gc_version",
+                            lambda doc_id, v, strategy, tenant, repo: gced.append(v))
+        w._finalize_versions({"report": 5}, "recursive", "default")
+        assert fdr.inserted[0][2] == 5                     # 台账记 v5
+        assert sorted(gced) == [1, 2]                      # 3 之前的被清
+        assert ("report", "recursive", 1) in fdr.deleted
+        assert ("report", "recursive", 2) in fdr.deleted
+
+    def test_rollback_discards_newer_versions(self, monkeypatch, w):
+        """回滚 v4 → v2（recursive）：GC 并删台账 v3/v4（仅当前策略）。"""
+        fdr = _LedgerDocRepo()
+        fdr.set_active({"report": 4})
+        monkeypatch.setattr("app.storage.DocumentRepository", lambda manager=None: fdr)
+        gced = []
+        monkeypatch.setattr(w, "_gc_version",
+                            lambda doc_id, v, strategy, tenant, repo: gced.append(v))
+        bumps = []
+        monkeypatch.setattr(w, "_bump_version", lambda strat, tenant: bumps.append(strat))
+
+        new_ver = w.rollback_document("report", 2, "recursive", "default")
+        assert new_ver == 2
+        assert sorted(gced) == [3, 4]                      # 丢弃 3、4（仅 recursive）
+        assert ("report", "recursive", 3) in fdr.deleted
+        assert ("report", "recursive", 4) in fdr.deleted
+        assert bumps == ["recursive"]
 
 
 class TestGcVersion:
@@ -320,3 +363,98 @@ class TestOverwritePurge:
         # MySQL 删除失败 → 抛异常中止写入（避免半覆盖不一致）
         with pytest.raises(RuntimeError):
             w._purge_document("report", "recursive", "default", BoomChunkRepo())
+
+
+class TestActiveVersionFilter:
+    """检索活跃过滤：只保留每文档活跃版本候选。"""
+    @staticmethod
+    def _pipeline(provider):
+        from app.rag.pipeline import RAGPipeline
+        p = RAGPipeline(retriever=object())
+        p.active_version_provider = provider
+        return p
+
+    def test_filters_non_active_versions(self):
+        p = self._pipeline(lambda ids: {"a": 2, "b": 1})
+        cands = [
+            {"document_id": "a", "version": 2},  # 活跃
+            {"document_id": "a", "version": 1},  # 非活跃 → 弃
+            {"document_id": "b", "version": 1},  # 活跃
+            {"document_id": "b", "version": 3},  # 非活跃 → 弃
+        ]
+        kept = p._filter_active_versions(cands)
+        assert [c["version"] for c in kept] == [2, 1]
+
+    def test_no_provider_passthrough(self):
+        p = self._pipeline(None)
+        cands = [{"document_id": "a", "version": 9}]
+        assert p._filter_active_versions(cands) == cands
+
+    def test_unknown_doc_passthrough(self):
+        p = self._pipeline(lambda ids: {"a": 1})
+        cands = [{"document_id": "a", "version": 1},
+                 {"document_id": "ghost", "version": 5}]
+        kept = p._filter_active_versions(cands)
+        assert len(kept) == 2
+
+
+class TestDocumentVersionsMigration:
+    """老库 document_versions 缺 strategy 列时的迁移（Unknown column 修复）。"""
+
+    def test_adds_strategy_and_rebuilds_pk(self):
+        from app.storage.mysql import MySQLManager
+
+        mgr = object.__new__(MySQLManager)
+        calls = []
+
+        class FakeCur:
+            def execute(self, sql, *a):
+                if sql.startswith("SELECT strategy FROM document_versions"):
+                    raise Exception("Unknown column 'strategy'")
+                calls.append(sql)
+
+        mgr._migrate_document_versions_strategy(FakeCur())
+        assert any("ADD COLUMN strategy" in s for s in calls)
+        pk_stmts = [s for s in calls if "PRIMARY KEY" in s]
+        assert len(pk_stmts) == 2  # DROP + ADD 复合主键
+
+    def test_skips_when_strategy_present(self):
+        from app.storage.mysql import MySQLManager
+
+        mgr = object.__new__(MySQLManager)
+        ran = []
+
+        class FakeCur:
+            def execute(self, sql, *a):
+                ran.append(sql)   # SELECT strategy 成功 → 不触发迁移
+
+        mgr._migrate_document_versions_strategy(FakeCur())
+        assert ran == ["SELECT strategy FROM document_versions LIMIT 1"]
+
+    def test_drop_stale_current_version_column(self):
+        from app.storage.mysql import MySQLManager
+
+        mgr = object.__new__(MySQLManager)
+        calls = []
+
+        class FakeCur:
+            def execute(self, sql, *a):
+                calls.append(sql)   # SELECT current_version 成功 → 执行 DROP
+
+        mgr._migrate_documents_remove_current_version(FakeCur())
+        assert any("DROP COLUMN current_version" in s for s in calls)
+
+    def test_remove_current_version_noop_when_missing(self):
+        from app.storage.mysql import MySQLManager
+
+        mgr = object.__new__(MySQLManager)
+        calls = []
+
+        class FakeCur:
+            def execute(self, sql, *a):
+                if sql.startswith("SELECT current_version"):
+                    raise Exception("no column")
+                calls.append(sql)
+
+        mgr._migrate_documents_remove_current_version(FakeCur())
+        assert calls == []

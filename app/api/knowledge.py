@@ -920,3 +920,108 @@ async def revoke_document_acl(doc_id: str, principal_type: str = None,
         detail="removed={}".format(removed),
     )
     return {"document_id": doc_id, "removed": removed}
+
+
+# ---------------- 文档版本管理（retention=N 版本回溯）----------------
+
+class VersionItem(BaseModel):
+    version: int
+    chunk_count: int = 0
+    created_at: str = ""
+    active: bool = False
+
+
+class VersionListResponse(BaseModel):
+    document_id: str
+    current_version: int
+    versions: List[VersionItem]
+
+
+@router.get(
+    "/{doc_id}/versions",
+    response_model=VersionListResponse,
+    dependencies=[Depends(require_permission("knowledge:read"))],
+)
+async def list_document_versions(doc_id: str, strategy: str = "recursive",
+                                 user: AuthUser = Depends(get_current_user)):
+    """列出某 (文档, 切分策略) 的历史版本（需 knowledge:read + 文档归属人/superadmin）。"""
+    from starlette.concurrency import run_in_threadpool
+
+    tenant_id = _current_tenant(user)
+
+    def _do():
+        if not _can_manage_acl(user, tenant_id, doc_id):
+            raise HTTPException(status_code=403, detail="无权查看该文档版本")
+        from app.storage.document_repository import DocumentRepository
+        repo = DocumentRepository()
+        current = repo.get_active_versions([doc_id], strategy, tenant_id).get(doc_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="文档不存在: {}".format(doc_id))
+        rows = repo.list_versions(doc_id, strategy, tenant_id=tenant_id)
+        return current, [
+            VersionItem(
+                version=int(r["version"]),
+                chunk_count=int(r.get("chunk_count", 0) or 0),
+                created_at=r.get("created_at", ""),
+                active=(int(r["version"]) == int(current)),
+            )
+            for r in rows
+        ]
+
+    current, items = await run_in_threadpool(_do)
+    return VersionListResponse(
+        document_id=doc_id, current_version=current, versions=items,
+    )
+
+
+@router.post(
+    "/{doc_id}/versions/{version}/rollback",
+    dependencies=[Depends(require_permission("knowledge:delete"))],
+)
+async def rollback_document_version(doc_id: str, version: int,
+                                    strategy: str = "recursive",
+                                    user: AuthUser = Depends(get_current_user)):
+    """回滚 (文档, 切分策略) 到较早版本（需 knowledge:delete + 文档归属人/superadmin）。
+
+    单活跃语义：切到指定版本，并丢弃该策略下所有比它新的版本（各端数据 + 台账）。
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    tenant_id = _current_tenant(user)
+    from_state = [None]
+
+    def _do():
+        if not _can_manage_acl(user, tenant_id, doc_id):
+            raise HTTPException(status_code=403, detail="无权回滚该文档")
+        from app.ingestion.writer import IndexWriter
+        from app.storage.document_repository import DocumentRepository
+        repo = DocumentRepository()
+        cur = repo.get_active_versions([doc_id], strategy, tenant_id).get(doc_id)
+        if cur is None:
+            raise HTTPException(status_code=404, detail="文档不存在: {}".format(doc_id))
+        from_state[0] = cur
+        try:
+            new_ver = IndexWriter().rollback_document(
+                doc_id, version, strategy, tenant_id=tenant_id
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        return new_ver
+
+    new_ver = await run_in_threadpool(_do)
+    record(
+        action="document.rollback", tenant_id=tenant_id,
+        actor_user_id=user.user_id if user else "",
+        actor_username=user.username if user else "",
+        resource=doc_id,
+        detail="strategy={}, {} -> {}".format(strategy, from_state[0], new_ver),
+    )
+    return {
+        "document_id": doc_id,
+        "strategy": strategy,
+        "from_version": from_state[0],
+        "to_version": new_ver,
+        "rolled_back": True,
+    }

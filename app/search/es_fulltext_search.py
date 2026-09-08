@@ -121,6 +121,8 @@ class ESFulltextSearch:
                     "score": score,
                     "vector_id": int(vector_id),
                     "chunk_id": h.get("chunk_id", ""),
+                    "document_id": h.get("document_id"),
+                    "version": int(h.get("version", 1) or 1),
                     "content": h.get("content", ""),
                     "start_offset": int(h.get("start_offset", 0) or 0),
                     "end_offset": int(h.get("end_offset", 0) or 0),

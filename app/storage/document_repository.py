@@ -106,56 +106,6 @@ class DocumentRepository:
         )
         return rows
 
-    # ---- 文档版本化（活跃版本指针）----
-
-    def get_current_version(self, document_id: str,
-                            tenant_id: Optional[str] = None) -> Optional[int]:
-        """读取文档活跃版本号。无记录返回 None（文档不存在）。"""
-        clause, params = self._tenant_clause(tenant_id)
-        sql = "SELECT current_version FROM {} WHERE document_id = %s{}".format(
-            self.TABLE, clause
-        )
-        with self.manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (document_id, *params))
-                row = cur.fetchone()
-        return int(row["current_version"]) if row else None
-
-    def set_current_version(self, document_id: str, new_version: int,
-                            expected_version: Optional[int] = None,
-                            tenant_id: Optional[str] = None) -> bool:
-        """原子切换活跃版本（乐观锁）。
-
-        expected_version 提供时要求当前版本等于该值（并发冲突返回 False）；
-        未提供（首次创建）时直接无条件更新为 new_version。
-        """
-        clause, params = self._tenant_clause(tenant_id)
-        if expected_version is None:
-            sql = "UPDATE {} SET current_version = %s WHERE document_id = %s{}".format(
-                self.TABLE, clause
-            )
-            exec_params = (new_version, document_id, *params)
-        else:
-            sql = (
-                "UPDATE {} SET current_version = %s "
-                "WHERE document_id = %s AND current_version = %s{}"
-            ).format(self.TABLE, clause)
-            exec_params = (new_version, document_id, expected_version, *params)
-        with self.manager.get_connection() as conn:
-            with conn.cursor() as cur:
-                rows = cur.execute(sql, exec_params)
-        if rows == 0:
-            logger.warning(
-                "版本切换冲突: doc=%s, expect=%s, new=%s（可能并发上传）",
-                document_id, expected_version, new_version,
-            )
-            return False
-        logger.info(
-            "版本切换成功: doc=%s, %s → %s",
-            document_id, expected_version, new_version,
-        )
-        return True
-
     def count(self, tenant_id: Optional[str] = None) -> int:
         """文档总数。tenant_id 提供时仅统计该租户。"""
         clause, params = self._tenant_clause(tenant_id)
@@ -164,3 +114,87 @@ class DocumentRepository:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 return cur.fetchone()["cnt"]
+
+    # ---- 版本台账（document_versions 表）：版本按 (document, strategy) 维度 ----
+
+    def get_active_versions(self, document_ids, strategy: str,
+                            tenant_id: Optional[str] = None) -> Dict[str, int]:
+        """批量读取 (document, strategy) 的活跃版本 = 该对下现存版本的最大值。
+
+        供检索活跃过滤用；无版本台账行的文档不返回（视为不可过滤，交由上层放行）。
+        """
+        if not document_ids:
+            return {}
+        clause, params = self._tenant_clause(tenant_id)
+        placeholders = ",".join(["%s"] * len(document_ids))
+        sql = (
+            "SELECT document_id, MAX(version) AS mv FROM document_versions "
+            "WHERE strategy = %s AND document_id IN ({}){} "
+            "GROUP BY document_id"
+        ).format(placeholders, clause)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (strategy, *document_ids, *params))
+                return {r["document_id"]: int(r["mv"]) for r in cur.fetchall()}
+
+    def next_version(self, document_id: str, strategy: str,
+                     tenant_id: Optional[str] = None) -> int:
+        """该 (document, strategy) 的下一个版本号（现存最大 + 1，无则 1）。"""
+        active = self.get_active_versions([document_id], strategy, tenant_id)
+        ver = active.get(document_id, 0)
+        return int(ver) + 1 if ver else 1
+
+    def list_versions(self, document_id: str, strategy: str,
+                      tenant_id: Optional[str] = None) -> List[Dict]:
+        """列出某 (document, strategy) 的历史版本（新→旧）。"""
+        clause, params = self._tenant_clause(tenant_id)
+        sql = (
+            "SELECT version, chunk_count, created_at FROM document_versions "
+            "WHERE document_id = %s AND strategy = %s{} ORDER BY version DESC".format(clause)
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (document_id, strategy, *params))
+                rows = cur.fetchall()
+        for r in rows:
+            r["created_at"] = str(r.get("created_at", ""))
+        return rows
+
+    def insert_version(self, document_id: str, strategy: str, version: int,
+                       tenant_id: str = "default", chunk_count: int = 0) -> None:
+        """记录 (document, strategy) 的一个版本到台账（INSERT IGNORE 幂等）。"""
+        sql = (
+            "INSERT IGNORE INTO document_versions "
+            "(document_id, strategy, version, tenant_id, chunk_count) "
+            "VALUES (%s, %s, %s, %s, %s)"
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql, (document_id, strategy, int(version), tenant_id, int(chunk_count))
+                )
+
+    def delete_version(self, document_id: str, strategy: str, version: int,
+                       tenant_id: Optional[str] = None) -> int:
+        """从台账删除某 (document, strategy, version) 行。"""
+        clause, params = self._tenant_clause(tenant_id)
+        sql = (
+            "DELETE FROM document_versions "
+            "WHERE document_id = %s AND strategy = %s AND version = %s{}".format(clause)
+        )
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                return cur.execute(sql, (document_id, strategy, int(version), *params))
+
+    def has_version(self, document_id: str, strategy: str, version: int,
+                    tenant_id: Optional[str] = None) -> bool:
+        """台账中是否存在该 (document, strategy, version)。"""
+        clause, params = self._tenant_clause(tenant_id)
+        sql = (
+            "SELECT 1 FROM document_versions "
+            "WHERE document_id = %s AND strategy = %s AND version = %s{} LIMIT 1"
+        ).format(clause)
+        with self.manager.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (document_id, strategy, int(version), *params))
+                return cur.fetchone() is not None

@@ -45,6 +45,7 @@ class RAGPipeline:
         prompt_builder=None,
         query_rewriter=None,
         multi_query_expander=None,
+        active_version_provider=None,
         top_k: int = 5,
         rerank_candidate_pool: int = 50,
     ):
@@ -55,6 +56,7 @@ class RAGPipeline:
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.query_rewriter = query_rewriter
         self.multi_query_expander = multi_query_expander
+        self.active_version_provider = active_version_provider
         self.top_k = top_k
         self.rerank_candidate_pool = rerank_candidate_pool
 
@@ -97,6 +99,9 @@ class RAGPipeline:
         candidates = self._search_all(query, queries, document_ids=document_ids)
         metrics.record_retrieval(strategy, time.time() - t)
 
+        # 1a. 检索活跃过滤：只保留每个文档的活跃版本（retention=N 时旧版仍在索引）
+        candidates = self._filter_active_versions(candidates)
+
         # 1b. 重排（整体重排，query 用主查询）
         if self.reranker is not None:
             t = time.time()
@@ -124,6 +129,39 @@ class RAGPipeline:
             "query_count": len(queries),
             "merged_candidates": len(candidates),
         }
+
+    def _filter_active_versions(self, candidates: List[Dict]) -> List[Dict]:
+        """检索候选里过滤掉每文档的非活跃版本。
+
+        仅当注入 active_version_provider 时启用（版本化开启时由 service 注入）：
+        按候选 document_id 批量读活跃版本，丢弃 version != active 的候选。
+        未注入/无候选/读不到活跃版本 → 原样返回（不误伤路径）。
+        """
+        provider = self.active_version_provider
+        if provider is None or not candidates:
+            return candidates
+        doc_ids = [c.get("document_id") for c in candidates if c.get("document_id")]
+        if not doc_ids:
+            return candidates
+        active = provider(doc_ids) or {}
+        if not active:
+            return candidates
+        # 某些候选无 document_id（如无 ACL）不在此过滤，交由上层处理
+        kept = []
+        for c in candidates:
+            doc = c.get("document_id")
+            if doc is None:
+                kept.append(c)
+                continue
+            curr = active.get(doc)
+            if curr is None or int(c.get("version", 1) or 1) == int(curr):
+                kept.append(c)
+        if len(kept) != len(candidates):
+            logger.info(
+                "检索活跃过滤: %d → %d（丢弃非活跃版本候选）",
+                len(candidates), len(kept),
+            )
+        return kept
 
     def _search_all(self, query: str, queries: List[str], document_ids=None) -> List[Dict]:
         """对每路子查询检索并合并去重（按 chunk_id）。

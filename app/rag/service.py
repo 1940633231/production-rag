@@ -72,11 +72,41 @@ class RAGService:
             generator=generator,
             query_rewriter=query_rewriter,
             multi_query_expander=multi_query_expander,
+            active_version_provider=self._active_version_provider(),
             top_k=self.config.retrieval_top_k,
             rerank_candidate_pool=self.config.rerank_candidate_pool,
         )
 
     # ---- 组件装配（供 _build_pipeline 复用）----
+
+    def _active_version_provider(self):
+        """返回"文档活跃版本"批量读取器；版本化未开启时为 None（不过滤）。
+
+        版本化开启时，旧版本可能在索引中保留（retention=N），检索需只命中活跃版。
+        返回 None 表示不需要过滤。
+        """
+        try:
+            versioning_on = bool(
+                getattr(self.config, "document_versioning_enabled", False)
+                and self.config.storage_mysql_enabled
+            )
+        except Exception:
+            versioning_on = False
+        if not versioning_on:
+            return None
+        from app.storage.document_repository import DocumentRepository
+        strategy = self.strategy
+
+        def _provider(document_ids):
+            try:
+                return DocumentRepository().get_active_versions(
+                    list(document_ids), strategy, tenant_id=self.tenant_id
+                )
+            except Exception as e:
+                logger.warning("活跃版本读取失败，本次检索不做版本过滤: %s", e)
+                return {}
+
+        return _provider
 
     def _index_paths(self):
         """按租户计算向量后端的路径/集合名。"""

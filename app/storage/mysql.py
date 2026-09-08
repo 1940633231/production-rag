@@ -60,12 +60,29 @@ CREATE TABLE IF NOT EXISTS documents (
     file_name      VARCHAR(512)  NOT NULL,
     content_length INT           NOT NULL DEFAULT 0,
     source         VARCHAR(512)  DEFAULT NULL,
-    current_version INT          NOT NULL DEFAULT 1 COMMENT '活跃版本指针（同名文档每次上传=新版本）',
     created_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (document_id),
     KEY idx_documents_tenant (tenant_id),
     KEY idx_documents_owner (owner_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+# document_versions：文档版本台账（版本列表/回滚用）。
+# PK 含 strategy：版本状态按 (document, strategy) 维度隔离——同一文档在不同切分策略
+# 下各自独立版本，active 版本 = 该 (document, strategy) 下现存版本的最大值（回滚 GC 后自洽）。
+_DDL_DOCUMENT_VERSIONS = """
+CREATE TABLE IF NOT EXISTS document_versions (
+    document_id VARCHAR(128) NOT NULL,
+    strategy    VARCHAR(32)  NOT NULL,
+    version     INT          NOT NULL,
+    tenant_id   VARCHAR(64)  NOT NULL DEFAULT 'default',
+    chunk_count INT          NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (document_id, strategy, version),
+    KEY idx_dv_tenant (tenant_id, strategy),
+    CONSTRAINT fk_dv_document FOREIGN KEY (document_id)
+        REFERENCES documents(document_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
@@ -96,10 +113,11 @@ CREATE TABLE IF NOT EXISTS chunks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
-# 旧表迁移：为已存在的 documents 表补加 current_version 列（文档版本化）
-_MIGRATE_ADD_DOC_VERSION = """
+# 旧表迁移：清理已废弃的 documents.current_version 列（版本活跃指针已迁到
+# document_versions（per (document,strategy) 派生），此列不再写入、避免误导）
+_MIGRATE_DROP_DOC_CURRENT_VERSION = """
 ALTER TABLE documents
-    ADD COLUMN current_version INT NOT NULL DEFAULT 1 COMMENT '活跃版本指针';
+    DROP COLUMN current_version
 """
 
 # 旧表迁移：为已存在的 chunks 表补加 version 列（文档版本化）
@@ -219,6 +237,8 @@ class MySQLManager:
         with self.get_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(_DDL_DOCUMENTS)
+                cur.execute(_DDL_DOCUMENT_VERSIONS)
+                self._migrate_document_versions_strategy(cur)
                 cur.execute(_DDL_CHUNKS)
                 # 迁移：旧表无 id 列时补加
                 self._migrate_chunks_id(cur)
@@ -263,22 +283,60 @@ class MySQLManager:
                     logger.info("索引版本表初始化完成: index_versions")
                 except Exception as e:
                     logger.warning("索引版本表初始化失败（可稍后运行 scripts/seed_users.py）: %s", e)
-                # 迁移：旧表无 current_version 列时补加（文档版本化）
-                self._migrate_documents_version(cur)
+                # 迁移：清理已废弃的 documents.current_version 列（active 已迁到 document_versions）
+                self._migrate_documents_remove_current_version(cur)
                 # 迁移：旧表无 version 列时补加（文档版本化）
                 self._migrate_chunks_version(cur)
                 # 迁移：存量 document_acl 补建 → documents 外键（ON DELETE CASCADE）
                 self._migrate_document_acl_fk(cur)
         logger.info("MySQL 表结构初始化完成: documents, chunks")
 
-    def _migrate_documents_version(self, cur):
-        """检测 documents 表是否有 current_version 列，缺失则 ALTER 补加。"""
+    def _migrate_documents_remove_current_version(self, cur):
+        """清理已废弃的 documents.current_version 列（存在才 DROP，幂等）。
+
+        活跃版本已改为由 document_versions 按 (document, strategy) 派生，
+        该列不再写入、容易误导，老库降级时一并移除。
+        """
         try:
             cur.execute("SELECT current_version FROM documents LIMIT 1")
         except Exception:
-            logger.info("documents 表缺少 current_version 列，执行迁移")
-            cur.execute(_MIGRATE_ADD_DOC_VERSION)
-            logger.info("documents.current_version 列迁移完成")
+            return  # 列已不存在，无需迁移
+        logger.info("documents 表存在废弃的 current_version 列，执行 DROP 迁移")
+        try:
+            cur.execute(_MIGRATE_DROP_DOC_CURRENT_VERSION)
+            logger.info("documents.current_version 列已移除")
+        except Exception as e:
+            logger.warning("移除 documents.current_version 列失败: %s", e)
+
+    def _migrate_document_versions_strategy(self, cur):
+        """老库 document_versions 缺 strategy 列时补加，并重建 (doc,strategy,version) 复合主键。
+
+        版本化早期 schema 无 strategy（per-document 版本）；后改为 per-(document, strategy)。
+        CREATE TABLE IF NOT EXISTS 不会去改既有表，故在此显式迁移：
+        - 补 strategy 列，存量行统一按默认策略 'recursive' 归并（其历史版本本就无策略概念）
+        - 重建主键为 (document_id, strategy, version)，保证后续按策略查询/去重正确
+        """
+        try:
+            cur.execute("SELECT strategy FROM document_versions LIMIT 1")
+            return  # 已有 strategy 列，无需迁移
+        except Exception:
+            logger.info("document_versions 表缺少 strategy 列，执行迁移")
+            cur.execute(
+                "ALTER TABLE document_versions ADD COLUMN strategy VARCHAR(32) "
+                "NOT NULL DEFAULT 'recursive'"
+            )
+            cur.execute("ALTER TABLE document_versions DROP PRIMARY KEY")
+            cur.execute(
+                "ALTER TABLE document_versions "
+                "ADD PRIMARY KEY (document_id, strategy, version)"
+            )
+            try:
+                cur.execute(
+                    "ALTER TABLE document_versions ADD KEY idx_dv_tenant (tenant_id, strategy)"
+                )
+            except Exception as ie:
+                logger.info("idx_dv_tenant 索引已存在或创建失败（忽略）: %s", ie)
+            logger.info("document_versions.strategy 列 + 复合主键迁移完成")
 
     def _migrate_users_token_version(self, cur):
         """检测 users 表是否有 token_version 列，缺失则 ALTER 补加。

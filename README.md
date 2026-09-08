@@ -26,7 +26,7 @@
 - **权限感知缓存**：RAG 结果缓存 key 含 租户+权限指纹+user_id+索引版本，不同租户/权限/用户不串缓存，权限变更或索引重建自动失效；支持**内存（LRU）/ Redis** 双后端，Redis 不可用时自动降级内存
 - **审计日志**：401/403 越权自动记录 + 登录/用户/角色/文档操作显式记录（MySQL `audit_logs` 表），支持按租户/操作者/action 过滤查询
 - **稳定 ID 索引**：向量使用显式稳定 ID（chunk_id 哈希），删除按 ID 移除向量、无需全量重建
-- **同名文档更新（可选）**：`ingestion.document_versioning.enabled=false`（默认）时同名上传 = **覆盖更新**（先清当前策略旧内容再写新，各端一致、无孤儿、ACL 保留）；`enabled=true` 时 = **版本化**（新版本写入 + 活跃指针原子切换 + 乐观锁 + GC）；两者都只作用于当前切分策略，不影响其他策略索引
+- **同名文档更新（可选）**：`ingestion.document_versioning.enabled=false`（默认）时同名上传 = **覆盖更新**（先清当前策略旧内容再写新，各端一致、无孤儿、ACL 保留）；`enabled=true` 时 = **版本化**（新版本写入 + 活跃指针原子切换 + 乐观锁）；两者都只作用于当前切分策略。`retention=latest`（默认）= 上传后即 GC 旧版只留活跃；`retention=N` = 保留最近 N 版可回溯，旧版留在索引但**检索按活跃版本过滤**不串旧版，并提供 `/documents/{id}/versions` 版本列表 + `/documents/{id}/versions/{v}/rollback` 回滚（单活跃：丢弃更新版本）
 - **可观测性**：Prometheus 指标采集 + 请求追踪（trace_id）+ 深度健康检查（线程池化，组件挂起不阻塞其他请求）
 - **后台任务**：大文档上传/索引重建支持后台异步执行 + 任务状态查询
 - **管理台 Web UI**：登录鉴权 + 9 面板（问答/上传/文档/索引/任务/用户/角色/审计日志/监控），支持文档 ACL 授权、用户/角色管理、审计查询、指标可视化（`/admin` 或 `/` 跳转）
@@ -281,8 +281,9 @@ chunk:
 ingestion:
   document_versioning:  # 同名文档处理（可选，默认关闭）
     enabled: false      # false：同名上传 = 覆盖更新（先清当前策略旧内容再写新，各端一致）
-                        # true：同名上传 = 版本化（新版本 + 活跃指针原子切换 + GC）
-    retention: latest   # latest=只留最新（P1）/ N=保留N版可回溯（P2）
+                        # true：同名上传 = 版本化（新版本 + 活跃指针原子切换）
+    retention: latest   # latest=只留最新 / N（int，如 3）=保留最近 N 版可回溯（配合 /versions 回滚）
+                        #   注意 N 时旧版留在索引，检索按活跃版本过滤，不会串旧版
 
 retrieval:
   top_k: 5          # 检索返回数
@@ -387,6 +388,8 @@ audit:
 | GET | `/api/knowledge/{doc_id}/acl` | 查看文档授权列表 | `knowledge:grant` + 归属人 |
 | POST | `/api/knowledge/{doc_id}/acl` | 授权用户/角色访问文档 | `knowledge:grant` + 归属人 |
 | DELETE | `/api/knowledge/{doc_id}/acl` | 撤销文档授权 | `knowledge:grant` + 归属人 |
+| GET | `/api/knowledge/{doc_id}/versions` | 列出文档历史版本（含活跃标记） | `knowledge:read` + 归属人 |
+| POST | `/api/knowledge/{doc_id}/versions/{version}/rollback` | 回滚到较早版本（单活跃：丢弃更新版本） | `knowledge:delete` + 归属人 |
 | GET | `/api/admin/permissions` | 列出权限点 | `admin:roles` |
 | GET/POST | `/api/admin/roles` | 角色列表/创建 | `admin:roles` |
 | DELETE | `/api/admin/roles/{role_code}` | 删除角色 | `admin:roles` |
