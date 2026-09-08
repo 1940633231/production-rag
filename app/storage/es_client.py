@@ -198,6 +198,17 @@ class ESClient:
         result = self._client.count(index=idx)
         return result.get("count", 0)
 
+    def refresh_index(self, strategy: str):
+        """立即刷新索引，使刚批量写入/删除的数据可被搜索（供写入后/校验前调用）。
+
+        ES 默认约 1s 才把 index 结果刷到可搜索；写入后立即搜索可能读不到，
+        故在写入路径显式 refresh。刷新失败仅降级（下次自动刷新仍会追上）。
+        """
+        try:
+            self._client.indices.refresh(index=self._index_name(strategy))
+        except Exception as e:
+            logger.warning("ES 索引 refresh 失败（可稍后自动追上）: strategy=%s, %s", strategy, e)
+
     # ---- 按需读取（避免全量加载到内存）----
 
     @staticmethod

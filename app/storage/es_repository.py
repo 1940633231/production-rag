@@ -82,6 +82,10 @@ class ChunkESRepository(BaseChunkRepository):
             for c in chunks
         ]
         self._es.bulk_index(strat, es_docs)
+        # 显式 refresh：ES 默认 ~1s 才可搜，立即 refresh 保证紧随其后的
+        # 校验（_validate_build 用 list_all 核对 vector_id）能读到刚写入的数据，
+        # 避免「写入成功却被判缺失」的时序误报。
+        self._es.refresh_index(strat)
 
     def incremental_reindex(self, chunks: List, deleted_doc_ids: List[str] = None):
         """增量更新：只删除被移除文档的 chunks，再写入新 chunks。
