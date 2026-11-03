@@ -1,4 +1,4 @@
-r"""OpenAI 兼容 LLM 后端测试。
+r"""统一 LLM 后端测试。
 
 覆盖:
   - generate：POST /chat/completions → 解析 choices[0].message.content
@@ -9,7 +9,7 @@ r"""OpenAI 兼容 LLM 后端测试。
 mock requests.post，无需真实 API。
 
 运行:
-  .venv\Scripts\python.exe -m pytest tests\generation\test_openai_compat.py -v
+  .venv\Scripts\python.exe -m pytest tests\generation\test_llm.py -v
 """
 import sys
 from pathlib import Path
@@ -20,7 +20,7 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.generation.openai_compat import OpenAICompatibleGenerator  # noqa: E402
+from app.generation.llm import LLMGenerator  # noqa: E402
 
 
 class _FakeResp:
@@ -47,16 +47,16 @@ class _FakeResp:
 
 
 def _make(monkeypatch, fake_post, **kw):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
     monkeypatch.setattr("requests.post", fake_post)
     defaults = dict(model="test-model", base_url="https://llm.example/v1",
                     retry_times=2, retry_backoff=0)
     defaults.update(kw)
-    return OpenAICompatibleGenerator(**defaults)
+    return LLMGenerator(**defaults)
 
 
 class TestGenerate:
-    def test_parses_content_and_sends_openai_format(self, monkeypatch):
+    def test_parses_content_and_sends_messages_format(self, monkeypatch):
         calls = []
 
         def fake_post(url, headers=None, json=None, timeout=None, stream=False):
@@ -76,9 +76,47 @@ class TestGenerate:
         assert headers["Authorization"] == "Bearer sk-test"
 
     def test_missing_api_key_raises(self, monkeypatch):
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with pytest.raises(ValueError, match="API key"):
-            OpenAICompatibleGenerator(model="m", base_url="https://x/v1")
+            LLMGenerator(model="m", base_url="https://x/v1")
+
+    def test_optional_api_key_skips_authorization_header(self, monkeypatch):
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        g = LLMGenerator(
+            model="local-model",
+            base_url="http://localhost:8000/v1",
+            require_api_key=False,
+        )
+        assert "Authorization" not in g._headers
+
+    def test_api_key_env_candidates(self, monkeypatch):
+        monkeypatch.delenv("PRIMARY_LLM_KEY", raising=False)
+        monkeypatch.setenv("SECONDARY_LLM_KEY", "sk-secondary")
+        g = LLMGenerator(
+            model="m",
+            base_url="https://x/v1",
+            api_key_env="PRIMARY_LLM_KEY,SECONDARY_LLM_KEY",
+        )
+        assert g.api_key == "sk-secondary"
+
+    def test_full_chat_completions_url_not_duplicated(self, monkeypatch):
+        calls = []
+
+        def fake_post(url, **kw):
+            calls.append(url)
+            return _FakeResp(status=200, body={
+                "choices": [{"message": {"content": "ok"}}],
+            })
+
+        g = _make(
+            monkeypatch,
+            fake_post,
+            base_url="https://llm.example/v1/chat/completions",
+        )
+        assert g.generate([]) == "ok"
+        assert calls == ["https://llm.example/v1/chat/completions"]
 
     def test_retry_on_429_then_success(self, monkeypatch):
         seq = [
@@ -160,13 +198,13 @@ class TestStream:
 
 
 class TestFactory:
-    def test_openai_backend_routed(self):
+    def test_llm_backend_routed(self):
         from app.generation.generator import create_generator
 
         g = create_generator(
-            "openai", model="m", api_key="k", base_url="https://x/v1",
+            "llm", model="m", api_key="k", base_url="https://x/v1",
         )
-        assert isinstance(g, OpenAICompatibleGenerator)
+        assert isinstance(g, LLMGenerator)
 
     def test_unknown_backend_raises(self):
         from app.generation.generator import create_generator

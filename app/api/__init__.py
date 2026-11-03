@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 def create_app() -> FastAPI:
     """创建并配置 FastAPI 应用。"""
-    # 加载 .env（确保 DASHSCOPE_API_KEY 等环境变量可用）
+    # 加载 .env（确保 LLM_API_KEY 等环境变量可用）
     load_env()
 
     # 生产安全护栏：APP_ENV=production 时若仍使用默认 JWT 密钥/默认管理员密码，

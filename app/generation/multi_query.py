@@ -1,7 +1,7 @@
 """Multi-Query 多路召回：LLM 把查询扩展成多个不同角度的子查询。
 
 设计要点：
-- 复用现有 generator（qwen 真实扩展；stub 直接回退单路 [query]）
+- 复用现有 generator（llm 真实扩展；stub 直接回退单路 [query]）
 - 每路子查询独立检索后合并去重，弥补单查询召回不足
 - LLM 失败/解析为空时回退 [query]，保证检索不中断
 - 总路数含原始 query：multi_query=3 表示原始 + 2 个 LLM 生成

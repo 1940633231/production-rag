@@ -4,10 +4,9 @@
   - MySQL 连通性（如启用）
   - Elasticsearch 连通性（如启用）
   - Milvus 连通性（如启用）
-  - DashScope API key 配置
+  - LLM endpoint、模型与 API key 配置
   - embedding / reranker 模型配置
 """
-import os
 from pathlib import Path
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -131,30 +130,23 @@ def _check_redis() -> ComponentStatus:
 
 
 def _check_llm() -> ComponentStatus:
-    """按 generation.backend 检查 LLM 后端配置（qwen → DashScope key；openai → base_url + key）。"""
+    """按 generation.backend 检查统一 LLM 配置（llm → base_url + key）。"""
     from app.core.config import Config
     config = Config()
     backend = config.generation_backend
-    if backend == "qwen":
-        api_key = os.getenv(config.generation_api_key_env, "")
-        if not api_key:
-            return ComponentStatus(
-                status="error", detail="{} 未配置".format(config.generation_api_key_env)
-            )
-        if not api_key.startswith("sk-"):
-            return ComponentStatus(status="degraded", detail="API key 格式异常")
-        return ComponentStatus(status="ok", detail="DashScope API key 已配置")
-    if backend == "openai":
-        api_key = os.getenv(config.generation_openai_api_key_env, "")
-        if not api_key:
+    if backend == "llm":
+        api_key = config._first_env_value(
+            config.generation_llm_api_key_env
+        )
+        if config.generation_llm_require_api_key and not api_key:
             return ComponentStatus(
                 status="error",
-                detail="{} 未配置".format(config.generation_openai_api_key_env),
+                detail="{} 未配置".format(config.generation_llm_api_key_env),
             )
         return ComponentStatus(
             status="ok",
-            detail="OpenAI 兼容端点: {}（模型 {}）".format(
-                config.generation_openai_base_url, config.generation_openai_model
+            detail="LLM 端点: {}（模型 {}）".format(
+                config.generation_llm_base_url, config.generation_llm_model
             ),
         )
     return ComponentStatus(
@@ -211,7 +203,7 @@ def _check_indexes() -> dict:
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
-    """深度服务健康检查：索引 + MySQL + ES + Milvus + DashScope + embedding + reranker。"""
+    """深度服务健康检查：索引 + MySQL + ES + Milvus + LLM + embedding + reranker。"""
     import asyncio
 
     from app.core.config import Config
@@ -255,6 +247,6 @@ async def health():
         status=status,
         indexes=indexes,
         llm_backend=config.generation_backend,
-        llm_model=config.generation_model,
+        llm_model=config.generation_effective_model,
         components=components_dict,
     )

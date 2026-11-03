@@ -5,7 +5,7 @@
 - user prompt 注入 context（ContextManager 已带 [1][2] 编号）+ query
 - 多轮对话：history 以独立 user/assistant 消息插入 system 与当前 user 之间，
   仅保留最近 N 轮（MAX_HISTORY_TURNS），避免 prompt 过长
-- 返回 OpenAI/DashScope 兼容的 messages 格式：[{role, content}, ...]
+- 返回统一 LLM messages 格式：[{role, content}, ...]
 """
 from typing import Dict, List, Optional
 

@@ -1,14 +1,13 @@
-"""OpenAI 兼容 LLM 生成器：通过任意 OpenAI 兼容 /chat/completions 端点调用。
+"""统一 LLM 生成器：通过 /chat/completions 端点调用真实模型。
 
-解除 DashScope 绑定：支持任何提供 OpenAI 兼容接口的 LLM 服务——
-OpenAI、DeepSeek、Moonshot(Kimi)、智谱 GLM、阿里百炼 compatible-mode、
-vLLM、Ollama、本地推理网关等，只需配置 base_url + api_key + model。
+支持所有提供 OpenAI-compatible 接口的模型服务，例如 OpenAI、DeepSeek、
+Moonshot(Kimi)、智谱 GLM、vLLM、Ollama、本地推理网关等。
 
 调用格式为 OpenAI messages：[{role, content}, ...]
 - generate:       POST {base_url}/chat/completions（stream=false）→ choices[0].message.content
 - stream_generate: POST stream=true → 解析 SSE data 行的 choices[0].delta.content
 - 重试：429 限流 / 5xx / 网络异常做指数退避；其余 4xx（鉴权/参数）直接抛
-- 并发：与 QwenGenerator 相同的 BoundedSemaphore 限流
+- 并发：BoundedSemaphore 限流
 """
 import json
 import os
@@ -22,14 +21,15 @@ from app.generation.generator import BaseGenerator
 logger = get_logger(__name__)
 
 
-class OpenAICompatibleGenerator(BaseGenerator):
-    """通用 OpenAI 兼容生成器（任意 base_url）。"""
+class LLMGenerator(BaseGenerator):
+    """统一 LLM 生成器（任意 /chat/completions endpoint）。"""
 
     def __init__(
         self,
         model: str = "gpt-4o-mini",
         api_key: Optional[str] = None,
-        api_key_env: str = "OPENAI_API_KEY",
+        api_key_env: str = "LLM_API_KEY,OPENAI_API_KEY",
+        require_api_key: bool = True,
         base_url: str = "https://api.openai.com/v1",
         temperature: float = 0.3,
         max_tokens: int = 1024,
@@ -39,35 +39,54 @@ class OpenAICompatibleGenerator(BaseGenerator):
         max_concurrency: int = 4,
     ):
         self.model = model
-        self.base_url = (base_url or "https://api.openai.com/v1").rstrip("/")
+        normalized_base_url = (
+            base_url or "https://api.openai.com/v1"
+        ).rstrip("/")
+        chat_suffix = "/chat/completions"
+        if normalized_base_url.endswith(chat_suffix):
+            self._chat_url = normalized_base_url
+            self.base_url = normalized_base_url[:-len(chat_suffix)]
+        else:
+            self.base_url = normalized_base_url
+            self._chat_url = normalized_base_url + chat_suffix
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.retry_times = retry_times
         self.retry_backoff = retry_backoff
-        # 并发信号量（与 QwenGenerator 一致）：0 表示不限制
+        self.require_api_key = require_api_key
+        # 并发信号量：0 表示不限制
         self._sem = (
             threading.BoundedSemaphore(max_concurrency) if max_concurrency > 0 else None
         )
 
-        self.api_key = api_key or os.getenv(api_key_env)
+        env_names = [
+            name.strip() for name in (api_key_env or "").split(",") if name.strip()
+        ]
+        self.api_key = api_key
         if not self.api_key:
-            logger.error("API key 缺失: 环境变量 %s 未设置", api_key_env)
+            for env_name in env_names:
+                value = os.getenv(env_name)
+                if value and value.strip():
+                    self.api_key = value.strip()
+                    break
+        if require_api_key and not self.api_key:
+            logger.error("API key 缺失: 环境变量 %s 均未设置", api_key_env)
             raise ValueError(
-                "OpenAI 兼容后端需要 API key：设置环境变量 {} 或构造时传入 api_key".format(
-                    api_key_env
+                "LLM endpoint 需要 API key：设置环境变量 {} 或构造时传入 "
+                "api_key；无鉴权本地端点可设置 require_api_key=False".format(
+                    api_key_env or "(未配置)"
                 )
             )
 
-        self._chat_url = self.base_url + "/chat/completions"
-        self._headers = {
-            "Authorization": "Bearer {}".format(self.api_key),
-            "Content-Type": "application/json",
-        }
+        self._headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            self._headers["Authorization"] = "Bearer {}".format(self.api_key)
         logger.info(
-            "OpenAICompatibleGenerator 初始化: base_url=%s, model=%s, "
-            "temperature=%.2f, max_tokens=%d",
+            "LLMGenerator 初始化: base_url=%s, model=%s, "
+            "temperature=%.2f, max_tokens=%d, auth=%s",
             self.base_url, model, temperature, max_tokens,
+            "enabled" if self.api_key else "disabled",
         )
 
     # ---- 内部 ----

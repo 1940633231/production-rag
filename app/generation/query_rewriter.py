@@ -2,7 +2,7 @@
 
 设计要点：
 - 仅在存在对话历史时改写（单轮查询无需改写，避免多余 LLM 调用）
-- 复用现有 generator（qwen 真实改写；stub 不支持改写，直接返回原 query）
+- 复用现有 generator（llm 真实改写；stub 不支持改写，直接返回原 query）
 - 改写失败（LLM 异常/返回空）时回退原 query，保证检索不中断
 - 改写后的 query 用于检索 + 生成，response.query 仍保留原始用户问题
 """

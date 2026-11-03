@@ -47,17 +47,17 @@ def test_rrf_metric_recorded():
 
 
 def test_llm_ttft_metric_recorded():
-    metrics.record_llm_ttft("QwenGenerator", 0.4)
+    metrics.record_llm_ttft("LLMGenerator", 0.4)
     text = _export_text()
     assert "rag_llm_ttft_seconds" in text
-    assert 'backend="QwenGenerator"' in text
+    assert 'backend="LLMGenerator"' in text
 
 
 def test_llm_total_metric_recorded():
-    metrics.record_generation("QwenGenerator", 1.2)
+    metrics.record_generation("LLMGenerator", 1.2)
     text = _export_text()
     assert "rag_generation_duration_seconds" in text
-    assert 'backend="QwenGenerator"' in text
+    assert 'backend="LLMGenerator"' in text
 
 
 def test_query_latency_has_p50_p95_p99_gauges():

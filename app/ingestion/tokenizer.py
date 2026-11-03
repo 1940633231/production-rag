@@ -7,7 +7,7 @@
 - "tiktoken": OpenAI cl100k_base BPE（中英文混合的合理近似，需 pip install tiktoken）
 
 通过 Config.context.tokenizer_backend 切换。
-后续若接入 Qwen 真实 tokenizer，新增一个 BaseTokenCounter 子类即可。
+后续若接入其他模型的真实 tokenizer，新增一个 BaseTokenCounter 子类即可。
 """
 from abc import ABC, abstractmethod
 
@@ -35,7 +35,7 @@ class CharLengthCounter(BaseTokenCounter):
 class TiktokenCounter(BaseTokenCounter):
     """tiktoken (cl100k_base) 计数。
 
-    对 GPT-3.5/4 系列贴近真实分词；对 Qwen 等国产模型为合理近似。
+对 GPT-3.5/4 系列贴近真实分词；对其他模型为合理近似。
     需要 pip install tiktoken，未安装时抛出明确错误。
     """
 

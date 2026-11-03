@@ -1,6 +1,6 @@
 """生成质量评估：Faithfulness（忠实度）+ Relevance（相关性）。
 
-采用 LLM-as-Judge 范式，复用项目已有的 BaseGenerator 接口（QwenGenerator）调用大模型。
+采用 LLM-as-Judge 范式，复用项目已有的 BaseGenerator 接口调用大模型。
 
 Faithfulness 评估流程（两步）：
   Step 1 - 提取事实陈述：让 LLM 从 answer 中拆分出独立的事实性声明
@@ -12,9 +12,10 @@ Relevance 评估流程（单步）：
 
 使用示例:
     from app.evaluation.generation_eval import FaithfulnessEvaluator, RelevanceEvaluator
-    from app.generation.generator import create_generator
+    from app.core.config import Config
+    from app.generation.generator import create_generator_from_config
 
-    judge = create_generator("qwen", model="qwen-turbo")
+    judge = create_generator_from_config(Config(), temperature=0.0)
 
     faith_eval = FaithfulnessEvaluator(judge)
     result = faith_eval.evaluate(query, answer, context)

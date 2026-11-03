@@ -118,34 +118,11 @@ class QueryScopeResolver:
         if self._generator is None:
             with self._generator_lock:
                 if self._generator is None:
-                    from app.generation.generator import create_generator
+                    from app.generation.generator import (
+                        create_generator_from_config,
+                    )
 
-                    cfg = self.config
-                    if cfg.generation_backend == "openai":
-                        self._generator = create_generator(
-                            "openai",
-                            model=cfg.generation_openai_model,
-                            base_url=cfg.generation_openai_base_url,
-                            api_key_env=cfg.generation_openai_api_key_env,
-                            temperature=cfg.generation_temperature,
-                            max_tokens=cfg.generation_max_tokens,
-                            timeout=cfg.generation_timeout,
-                            retry_times=cfg.generation_retry_times,
-                            retry_backoff=cfg.generation_retry_backoff,
-                            max_concurrency=cfg.generation_max_concurrency,
-                        )
-                    else:
-                        self._generator = create_generator(
-                            cfg.generation_backend,
-                            model=cfg.generation_model,
-                            api_key_env=cfg.generation_api_key_env,
-                            temperature=cfg.generation_temperature,
-                            max_tokens=cfg.generation_max_tokens,
-                            timeout=cfg.generation_timeout,
-                            retry_times=cfg.generation_retry_times,
-                            retry_backoff=cfg.generation_retry_backoff,
-                            max_concurrency=cfg.generation_max_concurrency,
-                        )
+                    self._generator = create_generator_from_config(self.config)
         return self._generator
 
     def _get_bm25(self, strategy: str, tenant_id: str):

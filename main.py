@@ -5,7 +5,7 @@
 
 前置条件:
   - 索引文件已生成：data/index/{strategy}/faiss.index + metadata.json
-  - 环境变量 DASHSCOPE_API_KEY 已设置（generation.backend=qwen 时）
+  - generation.backend 对应的 API key 已配置
 
 使用示例:
   # 交互式（默认）
@@ -21,7 +21,6 @@
   python main.py --no-rerank --query "铁矿供需"
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -103,15 +102,11 @@ def main():
     parser.add_argument("--no-rerank", action="store_true", help="跳过 rerank")
     args = parser.parse_args()
 
-    # 加载 .env（设置 DASHSCOPE_API_KEY 等环境变量）
+    # 加载 .env（设置 LLM_API_KEY 等环境变量）
     load_env()
 
-    # 读 config，如果 .env 指定了 DASHSCOPE_MODEL 则覆盖 yaml 的 model_name
+    # Config 会按 model_env / base_url_env 自动读取环境变量
     config = Config()
-    env_model = os.getenv("DASHSCOPE_MODEL")
-    if env_model:
-        config.data.setdefault("generation", {})["model_name"] = env_model
-        logger.info("用 .env 的 DASHSCOPE_MODEL 覆盖 model_name: %s", env_model)
 
     print("=" * 60)
     print("RAG 主程序")
@@ -120,7 +115,7 @@ def main():
     print("Mode: {}".format(args.mode))
     print("Rerank: {}".format("off" if args.no_rerank else "on"))
     print("LLM: {} (backend={})".format(
-        config.generation_model, config.generation_backend
+        config.generation_effective_model, config.generation_backend
     ))
     print()
 

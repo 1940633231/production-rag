@@ -22,13 +22,12 @@
 
 前置条件:
   - 索引文件已生成：data/index/{strategy}/（或 Milvus collection 已写入）
-  - 环境变量 DASHSCOPE_API_KEY 已设置（生成评估需要 LLM；--no-generation 除外）
+  - LLM API key 已按 generation.*.api_key_env 配置（--no-generation 除外）
   - data/evaluation/retrieval_dataset.json 存在（提供 query 列表）
 """
 import argparse
 import csv
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -141,17 +140,14 @@ def run_generation_eval(config, strategy, search_mode, use_rerank, output_path):
     )
 
     # 初始化评估器（复用 generation backend 做 LLM-as-Judge）
-    from app.generation.generator import create_generator
+    from app.generation.generator import create_generator_from_config
     from app.evaluation.generation_eval import (
         FaithfulnessEvaluator,
         RelevanceEvaluator,
     )
 
-    judge_model = config.generation_model
-    judge = create_generator(
-        config.generation_backend,
-        model=judge_model,
-        api_key_env=config.generation_api_key_env,
+    judge = create_generator_from_config(
+        config,
         temperature=0.0,  # Judge 用 temperature=0 保证一致性
         max_tokens=2048,   # 评估需要更多 token 输出 JSON
     )
@@ -285,7 +281,7 @@ def _config_snapshot(config, strategy, search_mode, use_rerank):
         "strategy": strategy,
         "mode": search_mode,
         "rerank": use_rerank,
-        "model": config.generation_model,
+        "model": config.generation_effective_model,
         "top_k": config.retrieval_top_k,
         "dataset": DATASET_PATH,
     }
@@ -440,17 +436,11 @@ def main():
     load_env()
     config = Config()
 
-    # .env 覆盖 model_name
-    env_model = os.getenv("DASHSCOPE_MODEL")
-    if env_model:
-        config.data.setdefault("generation", {})["model_name"] = env_model
-        logger.info("用 .env 的 DASHSCOPE_MODEL 覆盖 model_name: %s", env_model)
-
     print("配置: strategy={}, search_mode={}, rerank={}".format(
         args.strategy, args.search_mode, "off" if args.no_rerank else "on"
     ))
     print("LLM: {} (backend={})".format(
-        config.generation_model, config.generation_backend
+        config.generation_effective_model, config.generation_backend
     ))
     print()
 

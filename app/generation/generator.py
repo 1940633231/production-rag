@@ -3,11 +3,10 @@
 设计要点（与 tokenizer.py 一致的可插拔方案）：
 - BaseGenerator 抽象接口（含同步 generate 与流式 stream_generate）
 - StubGenerator: 零依赖占位，返回固定文本，教学用（默认）
-- QwenGenerator: 通过 DashScope API 调用 Qwen（可选，需 dashscope + API key）
-- OpenAICompatibleGenerator: 任意 OpenAI 兼容 /chat/completions 端点
-  （OpenAI / DeepSeek / Kimi / GLM / 百炼 compatible-mode / vLLM / Ollama ...），
-  解除 DashScope 绑定，只需 base_url + api_key + model
-- 工厂函数 create_generator(backend) 便于 Config 切换
+- LLMGenerator: 通过统一的 /chat/completions 协议调用真实模型
+  （OpenAI / DeepSeek / Kimi / GLM / vLLM / Ollama ...）
+- 工厂函数 create_generator(backend) 负责实例化
+- create_generator_from_config(config) 统一从 Config 组装参数
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Iterator, List
@@ -47,8 +46,7 @@ class StubGenerator(BaseGenerator):
         return (
             "[StubGenerator] 未接入真实 LLM。\n"
             "已构建 prompt（system + user），context 已完成去重/合并/压缩/预算控制。\n"
-            "如需真实生成，请配置 generation.backend=qwen（DashScope）或 "
-            "generation.backend=openai（任意 OpenAI 兼容端点）。\n"
+            "如需真实生成，请配置 generation.backend=llm 和 generation.llm。\n"
             "User prompt 前 50 字: {}".format(query[:50])
         )
 
@@ -57,17 +55,54 @@ def create_generator(backend: str = "stub", **kwargs) -> BaseGenerator:
     """工厂函数：按 backend 创建生成器。
 
     backend:
-        - "stub"  → StubGenerator（默认，零依赖）
-        - "qwen"  → QwenGenerator（DashScope，需 dashscope + DASHSCOPE_API_KEY）
-        - "openai" → OpenAICompatibleGenerator（任意 OpenAI 兼容端点，
-          需 base_url + api_key，如 OPENAI_API_KEY / DEEPSEEK_API_KEY 等）
+        - "stub" → StubGenerator（默认，零依赖）
+        - "llm"  → LLMGenerator（OpenAI-compatible /chat/completions）
     """
     if backend == "stub":
         return StubGenerator()
-    if backend == "qwen":
-        from app.generation.qwen import QwenGenerator
-        return QwenGenerator(**kwargs)
-    if backend == "openai":
-        from app.generation.openai_compat import OpenAICompatibleGenerator
-        return OpenAICompatibleGenerator(**kwargs)
+    if backend == "llm":
+        from app.generation.llm import LLMGenerator
+        return LLMGenerator(**kwargs)
     raise ValueError("Unknown generator backend: {}".format(backend))
+
+
+def create_generator_from_config(config, **overrides) -> BaseGenerator:
+    """按 Config 创建生成器，供主链路、Scope、评测等所有入口复用。
+
+    overrides 最后合并，便于评测 Judge 只覆盖 temperature/max_tokens 等参数。
+    """
+    backend = config.generation_backend
+    common = {
+        "temperature": config.generation_temperature,
+        "max_tokens": config.generation_max_tokens,
+        "timeout": config.generation_timeout,
+        "retry_times": config.generation_retry_times,
+        "retry_backoff": config.generation_retry_backoff,
+        "max_concurrency": config.generation_max_concurrency,
+    }
+
+    if backend == "llm":
+        common.update({
+            "model": config.generation_llm_model,
+            "base_url": config.generation_llm_base_url,
+            "api_key_env": config.generation_llm_api_key_env,
+            "require_api_key": config.generation_llm_require_api_key,
+        })
+
+    common.update(overrides)
+    if backend == "llm":
+        if not common.get("base_url"):
+            raise ValueError(
+                "LLM base_url 未配置：请设置环境变量 {}".format(
+                    config.generation_llm_config.get(
+                        "base_url_env", "LLM_BASE_URL"
+                    )
+                )
+            )
+        if not common.get("model"):
+            raise ValueError(
+                "LLM 模型名未配置：请设置环境变量 {}".format(
+                    config.generation_llm_config.get("model_env", "LLM_MODEL")
+                )
+            )
+    return create_generator(backend, **common)

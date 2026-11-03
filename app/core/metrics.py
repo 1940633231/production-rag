@@ -30,8 +30,8 @@
   metrics.record_bm25("recursive", 0.004)
   metrics.record_sparse("recursive", 0.004)
   metrics.record_rrf("recursive", 0.0001)
-  metrics.record_llm_ttft("qwen", 0.4)
-  metrics.record_generation("qwen", 1.2)
+  metrics.record_llm_ttft("LLMGenerator", 0.4)
+  metrics.record_generation("LLMGenerator", 1.2)
 
   # /metrics 端点直接用 prometheus_client.generate_latest
 """

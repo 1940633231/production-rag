@@ -12,7 +12,7 @@
 - **上下文管理**：chunk 去重（span 重叠 + Jaccard）、邻接合并、**分数加权预算**（高分块保留更多内容）、超预算块跳过装填
 - **多轮对话**：`history` 透传 + Query 改写（LLM 指代消解，如"那价格呢"→"铁矿近期价格走势"），改写结果用于检索与生成
 - **引用溯源**：答案中的 `[1][2]` 引用自动映射到源 chunk，含文件名和字符偏移；解析兼容 `[1,2]`、`【1】` 等多种格式
-- **多 LLM 后端**：`stub`（零依赖）/ `qwen`（DashScope）/ `openai`（任意 OpenAI 兼容端点：OpenAI / DeepSeek / Kimi / 智谱 GLM / 百炼 compatible-mode / vLLM / Ollama…），仅需 base_url + api_key + model
+- **统一 LLM 后端**：`stub`（零依赖）/ `llm`（任意 `/chat/completions` 端点：OpenAI / DeepSeek / Kimi / 智谱 GLM / vLLM / Ollama…），仅需 base_url + api_key + model
 - **流式生成**：基于 LLM 后端的真流式 SSE 输出，首字延迟≈模型开始输出时间
 - **生成可靠性**：超时控制 + 指数退避重试（网络异常/429/5xx 自动重试，4xx 不重试）+ **并发限流**（防止慢请求占满线程池）
 - **多后端持久化**：MySQL 存储文档/chunks（含连接池与 CASCADE 删除）+ Elasticsearch 全文检索 + Milvus 向量库（替代本地 FAISS），均可按开关启用
@@ -65,7 +65,7 @@ production-rag/
 │   ├── search/               # 检索引擎（vector/bm25/es_fulltext/hybrid + RRF）
 │   ├── rerank/               # Cross-Encoder 重排器
 │   ├── context/              # 上下文管理（builder/compressor/manager）
-│   ├── generation/           # LLM 生成（Stub/Qwen/OpenAI 兼容 + 流式 + 重试 + Query 改写 + Multi-Query）
+│   ├── generation/           # LLM 生成（Stub/统一 LLM + 流式 + 重试 + Query 改写 + Multi-Query）
 │   ├── citation/             # 引用提取（兼容多种括号/分隔符格式）
 │   ├── rag/                  # RAG 编排（pipeline/service/scope 业务范围过滤）
 │   ├── storage/              # 持久化（MySQL + ES + Milvus + chunk/document/索引版本仓储）
@@ -107,8 +107,7 @@ production-rag/
 - MySQL 8.0+（可选，`storage.backends.mysql.enabled=false` 时不需要）
 - Elasticsearch 8.x（可选，`storage.backends.es.enabled=false` 时不需要）
 - Milvus 2.x（可选，`storage.backends.milvus.enabled=false` 时回退本地 FAISS 索引）
-- 阿里云 DashScope API Key（`generation.backend=qwen` 时需要）
-- 其他 LLM API Key（`generation.backend=openai` 时需要，如 OPENAI_API_KEY / DEEPSEEK_API_KEY）
+- LLM API Key（`generation.backend=llm` 时需要，如 LLM_API_KEY）
 - Redis（可选，`cache.backend=redis` 时需要）
 - Docker + Docker Compose（可选，使用容器部署时需要；GPU 版另需 NVIDIA GPU + nvidia-container-toolkit）
 - 网络（C-MTEB 评测需下载数据集与模型，默认走 hf-mirror 国内镜像）
@@ -143,12 +142,10 @@ JWT_SECRET=your-long-random-secret
 # 启用生产安全护栏：仍用默认 JWT 密钥(dev-secret-change-me) 或默认管理员密码(admin123)
 # 时，服务启动直接失败（fail-fast），不再依赖部署人员自觉修改。
 APP_ENV=production
-# DashScope（LLM 生成，backend=qwen 时使用，不使用 Qwen 可不配）
-DASHSCOPE_API_KEY=sk-your-api-key-here
-DASHSCOPE_MODEL=qwen-plus
-
-# OpenAI 兼容端点（LLM 生成，backend=openai 时使用；如 DEEPSEEK_API_KEY 等）
-OPENAI_API_KEY=sk-your-api-key-here
+# 统一 LLM（backend=llm 时使用；切换提供商只改这三项）
+LLM_BASE_URL=https://api.deepseek.com
+LLM_API_KEY=sk-your-api-key-here
+LLM_MODEL=deepseek-chat
 
 # Redis（查询缓存，cache.backend=redis 时；无密码可不配）
 REDIS_PASSWORD=
@@ -316,19 +313,18 @@ context:
   merge_span_gap: 5         # span 端点 gap <= 此值判为邻接可合并
 
 generation:
-  backend: qwen           # stub（占位）/ qwen（DashScope）/ openai（任意 OpenAI 兼容端点）
-  model_name: qwen-turbo  # 模型名（backend=openai 时留空则复用此值）
-  api_key_env: DASHSCOPE_API_KEY  # 从环境变量读 API key
+  backend: llm            # stub（占位）/ llm（统一真实模型）
   temperature: 0.3
   max_tokens: 1024
   timeout: 60             # LLM API 超时（秒）
   retry_times: 2          # 网络异常/5xx/429 时的重试次数
   retry_backoff: 1.0      # 重试基础退避秒数（指数退避：1s → 2s → 4s）
   max_concurrency: 4      # 最大并发 LLM 调用数（0=不限制），防止占满线程池
-  openai:                 # backend=openai 时生效（OpenAI/DeepSeek/Kimi/GLM/百炼/vLLM/Ollama...）
-    base_url: https://api.openai.com/v1   # 端点 base_url（末尾不带 /）
-    api_key_env: OPENAI_API_KEY           # API key 环境变量名
-    model_name: ""                        # 模型名（留空复用顶层 generation.model_name）
+  llm:                    # backend=llm 时生效（OpenAI/DeepSeek/Kimi/GLM/vLLM/Ollama...）
+    base_url_env: LLM_BASE_URL            # endpoint 环境变量
+    api_key_env: LLM_API_KEY              # API key 环境变量
+    require_api_key: true                 # 本地无鉴权端点设为 false
+    model_env: LLM_MODEL                  # 模型名仅从环境变量读取
 
 storage:
   pool_size: 5     # 连接池大小
@@ -486,7 +482,7 @@ python scripts/evaluate.py --mode retrieval --strategy recursive --search-mode h
 ### 生成质量评估
 
 ```bash
-# 评估 Faithfulness + Relevance（LLM-as-Judge，需要 DASHSCOPE_API_KEY），输出 CSV 报告
+# 评估 Faithfulness + Relevance（LLM-as-Judge，使用 generation.llm 配置），输出 CSV 报告
 python scripts/evaluate.py --mode generation --strategy recursive --search-mode hybrid
 
 # 指定输出路径
@@ -610,7 +606,7 @@ MySQL / ES / Milvus 相关测试需要对应服务运行中，否则会自动跳
 | 审计 / 缓存 | MySQL audit_logs 表 + 权限感知缓存（内存 LRU / Redis） |
 | Embedding | sentence-transformers (BGE) |
 | 重排 | Cross-Encoder (BGE-reranker)，可配置开关 |
-| LLM 生成 | DashScope (Qwen) / OpenAI 兼容端点（OpenAI/DeepSeek/Kimi/GLM/vLLM/Ollama），含重试 + Query 改写 + 并发限流 |
+| LLM 生成 | 统一 `/chat/completions` 端点（OpenAI/DeepSeek/Kimi/GLM/vLLM/Ollama），含重试 + Query 改写 + 并发限流 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
 | 部署 | Docker（CPU/GPU 双镜像）+ docker-compose |
 | 评测 | C-MTEB T2Retrieval 基准 + LLM-as-Judge 生成质量评估 + 回归闭环门禁 |

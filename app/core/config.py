@@ -215,6 +215,27 @@ class Config:
 
     # ---- generation 段（LLM 生成配置）----
 
+    @staticmethod
+    def _first_env_value(env_names):
+        """返回第一个非空环境变量值。
+
+        env_names 支持字符串或列表；字符串可用逗号分隔多个候选变量，
+        例如 "LLM_MODEL,SECONDARY_MODEL"。
+        """
+        import os
+
+        if not env_names:
+            return None
+        if isinstance(env_names, str):
+            names = [name.strip() for name in env_names.split(",") if name.strip()]
+        else:
+            names = [str(name).strip() for name in env_names if str(name).strip()]
+        for name in names:
+            value = os.getenv(name)
+            if value is not None and value.strip():
+                return value.strip()
+        return None
+
     @property
     def generation_config(self):
         """generation 段整体，缺失时返回空 dict 保证默认值可用。"""
@@ -225,12 +246,11 @@ class Config:
         return self.generation_config.get("backend", "stub")
 
     @property
-    def generation_model(self):
-        return self.generation_config.get("model_name", "qwen-turbo")
-
-    @property
-    def generation_api_key_env(self):
-        return self.generation_config.get("api_key_env", "DASHSCOPE_API_KEY")
+    def generation_effective_model(self):
+        """当前 backend 实际生效的模型名。"""
+        if self.generation_backend == "llm":
+            return self.generation_llm_model
+        return None
 
     @property
     def generation_temperature(self):
@@ -258,28 +278,35 @@ class Config:
         return self.generation_config.get("max_concurrency", 4)
 
     @property
-    def generation_openai_config(self):
-        """generation.openai 段（OpenAI 兼容后端），缺失时返回空 dict。"""
-        return self.generation_config.get("openai", {})
+    def generation_llm_config(self):
+        """generation.llm 段，缺失时返回空 dict。"""
+        return self.generation_config.get("llm", {})
 
     @property
-    def generation_openai_base_url(self):
-        """OpenAI 兼容端点 base_url（OpenAI / DeepSeek / Kimi / GLM / 百炼等）。"""
-        return self.generation_openai_config.get(
-            "base_url", "https://api.openai.com/v1"
+    def generation_llm_base_url(self):
+        """LLM endpoint：仅从 base_url_env 指定的环境变量读取。"""
+        cfg = self.generation_llm_config
+        env_name = cfg.get("base_url_env", "LLM_BASE_URL")
+        return (self._first_env_value(env_name) or "").rstrip("/")
+
+    @property
+    def generation_llm_api_key_env(self):
+        """LLM API key 的环境变量名（支持逗号分隔候选）。"""
+        return self.generation_llm_config.get(
+            "api_key_env", "LLM_API_KEY"
         )
 
     @property
-    def generation_openai_api_key_env(self):
-        """OpenAI 兼容后端 API key 的环境变量名。"""
-        return self.generation_openai_config.get("api_key_env", "OPENAI_API_KEY")
+    def generation_llm_require_api_key(self):
+        """是否强制 LLM endpoint 提供 API key（本地无鉴权端点可关闭）。"""
+        return bool(self.generation_llm_config.get("require_api_key", True))
 
     @property
-    def generation_openai_model(self):
-        """OpenAI 兼容后端模型名；未单独配置时复用 generation.model_name。"""
-        return self.generation_openai_config.get(
-            "model_name"
-        ) or self.generation_model
+    def generation_llm_model(self):
+        """LLM 模型名：仅从 model_env 指定的环境变量读取。"""
+        cfg = self.generation_llm_config
+        env_name = cfg.get("model_env", "LLM_MODEL")
+        return self._first_env_value(env_name) or ""
 
     @property
     def ingestion_config(self):
