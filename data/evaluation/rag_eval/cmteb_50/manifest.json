@@ -1,0 +1,10 @@
+{
+  "dataset_id": "cmteb-t2retrieval-50",
+  "version": "1.0.0",
+  "task": "retrieval",
+  "samples_file": "samples.jsonl",
+  "qrels_file": "qrels.json",
+  "description": "C-MTEB T2Retrieval subset generated from the existing benchmark pipeline (seed=42, max_corpus=1000, fill_factor=5).",
+  "source": "production-rag",
+  "created_at": "2026-11-05T00:00:00+08:00"
+}

@@ -1,0 +1,2 @@
+# Release dependency after PyPI Trusted Publishing is enabled.
+rag-eval>=0.1.0,<0.2.0

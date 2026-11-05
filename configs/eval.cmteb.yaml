@@ -1,0 +1,17 @@
+dataset: data/evaluation/rag_eval/cmteb_50
+adapter: eval_adapter:CmtebRetrievalAdapter
+model: BAAI/bge-small-zh-v1.5
+prompt_version: cmteb-t2retrieval
+seed: 42
+max_errors: 0
+min_coverage: 1.0
+timeout_seconds: 300
+cache_dir: .rag-eval-cache/cmteb
+output_dir: reports/rag-eval/cmteb
+k_values: [1, 3, 5, 10]
+thresholds:
+  recall@1: 0.0
+  recall@3: 0.0
+  recall@5: 0.0
+  mrr@10: 0.0
+  ndcg@10: 0.0

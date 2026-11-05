@@ -469,6 +469,28 @@ curl http://localhost:8000/api/knowledge/tasks/{task_id}
 
 评估体系分三层：**检索评估**（Recall/MRR/NDCG）、**生成质量评估**（Faithfulness/Relevance）、**回归闭环**（基线/对比/门禁/趋势），并支持 **C-MTEB 中文检索基准**。
 
+### rag-eval 平台（推荐）
+
+独立评估包位于
+[`1940633231/rag-eval`](https://github.com/1940633231/rag-eval)，旧
+`scripts/evaluate.py` 和 `scripts/eval_cmteb.py` 保留用于兼容与一致性对照。
+
+```bash
+python -m pip install -r requirements-eval-github.txt
+# PyPI 发布后：pip install "rag-eval>=0.1.0,<0.2.0"
+rag-eval validate data/evaluation/rag_eval/production_smoke
+rag-eval run --config configs/eval.pr_smoke.yaml \
+  --baseline reports/rag-eval/baselines/pr_smoke_fake.json
+rag-eval run --config configs/eval.cmteb.yaml \
+  --baseline reports/rag-eval/baselines/cmteb_50.json
+```
+
+- `LocalRetrievalAdapter`：只读本地 `metadata.json` + BM25，不需要 MySQL/Redis/ES/Milvus。
+- `ProductionRAGServiceAdapter`：显式集成时构建完整服务。
+- `HttpEvaluationAdapter`：调用运行中的 `/api/chat`。
+- `CmtebRetrievalAdapter`：使用既有 C-MTEB 采样、embedding 缓存和 FAISS。
+- 详见 `docs/rag_eval_usage.md`。
+
 ### 检索评估
 
 ```bash
@@ -538,9 +560,9 @@ python scripts/eval_cmteb.py --max-corpus 200000 --max-queries 30000 --seed 42
 
 | Job | 触发 | 说明 |
 |-----|------|------|
-| `test` | push / PR | pytest 全量测试 + 覆盖率 |
-| `eval` | schedule / 手动 dispatch（gate） | 下载 C-MTEB 数据 → `eval_cmteb.py --compare` 与入库基线对比，指标回退即 FAIL（退出码 1 标红） |
-| `full-eval` | 手动 dispatch（full） | 全量 11.8 万 corpus / 2.28 万 query 评测，报告存 artifact |
+| `test` | push / PR | pytest、rag-eval 契约/adapter 测试、fake runner + gate；全程不依赖 Docker/ES |
+| `eval` | nightly schedule / 手动 dispatch（gate） | 新平台 C-MTEB 50 题 Gate + 旧 `eval_cmteb.py` 同规模一致性比较 |
+| `full-eval` | 手动 dispatch（full） | Release 级全量 11.8 万 corpus / 2.28 万 query 评测，报告存 artifact |
 
 手动触发：**Actions → CI → Run workflow**，可选参数：
 - `eval_scale`：`gate`（1500/50，默认）或 `full`（全量）
@@ -609,8 +631,8 @@ MySQL / ES / Milvus 相关测试需要对应服务运行中，否则会自动跳
 | LLM 生成 | 统一 `/chat/completions` 端点（OpenAI/DeepSeek/Kimi/GLM/vLLM/Ollama），含重试 + Query 改写 + 并发限流 |
 | 持久化 | MySQL (pymysql + dbutils 连接池) |
 | 部署 | Docker（CPU/GPU 双镜像）+ docker-compose |
-| 评测 | C-MTEB T2Retrieval 基准 + LLM-as-Judge 生成质量评估 + 回归闭环门禁 |
-| CI | GitHub Actions（test + eval 检索门禁 + full-eval 全量评测） |
+| 评测 | 独立 `rag-eval` 平台 + C-MTEB T2Retrieval + 确定性指标 + LLM-as-Judge + Gate |
+| CI | GitHub Actions（PR smoke + nightly retrieval gate + release full eval） |
 | 指标采集 | prometheus-client |
 | 测试 | pytest |
 

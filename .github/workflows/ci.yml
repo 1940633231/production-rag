@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 02:00 Asia/Shanghai
+    - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
       eval_scale:
@@ -33,10 +36,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.lock
+          pip install -r requirements-eval-github.txt
 
       - name: Run tests with coverage
         run: |
           python -m pytest -q --cov=app --cov-report=term-missing
+
+      - name: Run rag-eval PR smoke
+        run: |
+          python -m pytest tests/evaluation/test_eval_adapter.py -q
+          rag-eval validate data/evaluation/rag_eval/production_smoke
+          rag-eval run \
+            --config configs/eval.pr_smoke.yaml \
+            --baseline reports/rag-eval/baselines/pr_smoke_fake.json \
+            --trend-csv reports/rag-eval/trends/pr-smoke.csv
 
       - name: Upload coverage data
         if: always()
@@ -45,17 +58,16 @@ jobs:
           name: coverage
           path: .coverage
 
-  # 定时/手动检索评估门禁：C-MTEB T2Retrieval 子集（可复现，无需外部服务）
-  # 与入库基线 cmteb_ci_baseline.json 同 seed/同规模对比，指标回退即拦截 PR
-  # corpus embedding 用 actions/cache 复用（key = 数据内容 hash + 规模 + seed），
-  # GitHub-hosted runner 是全新机器，corpus 未变时跳过重复编码
+  # Nightly retrieval gate: new rag-eval platform plus legacy-script consistency.
   eval:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.eval_scale == 'gate')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      MAX_CORPUS: "1500"
+      MAX_CORPUS: "1000"
       MAX_QUERIES: "50"
+      PRODUCTION_RAG_CMTEB_MAX_CORPUS: "1000"
+      PRODUCTION_RAG_CMTEB_MAX_QUERIES: "50"
     steps:
       - uses: actions/checkout@v4
 
@@ -69,9 +81,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.lock
+          pip install -r requirements-eval-github.txt
 
       - name: Download C-MTEB data
         run: python scripts/download_cmteb.py
+
+      - name: Build rag-eval C-MTEB subset
+        run: |
+          python scripts/migrate_rag_eval_datasets.py cmteb-50 \
+            --max-corpus "$MAX_CORPUS" --max-queries "$MAX_QUERIES" \
+            --fill-factor 5 --seed 42
 
       - name: Compute embedding cache key
         id: cache-key
@@ -90,11 +109,27 @@ jobs:
           path: data/evaluation/cmteb_cache
           key: cmteb-emb-${{ steps.cache-key.outputs.hash }}-${{ env.MAX_CORPUS }}-${{ env.MAX_QUERIES }}-seed42
 
-      - name: Run C-MTEB gate (compare with baseline)
+      - name: Run new-platform C-MTEB gate
+        run: |
+          mkdir -p reports/rag-eval/trends
+          rag-eval run \
+            --config configs/eval.cmteb.yaml \
+            --baseline reports/rag-eval/baselines/cmteb_50.json \
+            --save-baseline /tmp/platform-cmteb-baseline.json \
+            --trend-csv reports/rag-eval/trends/cmteb.csv
+
+      - name: Run legacy C-MTEB evaluation
         run: |
           python scripts/eval_cmteb.py \
-            --max-corpus ${{ env.MAX_CORPUS }} --max-queries ${{ env.MAX_QUERIES }} --seed 42 \
-            --compare reports/cmteb_ci_baseline.json
+            --max-corpus "$MAX_CORPUS" --max-queries "$MAX_QUERIES" --seed 42 \
+            --save-baseline /tmp/legacy-cmteb-baseline.json
+
+      - name: Compare legacy and rag-eval metrics
+        run: |
+          python scripts/compare_eval_metrics.py \
+            /tmp/legacy-cmteb-baseline.json \
+            /tmp/platform-cmteb-baseline.json \
+            --tolerance 0.02
 
       - name: Upload eval report
         if: always()
@@ -113,6 +148,8 @@ jobs:
     env:
       MAX_CORPUS: "200000"   # > 全量 corpus 数，即不截断
       MAX_QUERIES: "30000"   # > 全量 query 数，即不截断
+      PRODUCTION_RAG_CMTEB_MAX_CORPUS: "200000"
+      PRODUCTION_RAG_CMTEB_MAX_QUERIES: "30000"
     steps:
       - uses: actions/checkout@v4
 
@@ -126,6 +163,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.lock
+          pip install -r requirements-eval-github.txt
 
       - name: Download C-MTEB data
         run: python scripts/download_cmteb.py
@@ -152,6 +190,15 @@ jobs:
           python scripts/eval_cmteb.py \
             --max-corpus ${{ env.MAX_CORPUS }} --max-queries ${{ env.MAX_QUERIES }} --seed 42 \
             ${{ github.event.inputs.eval_rerank == 'true' && '--rerank' || '' }}
+
+      - name: Run full rag-eval C-MTEB baseline
+        run: |
+          python scripts/migrate_rag_eval_datasets.py cmteb-50 \
+            --max-corpus "$MAX_CORPUS" --max-queries "$MAX_QUERIES" \
+            --fill-factor 5 --seed 42
+          rag-eval run \
+            --config configs/eval.cmteb.yaml \
+            --save-baseline reports/rag-eval/baselines/cmteb_full.json
 
       - name: Upload full eval report
         if: always()

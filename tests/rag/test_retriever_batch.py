@@ -31,9 +31,11 @@ class FakeEmbedding:
 class FakeVectorStore:
     def __init__(self):
         self.calls = []
+        self.shapes = []
 
     def search(self, qv, top_k, vector_ids=None):
         self.calls.append({"top_k": top_k, "vector_ids": vector_ids})
+        self.shapes.append(tuple(np.asarray(qv).shape))
         n = min(top_k, 3)
         scores = np.zeros((1, top_k), dtype="float32")
         ids = np.full((1, top_k), -1, dtype="int64")
@@ -90,6 +92,12 @@ class TestSearchBatch:
         for route in results:
             assert len(route) <= 5
             assert all("chunk_id" in r and "score" in r for r in route)
+
+    def test_batch_vectors_stay_two_dimensional(self, retriever):
+        """每路 FAISS 查询必须保持 (1, dim)，不能把单行压成一维。"""
+        retriever.search_batch(["q1", "q2"], per_query=5)
+
+        assert retriever.vector_store.shapes == [(1, 4), (1, 4)]
 
     def test_prefilters_document_ids(self, retriever):
         """document_ids → vector_ids 预过滤（各路共用一次翻译）。"""

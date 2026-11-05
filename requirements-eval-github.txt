@@ -1,0 +1,2 @@
+# Bootstrap until the same version is available on PyPI.
+https://github.com/1940633231/rag-eval/releases/download/v0.1.0/rag_eval-0.1.0-py3-none-any.whl

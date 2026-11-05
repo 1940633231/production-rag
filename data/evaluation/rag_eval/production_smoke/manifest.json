@@ -1,0 +1,10 @@
+{
+  "dataset_id": "production-rag-smoke",
+  "version": "1.0.0",
+  "task": "retrieval",
+  "samples_file": "samples.jsonl",
+  "qrels_file": null,
+  "description": "Four production-rag smoke queries migrated with explicit document_id.",
+  "source": "production-rag",
+  "created_at": "2026-11-05T00:00:00+08:00"
+}
