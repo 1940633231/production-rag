@@ -2,10 +2,12 @@
 
 ## Local smoke
 
-Install the package once from the repository root:
+Install the released package once from the repository root:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e packages\rag-eval
+.\.venv\Scripts\python.exe -m pip install -r requirements-eval-github.txt
+# After PyPI publication:
+.\.venv\Scripts\python.exe -m pip install "rag-eval>=0.1.0,<0.2.0"
 ```
 
 Run the four migrated smoke queries:

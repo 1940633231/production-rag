@@ -471,11 +471,13 @@ curl http://localhost:8000/api/knowledge/tasks/{task_id}
 
 ### rag-eval 平台（推荐）
 
-新的独立评估包位于 `packages/rag-eval/`，旧 `scripts/evaluate.py` 和
-`scripts/eval_cmteb.py` 保留用于兼容与一致性对照。
+独立评估包位于
+[`1940633231/rag-eval`](https://github.com/1940633231/rag-eval)，旧
+`scripts/evaluate.py` 和 `scripts/eval_cmteb.py` 保留用于兼容与一致性对照。
 
 ```bash
-python -m pip install -e packages/rag-eval
+python -m pip install -r requirements-eval-github.txt
+# PyPI 发布后：pip install "rag-eval>=0.1.0,<0.2.0"
 rag-eval validate data/evaluation/rag_eval/production_smoke
 rag-eval run --config configs/eval.pr_smoke.yaml \
   --baseline reports/rag-eval/baselines/pr_smoke_fake.json

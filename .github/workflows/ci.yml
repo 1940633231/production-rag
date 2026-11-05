@@ -43,11 +43,11 @@ jobs:
 
       - name: Install rag-eval
         run: |
-          python -m pip install -e packages/rag-eval
+          python -m pip install -r requirements-eval-github.txt
 
       - name: Run rag-eval PR smoke
         run: |
-          python -m pytest packages/rag-eval/tests tests/evaluation/test_eval_adapter.py -q
+          python -m pytest tests/evaluation/test_eval_adapter.py -q
           rag-eval validate data/evaluation/rag_eval/production_smoke
           rag-eval run \
             --config configs/eval.pr_smoke.yaml \
@@ -84,7 +84,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.lock
-          pip install -e packages/rag-eval
+          pip install -r requirements-eval-github.txt
 
       - name: Download C-MTEB data
         run: python scripts/download_cmteb.py
@@ -166,7 +166,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.lock
-          pip install -e packages/rag-eval
+          pip install -r requirements-eval-github.txt
 
       - name: Download C-MTEB data
         run: python scripts/download_cmteb.py
