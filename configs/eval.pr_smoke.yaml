@@ -1,0 +1,17 @@
+dataset: data/evaluation/rag_eval/production_smoke
+adapter: rag_eval.registry:FakeAdapter
+model: fake-gold
+prompt_version: pr-smoke-v1
+seed: 42
+max_errors: 0
+min_coverage: 1.0
+timeout_seconds: 30
+cache_dir: .rag-eval-cache/pr-smoke
+output_dir: reports/rag-eval/pr-smoke
+k_values: [1, 3, 5]
+thresholds:
+  recall@1: 0.0
+  recall@3: 0.0
+  mrr@3: 0.0
+  ndcg@3: 0.0
+  evidence_hit@3: 0.0

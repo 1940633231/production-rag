@@ -99,6 +99,9 @@ class Retriever:
         vt = time.time()
         all_results = []
         for qv in query_vectors:
+            qv = np.asarray(qv, dtype="float32")
+            if qv.ndim == 1:
+                qv = qv.reshape(1, -1)
             scores, ids = self.vector_store.search(
                 qv, per_query, vector_ids=vector_ids
             )

@@ -15,7 +15,7 @@ from rag_eval.regression.baseline import (
     baseline_from_report,
     compare_reports,
 )
-from rag_eval.regression.gate import evaluate_gate
+from rag_eval.regression.gate import GateResult, evaluate_gate
 from rag_eval.report.json_report import load_report_payload
 from rag_eval.runner import run_evaluation
 
@@ -38,6 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True)
     run.add_argument("--json", action="store_true")
     run.add_argument("--save-baseline")
+    run.add_argument("--baseline", help="compare the new report with this baseline")
+    run.add_argument("--trend-csv", help="append this report to a trend CSV")
 
     compare = subparsers.add_parser("compare", help="compare two reports")
     compare.add_argument("current")
@@ -88,6 +90,7 @@ def _handle_validate(args: argparse.Namespace) -> int:
 def _handle_run(args: argparse.Namespace) -> int:
     config = load_eval_config(args.config)
     outcome = run_evaluation(config)
+    gate: GateResult | None = None
     if args.save_baseline:
         baseline_path = Path(args.save_baseline)
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,14 +98,22 @@ def _handle_run(args: argparse.Namespace) -> int:
             baseline_from_report(outcome.report).model_dump_json(indent=2),
             encoding="utf-8",
         )
+    report_path = outcome.run_directory / "report.json"
+    if args.baseline:
+        gate = evaluate_gate(config, args.baseline, report_path)
+    if args.trend_csv:
+        append_trend_csv(args.trend_csv, outcome.report)
+    failed = outcome.failed or (gate is not None and not gate.passed)
     if args.json:
         print(
             _json_dump(
                 {
-                    "failed": outcome.failed,
+                    "failed": failed,
                     "failure_reasons": outcome.failure_reasons,
                     "run_directory": str(outcome.run_directory),
                     "report": outcome.report.model_dump(mode="json"),
+                    "gate": gate.model_dump(mode="json") if gate else None,
+                    "trend_csv": args.trend_csv,
                 }
             )
         )
@@ -119,7 +130,11 @@ def _handle_run(args: argparse.Namespace) -> int:
             print(f"{name}: {outcome.report.metrics.values[name]:.6f}")
         for reason in outcome.failure_reasons:
             print(f"FAIL: {reason}", file=sys.stderr)
-    return 1 if outcome.failed else 0
+        if gate is not None:
+            for issue in gate.issues:
+                print(f"GATE FAIL: {issue}", file=sys.stderr)
+            print("GATE PASS" if gate.passed else "GATE FAIL")
+    return 1 if failed else 0
 
 
 def _handle_compare(args: argparse.Namespace) -> int:

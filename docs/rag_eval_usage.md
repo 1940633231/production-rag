@@ -45,6 +45,15 @@ Run or regenerate the baseline:
 The corpus embedding cache is stored under `data/evaluation/cmteb_cache/`.
 The cache is local and ignored by Git.
 
+Run and gate in one command:
+
+```powershell
+.\.venv\Scripts\rag-eval.exe run `
+  --config configs\eval.cmteb.yaml `
+  --baseline reports\rag-eval\baselines\cmteb_50.json `
+  --trend-csv reports\rag-eval\trends\cmteb.csv
+```
+
 ## Gate
 
 ```powershell
@@ -56,6 +65,11 @@ The cache is local and ignored by Git.
 
 The gate checks dataset hash, execution configuration, coverage, and metric
 drop thresholds. It does not start external services.
+
+PR CI uses the fake-adapter configuration in `configs/eval.pr_smoke.yaml`.
+Nightly CI runs the 50-query C-MTEB platform gate and compares the result with
+the legacy `scripts/eval_cmteb.py` on the same sample. Release CI runs the full
+C-MTEB corpus through both entry points.
 
 ## Full service adapter
 

@@ -35,3 +35,5 @@ data/evaluation/cmteb/
 data/evaluation/cmteb_cache/
 reports/rag-eval/local/
 reports/rag-eval/cmteb/
+reports/rag-eval/pr-smoke/
+reports/rag-eval/trends/

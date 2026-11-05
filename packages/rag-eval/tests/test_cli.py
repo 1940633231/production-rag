@@ -86,6 +86,24 @@ def test_compare_and_gate_cli_exit_codes(tmp_path: Path, capsys) -> None:
     assert main(["compare", str(report_path), str(baseline_path)]) == 0
     capsys.readouterr()
 
+    trend_path = tmp_path / "trend.csv"
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(config_path),
+                "--baseline",
+                str(baseline_path),
+                "--trend-csv",
+                str(trend_path),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert trend_path.is_file()
+
     current = json.loads(report_path.read_text(encoding="utf-8"))
     current["metrics"]["values"]["recall@5"] = 0.25
     regressed_path = tmp_path / "regressed.json"
