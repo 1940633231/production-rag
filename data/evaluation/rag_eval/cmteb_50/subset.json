@@ -1,0 +1,9 @@
+{
+  "generated_at": "2026-11-05T18:01:31.661454+08:00",
+  "seed": 42,
+  "max_queries": 50,
+  "max_corpus": 1000,
+  "fill_factor": 5,
+  "corpus_size": 1000,
+  "query_count": 50
+}

@@ -1,0 +1,37 @@
+# 环境变量文件
+.env
+
+#python环境文件
+.venv/
+
+# Python缓存
+__pycache__/
+*.pyc
+*.egg-info/
+
+# 日志文件
+logs/
+
+# 数据目录
+data/raw/
+data/index/
+
+# 评测数据集（大体积，按需下载）
+data/evaluation/cmteb/
+*.log
+
+# 本机开发环境管理（路径和容器配置与当前机器绑定）
+/configs/dev_environment.json
+/scripts/DevEnvironment.psm1
+/scripts/dev_up.ps1
+/scripts/dev_down.ps1
+/scripts/dev_status.ps1
+/scripts/dev_doctor.ps1
+/docs/dev_environment.md
+/docs/rag_eval_implementation_plan.md
+
+# rag-eval local transient outputs
+.rag-eval-cache/
+data/evaluation/cmteb_cache/
+reports/rag-eval/local/
+reports/rag-eval/cmteb/
